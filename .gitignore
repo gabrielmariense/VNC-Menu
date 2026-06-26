@@ -1,0 +1,15 @@
+/creds.json
+/hosts.json
+/settings.json
+/dist
+/build
+/VNC-Menu.spec
+/VNC-Menu-Dev.pyw
+/VNC-Menu-Dev2.pyw
+/realvnc
+/oldpy
+/hosts_bkp.json
+/logs
+/_internal
+/realvnc/*.vnc
+/logs/*.log
