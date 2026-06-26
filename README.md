@@ -4,9 +4,13 @@ Interface gráfica para Windows que organiza e abre conexões VNC a partir de um
 
 O objetivo do projeto é facilitar o acesso rápido a várias máquinas, evitando a abertura manual de diversos perfis VNC e reduzindo a repetição de credenciais no dia a dia.
 
+<p align="center">
+  <img src="assets/VNC-Menu PROMOCIONAL.png" alt="Preview da interface" width="850">
+</p>
+
 ## Funcionalidades
 
-- Interface desktop em Tkinter para Windows.
+- Interface desktop em CustomTkinter para Windows.
 - Organização de hosts por **Unidade > Setor > Host**.
 - Suporte atual somente a **UltraVNC** e **RealVNC**.
 - Conexões UltraVNC usando um `template.vnc` compartilhado.
@@ -37,6 +41,7 @@ pywinauto==0.6.9
 pyinstaller>=6.0,<7.0
 pywin32>=306
 comtypes>=1.4.0
+customtkinter>=5.2.2
 ```
 
 ## Instalação

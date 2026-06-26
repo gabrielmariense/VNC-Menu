@@ -4,9 +4,13 @@ A lightweight Windows GUI for organizing and opening VNC connections from a stru
 
 The goal is to give technicians quick access to multiple machines without manually opening several VNC profiles or repeatedly typing the same credentials.
 
+<p align="center">
+  <img src="assets/VNC-Menu PROMOTION.png" alt="Interface preview" width="850">
+</p>
+
 ## Features
 
-- Tkinter desktop interface for Windows.
+- CustomTkinter desktop interface for Windows.
 - Host organization by **Unit > Sector > Host**.
 - Currently supports only **UltraVNC** and **RealVNC**.
 - UltraVNC connections using a shared `template.vnc`.
@@ -37,6 +41,7 @@ pywinauto==0.6.9
 pyinstaller>=6.0,<7.0
 pywin32>=306
 comtypes>=1.4.0
+customtkinter>=5.2.2
 ```
 
 ## Installation
