@@ -6,6 +6,7 @@ import re
 import shutil
 import subprocess
 import tempfile
+import threading
 import time
 import traceback
 from ctypes import wintypes
@@ -1251,6 +1252,63 @@ def show_text_window(parent, title, content):
         win.after(250, lambda: win.attributes("-topmost", False))
     except Exception:
         pass
+
+
+class QwinstaProgressWindow(ctk.CTkToplevel):
+    def __init__(self, parent, label: str, host_count: int):
+        super().__init__(parent)
+        self.title("Consultando usuários")
+        self.geometry("430x190")
+        self.resizable(False, False)
+        self.configure(fg_color=THEME["bg"])
+
+        box = ctk.CTkFrame(self, fg_color=THEME["surface"], corner_radius=18)
+        box.pack(fill="both", expand=True, padx=18, pady=18)
+
+        ctk.CTkLabel(
+            box,
+            text="Consultando usuários logados",
+            font=FONT_SUBTITLE,
+            text_color=THEME["text"],
+        ).pack(anchor="w", padx=18, pady=(18, 8))
+
+        ctk.CTkLabel(
+            box,
+            text=f"Executando qwinsta em {host_count} host(s): {label}",
+            font=FONT_NORMAL,
+            text_color=THEME["muted"],
+            wraplength=360,
+            justify="left",
+        ).pack(anchor="w", padx=18, pady=(0, 14))
+
+        self.progress = ctk.CTkProgressBar(box, mode="indeterminate")
+        self.progress.pack(fill="x", padx=18, pady=(0, 14))
+        self.progress.start()
+
+        ctk.CTkLabel(
+            box,
+            text="Aguarde. A janela de resultado abrirá automaticamente.",
+            font=FONT_SMALL,
+            text_color=THEME["muted"],
+        ).pack(anchor="w", padx=18, pady=(0, 18))
+
+        center_window(self, 430, 190)
+        self.transient(parent)
+        self.lift()
+        self.focus()
+
+        try:
+            self.attributes("-topmost", True)
+            self.after(250, lambda: self.attributes("-topmost", False))
+        except Exception:
+            pass
+
+    def close(self):
+        try:
+            self.progress.stop()
+        except Exception:
+            pass
+        self.destroy()
 
 
 # =========================
@@ -2513,7 +2571,7 @@ class App(ctk.CTk):
     def show_qwinsta_users(self):
         unit_name = self.selected_unit.get()
         sector_name = self.selected_sector.get()
-        hosts = get_sector_hosts(self.hosts_data, unit_name, sector_name)
+        hosts = [dict(item) for item in get_sector_hosts(self.hosts_data, unit_name, sector_name)]
         label = f"{unit_name} > {sector_name}"
 
         if not hosts:
@@ -2521,8 +2579,37 @@ class App(ctk.CTk):
             return
 
         audit_log("USERS_QUERY", f"unidade={unit_name}; setor={sector_name}; hosts={len(hosts)}")
-        output = query_all_logged_users(hosts)
-        show_text_window(self, f"Usuários logados - {label}", output)
+
+        progress = QwinstaProgressWindow(self, label, len(hosts))
+        self.btn_users.configure(state="disabled", text="Consultando...")
+
+        def worker():
+            try:
+                result = query_all_logged_users(hosts)
+                error = None
+            except Exception as exc:
+                log_exception(exc)
+                result = ""
+                error = exc
+
+            def finish():
+                try:
+                    if progress.winfo_exists():
+                        progress.close()
+                except Exception:
+                    pass
+
+                self.btn_users.configure(state="normal", text="Usuários")
+
+                if error:
+                    show_error(self, "Usuários logados", f"Falha ao consultar usuários:\n{error}\n\nLog: {ERROR_LOG}")
+                    return
+
+                show_text_window(self, f"Usuários logados - {label}", result)
+
+            self.after(0, finish)
+
+        threading.Thread(target=worker, daemon=True).start()
 
 
 if __name__ == "__main__":
