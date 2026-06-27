@@ -2,6 +2,7 @@ import base64
 import getpass
 import ctypes
 import json
+import re
 import shutil
 import subprocess
 import tempfile
@@ -88,6 +89,8 @@ DEFAULT_SETTINGS = {
     "selected_unit": "Geral",
     "selected_sector": "Geral",
     "host_columns": 3,
+    "main_window_size": "980x610",
+    "window_geometries": {},
     "ultravnc_exe": ULTRAVNC_EXE,
     "realvnc_exe": REALVNC_EXE,
 }
@@ -202,6 +205,86 @@ def center_window(win, width: int | None = None, height: int | None = None):
     win.geometry(f"{w}x{h}+{x}+{y}")
 
 
+_GEOMETRY_RE = re.compile(r"^\d+x\d+[+-]\d+[+-]\d+$")
+
+
+def is_valid_geometry(value: str) -> bool:
+    return bool(_GEOMETRY_RE.match(str(value or "").strip()))
+
+
+def get_window_geometries(settings: dict | None = None) -> dict:
+    settings = settings if isinstance(settings, dict) else load_settings()
+    data = settings.get("window_geometries", {})
+    return dict(data) if isinstance(data, dict) else {}
+
+
+def get_saved_window_geometry(key: str) -> str | None:
+    geometry = str(get_window_geometries().get(key) or "").strip()
+    return geometry if is_valid_geometry(geometry) else None
+
+
+def get_geometry_size(geometry: str, fallback_width: int, fallback_height: int) -> tuple[int, int]:
+    try:
+        size = str(geometry).split("+", 1)[0].split("-", 1)[0]
+        width_text, height_text = size.lower().split("x", 1)
+        return max(1, int(width_text)), max(1, int(height_text))
+    except Exception:
+        return fallback_width, fallback_height
+
+
+def restore_window_geometry(win, key: str, width: int | None = None, height: int | None = None):
+    """Restore saved geometry, or center the window if no valid geometry exists."""
+    geometry = get_saved_window_geometry(key)
+    if geometry:
+        win.geometry(geometry)
+    else:
+        center_window(win, width, height)
+
+
+def save_window_geometry(win, key: str):
+    """Save current window size and position to settings.json."""
+    try:
+        if not key:
+            return
+        if hasattr(win, "state") and win.state() in {"iconic", "withdrawn"}:
+            return
+
+        win.update_idletasks()
+        geometry = str(win.geometry())
+        if not is_valid_geometry(geometry):
+            return
+
+        settings = load_settings()
+        geometries = get_window_geometries(settings)
+        geometries[key] = geometry
+        settings["window_geometries"] = geometries
+
+        if key == "main":
+            settings["main_window_size"] = geometry.split("+", 1)[0].split("-", 1)[0]
+
+        save_settings(settings)
+    except Exception as e:
+        try:
+            log_exception(e)
+        except Exception:
+            pass
+
+
+def remember_window_geometry(win, key: str, width: int | None = None, height: int | None = None):
+    """Restore now and save when the exact window is destroyed."""
+    restore_window_geometry(win, key, width, height)
+
+    def _save_on_destroy(event=None):
+        if event is not None and event.widget is not win:
+            return
+        save_window_geometry(win, key)
+
+    try:
+        win.bind("<Destroy>", _save_on_destroy, add="+")
+    except Exception:
+        pass
+
+
 def safe_filename(s: str) -> str:
     invalid = '<>:"/\\|?*'
     cleaned = "".join("_" if c in invalid else c for c in str(s).strip())
@@ -297,7 +380,7 @@ def confirm_action(parent, title, message) -> bool:
     ctk.CTkButton(buttons, text="Cancelar", command=no, fg_color=THEME["surface_3"], hover_color=THEME["accent_soft"]).pack(side="right", padx=(8, 0))
     ctk.CTkButton(buttons, text="Confirmar", command=yes, fg_color=THEME["accent"], hover_color=THEME["accent_hover"]).pack(side="right")
 
-    center_window(win, 420, 210)
+    remember_window_geometry(win, f"dialog_text_{safe_filename(title)}", 420, 210)
     modal_window(win, parent)
     return result["value"]
 
@@ -337,7 +420,7 @@ def ask_text(parent: Any, title: str, label: str, initial: str = "") -> str | No
     win.bind("<Return>", ok)
     win.bind("<Escape>", lambda _e: cancel())
 
-    center_window(win, 460, 235)
+    remember_window_geometry(win, "dialog_host_details", 460, 235)
     modal_window(win, parent)
     return result["value"]
 
@@ -391,7 +474,7 @@ def ask_host_details(parent: Any, title: str, initial: dict[str, str] | None = N
     win.bind("<Return>", ok)
     win.bind("<Escape>", lambda _e: cancel())
 
-    center_window(win, 450, 410)
+    remember_window_geometry(win, "dialog_custom_connection", 450, 410)
     name_entry.focus_set()
     modal_window(win, parent)
     return result["value"]
@@ -436,7 +519,7 @@ def ask_custom_connection(parent: Any) -> tuple[str, str] | None:
     win.bind("<Return>", ok)
     win.bind("<Escape>", lambda _e: cancel())
 
-    center_window(win, 460, 310)
+    remember_window_geometry(win, "dialog_realvnc_profile", 460, 310)
     modal_window(win, parent)
     return result["value"]
 
@@ -486,7 +569,7 @@ def show_realvnc_profile_dialog(parent, profile_path: Path, profile_name: str):
     ctk.CTkButton(buttons, text="Copiar nome", command=copy_name, fg_color=THEME["surface_3"], hover_color=THEME["accent_soft"]).pack(side="right", padx=(8, 0))
     ctk.CTkButton(buttons, text="Criar arquivo", command=create_empty, fg_color=THEME["accent"], hover_color=THEME["accent_hover"]).pack(side="right")
 
-    center_window(win, 620, 335)
+    remember_window_geometry(win, "dialog_hosts_source_select", 620, 335)
     modal_window(win, parent)
     return result["value"]
 
@@ -732,6 +815,16 @@ def get_realvnc_exe() -> str:
     return _settings_path_value(load_settings(), "realvnc_exe", REALVNC_EXE)
 
 
+def resolve_existing_exe(configured_path: str, default_path: str) -> str | None:
+    """Return a valid executable path, trying the configured path first."""
+    configured_path = str(configured_path or "").strip()
+    if configured_path and Path(configured_path).exists():
+        return configured_path
+    if Path(default_path).exists():
+        return default_path
+    return None
+
+
 def get_host_columns(settings: dict) -> int:
     try:
         value = int(settings.get("host_columns", 3))
@@ -832,7 +925,7 @@ def choose_hosts_source_dialog(parent, required=False):
     if not required:
         ctk.CTkButton(buttons, text="Cancelar", command=win.destroy, fg_color=THEME["surface_3"], hover_color=THEME["accent_soft"]).pack(side="right")
 
-    center_window(win, 620)
+    remember_window_geometry(win, "dialog_hosts_source_select", 620)
     modal_window(win, parent)
     return result["value"]
 
@@ -878,7 +971,7 @@ def shared_hosts_edit_warning(parent):
     ctk.CTkButton(buttons, text="Criar cópia", command=lambda: choose("copy"), fg_color=THEME["surface_3"], hover_color=THEME["accent_soft"]).pack(side="right", padx=(8, 0))
     ctk.CTkButton(buttons, text="Editar padrão", command=lambda: choose("continue"), fg_color=THEME["accent"], hover_color=THEME["accent_hover"]).pack(side="right")
 
-    center_window(win, 610)
+    remember_window_geometry(win, "dialog_shared_hosts_warning", 610)
     modal_window(win, parent)
     return result["value"]
 
@@ -887,96 +980,129 @@ def shared_hosts_edit_warning(parent):
 # =========================
 def auto_enter_uvnc_credentials(timeout=AUTH_TIMEOUT) -> bool:
     user, pwd = load_creds()
-    if not pwd:
+    if not user and not pwd:
         return False
 
     deadline = time.time() + timeout
+    dlg = None
+
     while time.time() < deadline:
         try:
-            windows = Desktop(backend="win32").windows(title_re=AUTH_TITLE_RE, visible_only=True)
-            if not windows:
-                time.sleep(0.3)
-                continue
+            candidate = Desktop(backend="win32").window(title_re=AUTH_TITLE_RE)
+            if candidate.exists(timeout=0.2):
+                dlg = candidate
+                break
+        except Exception:
+            pass
+        time.sleep(0.1)
 
-            dlg = windows[0]
-            dlg.set_focus()
-            edits = dlg.descendants(class_name="Edit")
-            if len(edits) >= 2:
-                edits[0].set_edit_text(user)
-                edits[1].set_edit_text(pwd)
-            elif len(edits) == 1:
-                edits[0].set_edit_text(pwd)
-            else:
-                if user:
-                    send_keys(user)
-                    send_keys("{TAB}")
-                send_keys(pwd)
+    if dlg is None:
+        return False
 
+    try:
+        dlg.wait("visible", timeout=2)
+        dlg.set_focus()
+        edits = dlg.descendants(control_type="Edit")
+
+        if len(edits) == 1:
+            edits[0].set_text(pwd)
             send_keys("{ENTER}")
             return True
-        except Exception:
-            time.sleep(0.3)
-    return False
+
+        if len(edits) >= 2:
+            if user:
+                edits[0].set_text(user)
+            edits[1].set_text(pwd)
+            send_keys("{ENTER}")
+            return True
+
+        if user:
+            send_keys(user + "{TAB}" + pwd + "{ENTER}", with_spaces=True)
+        else:
+            send_keys(pwd + "{ENTER}", with_spaces=True)
+        return True
+
+    except Exception:
+        return False
 
 
 def launch_vnc(host: str, viewer: str = DEFAULT_VIEWER, display_name: str | None = None, sector_name: str | None = None, parent=None):
     viewer = sanitize_viewer(viewer)
-    name = display_name or host
-    audit_log("CONNECTION_ATTEMPT", f"viewer={viewer_display_name(viewer)}; name={name}; host={host}; setor={sector_name or ''}")
+    host = str(host or "").strip()
+    target_name = str(display_name or host or "Host").strip()
+
+    if not host:
+        show_error(parent, "VNC", "Host/IP vazio.")
+        audit_log("CONNECTION_BLOCKED", f"viewer={viewer}; reason=empty_host; name={target_name}")
+        return
+
+    audit_log(
+        "CONNECTION_ATTEMPT",
+        f"viewer={viewer_display_name(viewer)}; name={target_name}; host={host}; setor={sector_name or '-'}",
+    )
 
     try:
         if viewer == VIEWER_REALVNC:
-            realvnc_exe = get_realvnc_exe()
-            profile_path = realvnc_profile_path(sector_name, name)
-            profile_name = profile_path.name
+            configured_realvnc = get_realvnc_exe()
+            realvnc_exe = resolve_existing_exe(configured_realvnc, REALVNC_EXE)
 
-            if not Path(realvnc_exe).exists():
-                audit_log("REALVNC_EXE_MISSING", f"exe={realvnc_exe}")
-                show_error(parent, "RealVNC", f"RealVNC Viewer não encontrado:\n{realvnc_exe}")
+            if not realvnc_exe:
+                audit_log("CONNECTION_ERROR", f"viewer=RealVNC; host={host}; reason=viewer_not_found; path={configured_realvnc}")
+                show_error(parent, "Erro", f"RealVNC Viewer não encontrado:\n{configured_realvnc}")
                 return
 
-            if not profile_path.exists() or profile_path.stat().st_size == 0:
-                audit_log("REALVNC_PROFILE_MISSING", f"file={profile_path}; host={host}")
+            profile_name = realvnc_profile_name(sector_name, target_name)
+            profile_path = REALVNC_DIR / profile_name
+
+            if profile_path.exists() and profile_path.stat().st_size > 0:
+                subprocess.Popen(
+                    [realvnc_exe, str(profile_path)],
+                    stdout=subprocess.DEVNULL,
+                    stderr=subprocess.DEVNULL,
+                )
+                audit_log("CONNECTION_STARTED", f"viewer=RealVNC; name={target_name}; host={host}; profile={profile_path}")
+                return
+
+            audit_log("CONNECTION_BLOCKED", f"viewer=RealVNC; name={target_name}; host={host}; reason=profile_missing_or_empty; profile={profile_path}")
+            if parent is not None:
                 show_realvnc_profile_dialog(parent, profile_path, profile_name)
-                return
-
-            subprocess.Popen([realvnc_exe, str(profile_path)], shell=False)
-            audit_log("CONNECTION_STARTED", f"viewer=RealVNC; exe={realvnc_exe}; profile={profile_path}")
+            else:
+                show_info(None, "Perfil RealVNC", f"Perfil RealVNC não encontrado ou vazio:\n\n{profile_path}")
             return
 
-        ultravnc_exe = get_ultravnc_exe()
-        if not Path(ultravnc_exe).exists():
-            audit_log("ULTRAVNC_EXE_MISSING", f"exe={ultravnc_exe}")
-            show_error(parent, "UltraVNC", f"UltraVNC Viewer não encontrado:\n{ultravnc_exe}")
+        configured_ultravnc = get_ultravnc_exe()
+        ultravnc_exe = resolve_existing_exe(configured_ultravnc, ULTRAVNC_EXE)
+
+        if not ultravnc_exe:
+            audit_log("CONNECTION_ERROR", f"viewer=UltraVNC; host={host}; reason=viewer_not_found; path={configured_ultravnc}")
+            show_error(parent, "Erro", f"UltraVNC Viewer não encontrado:\n{configured_ultravnc}")
             return
 
         if not TEMPLATE_VNC.exists():
-            audit_log("TEMPLATE_MISSING", f"file={TEMPLATE_VNC}")
-            show_error(parent, "UltraVNC", f"template.vnc não encontrado:\n{TEMPLATE_VNC}")
+            audit_log("CONNECTION_ERROR", f"viewer=UltraVNC; host={host}; reason=template_not_found; path={TEMPLATE_VNC}")
+            show_error(parent, "Erro", "template.vnc não encontrado.\nVerifique se ele está na pasta _internal.")
             return
 
-        content = TEMPLATE_VNC.read_text(encoding="utf-8", errors="ignore")
-        lines = []
-        replaced = False
-        for line in content.splitlines():
-            if line.lower().startswith("host="):
-                lines.append(f"host={host}:{PORT}")
-                replaced = True
-            else:
-                lines.append(line)
-        if not replaced:
-            lines.append(f"host={host}:{PORT}")
+        # This is the launch behavior from the old working Tkinter version:
+        # copy the template unchanged and pass the target as host::port.
+        tmp_vnc = Path(tempfile.gettempdir()) / f"uvnc_{safe_filename(host)}.vnc"
+        shutil.copyfile(TEMPLATE_VNC, tmp_vnc)
 
-        tmp = Path(tempfile.gettempdir()) / f"vnc_menu_{safe_filename(name)}.vnc"
-        tmp.write_text("\n".join(lines) + "\n", encoding="utf-8")
-        subprocess.Popen([ultravnc_exe, str(tmp)], shell=False)
-        audit_log("CONNECTION_STARTED", f"viewer=UltraVNC; exe={ultravnc_exe}; file={tmp}; host={host}")
+        cmd = [ultravnc_exe, "-config", str(tmp_vnc), f"{host}::{PORT}"]
+        subprocess.Popen(
+            cmd,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+            cwd=str(Path(ultravnc_exe).parent),
+        )
+        audit_log("CONNECTION_STARTED", f"viewer=UltraVNC; name={target_name}; host={host}; template={TEMPLATE_VNC}")
+
         auto_enter_uvnc_credentials()
-    except Exception as e:
-        log_exception(e)
-        audit_log("CONNECTION_ERROR", f"viewer={viewer}; host={host}; error={e}")
-        show_error(parent, "Erro", f"Falha ao iniciar viewer VNC:\n{e}\n\nLog: {ERROR_LOG}")
 
+    except Exception as e:
+        audit_log("CONNECTION_ERROR", f"viewer={viewer_display_name(viewer)}; host={host}; error={e}")
+        log_exception(e)
+        show_error(parent, "Erro", f"Falha ao iniciar viewer VNC:\n{e}\n\nLog: {ERROR_LOG}")
 
 def restart_host(host: str):
     audit_log("RESTART_ATTEMPT", f"host={host}")
@@ -991,65 +1117,140 @@ def restart_host(host: str):
 
 def query_all_logged_users(hosts):
     rows = []
+
     for item in hosts:
-        name = item.get("name", "")
-        host = item.get("host", "")
+        name = str(item.get("name") or "Host")
+        host = str(item.get("host") or "").strip()
+
         if not host:
+            rows.append((name, "SEM HOST"))
             continue
+
         try:
-            cmd = ["qwinsta", f"/server:{host}"]
-            proc = subprocess.run(cmd, capture_output=True, text=True, timeout=7)
-            output = (proc.stdout or "") + (proc.stderr or "")
-            if proc.returncode != 0:
-                rows.append((name, host, "OFFLINE"))
+            ping = subprocess.run(
+                ["ping", "-n", "1", "-w", "800", host],
+                capture_output=True,
+                text=True,
+                timeout=3,
+                creationflags=subprocess.CREATE_NO_WINDOW,
+            )
+
+            if ping.returncode != 0:
+                rows.append((name, "OFFLINE"))
+                continue
+
+            result = subprocess.run(
+                ["qwinsta", f"/server:{host}"],
+                capture_output=True,
+                text=True,
+                timeout=8,
+                creationflags=subprocess.CREATE_NO_WINDOW,
+            )
+
+            output = result.stdout.strip()
+            error = result.stderr.strip()
+
+            if result.returncode != 0:
+                rows.append((name, error or output or "ERRO"))
                 continue
 
             users = []
-            for line in output.splitlines():
-                if "SESSIONNAME" in line.upper() or not line.strip():
-                    continue
+            for line in output.splitlines()[1:]:
                 parts = line.split()
-                # qwinsta costuma trazer USERNAME na segunda ou terceira coluna.
-                for part in parts[1:3]:
-                    low = part.lower()
-                    if low not in {"console", "rdp-tcp", "disc", "listen", "active", "services"} and not part.isdigit():
-                        users.append(part)
-                        break
-            rows.append((name, host, ", ".join(sorted(set(users))) if users else "VAZIO"))
-        except Exception:
-            rows.append((name, host, "OFFLINE"))
+
+                # Old working behavior: in Portuguese Windows output, the username
+                # appears in this position for disconnected user sessions.
+                if len(parts) >= 4:
+                    username = parts[1]
+                    if username.lower() not in ("services", "console", "rdp-tcp"):
+                        users.append(username)
+
+            rows.append((name, ", ".join(users) if users else "VAZIO"))
+
+        except Exception as e:
+            rows.append((name, f"ERRO: {e}"))
+
     return format_users_output(rows)
 
 
 def format_users_output(rows):
     if not rows:
         return "Nenhum host encontrado."
-    name_w = max(len("Host"), max(len(r[0]) for r in rows))
-    host_w = max(len("Endereço"), max(len(r[1]) for r in rows))
-    lines = [f"{'Host':<{name_w}}  {'Endereço':<{host_w}}  Usuário", f"{'-' * name_w}  {'-' * host_w}  {'-' * 20}"]
-    for name, host, user in rows:
-        lines.append(f"{name:<{name_w}}  {host:<{host_w}}  {user}")
+
+    host_w = max(len("HOST"), *(len(str(r[0])) for r in rows))
+    lines = []
+    lines.append(f"{'HOST':<{host_w}}  USUÁRIO")
+    lines.append("-" * (host_w + 35))
+
+    for host, user in rows:
+        lines.append(f"{host:<{host_w}}  {user}")
+
     return "\n".join(lines)
 
-
 def show_text_window(parent, title, content):
+    lines = content.splitlines()
+    max_len = max((len(line) for line in lines), default=40)
+    line_count = max(len(lines), 1)
+
+    # Auto-size the output window to avoid large empty areas for short reports.
+    width = min(max((max_len * 8) + 110, 460), 760)
+    height = min(max((line_count * 18) + 135, 300), 540)
+    textbox_height = max(height - 150, 150)
+
     win = ctk.CTkToplevel(parent)
     win.title(title)
-    win.geometry("760x520")
-    win.minsize(620, 420)
+    win.geometry(f"{width}x{height}")
+    win.minsize(420, 260)
     win.configure(fg_color=THEME["bg"])
 
     outer = ctk.CTkFrame(win, fg_color=THEME["surface"], corner_radius=18)
     outer.pack(fill="both", expand=True, padx=18, pady=18)
 
-    ctk.CTkLabel(outer, text=title, font=FONT_SUBTITLE, text_color=THEME["text"]).pack(anchor="w", padx=18, pady=(18, 10))
-    textbox = ctk.CTkTextbox(outer, font=("Consolas", 12), fg_color=THEME["bg"], text_color=THEME["text"], corner_radius=12)
-    textbox.pack(fill="both", expand=True, padx=18, pady=(0, 18))
+    ctk.CTkLabel(
+        outer,
+        text=title,
+        font=FONT_SUBTITLE,
+        text_color=THEME["text"],
+    ).pack(anchor="w", padx=18, pady=(18, 10))
+
+    textbox = ctk.CTkTextbox(
+        outer,
+        height=textbox_height,
+        font=("Consolas", 12),
+        fg_color=THEME["bg"],
+        text_color=THEME["text"],
+        corner_radius=12,
+        wrap="none",
+    )
+    textbox.pack(fill="both", expand=True, padx=18, pady=(0, 14))
     textbox.insert("1.0", content)
     textbox.configure(state="disabled")
 
-    ctk.CTkButton(outer, text="Fechar", command=win.destroy, fg_color=THEME["surface_3"], hover_color=THEME["accent_soft"]).pack(anchor="e", padx=18, pady=(0, 18))
-    center_window(win, 760, 520)
+    ctk.CTkButton(
+        outer,
+        text="Fechar",
+        width=140,
+        height=36,
+        command=win.destroy,
+        fg_color=THEME["surface_3"],
+        hover_color=THEME["accent_soft"],
+        text_color=THEME["secondary_button_text"],
+    ).pack(anchor="e", padx=18, pady=(0, 18))
+
+    remember_window_geometry(win, "window_text_output", width, height)
+
+    # Keep the result window visible without making it modal.
+    # Do not use grab_set() here, because the user still needs normal access
+    # to the rest of Windows while this report is open.
+    win.transient(parent)
+    win.lift()
+    win.focus()
+
+    try:
+        win.attributes("-topmost", True)
+        win.after(250, lambda: win.attributes("-topmost", False))
+    except Exception:
+        pass
 
 
 # =========================
@@ -1104,7 +1305,7 @@ class CredsWindow(ctk.CTkToplevel):
             text_color=THEME["button_text"],
         ).pack(side="right")
 
-        center_window(self, 500, 390)
+        remember_window_geometry(self, "window_credentials", 500, 390)
         self.transient(parent)
         self.grab_set()
         self.user_entry.focus_set()
@@ -1158,7 +1359,7 @@ class SimpleListEditor(ctk.CTkToplevel):
         ctk.CTkButton(actions, text="Fechar", command=self.destroy, width=80, fg_color=THEME["accent"], hover_color=THEME["accent_hover"]).pack(side="right")
 
         self.render_items()
-        center_window(self, 520, 520)
+        remember_window_geometry(self, f"window_list_editor_{safe_filename(title)}", 520, 520)
         self.transient(parent)
         self.grab_set()
 
@@ -1307,12 +1508,12 @@ class HostUnitsConfigWindow(ctk.CTkToplevel):
         self.right = ctk.CTkFrame(self, fg_color=THEME["surface"], corner_radius=18)
         self.right.grid(row=0, column=1, sticky="nsew", padx=(0, 18), pady=18)
         self.right.grid_columnconfigure(0, weight=1)
-        self.right.grid_rowconfigure(2, weight=1)
+        self.right.grid_rowconfigure(3, weight=1)
 
         self.build_left_panel()
         self.build_right_panel()
         self.refresh_all()
-        center_window(self, 1060, 660)
+        remember_window_geometry(self, "window_hosts_config", 1060, 660)
         self.transient(parent)
         self.grab_set()
         self.protocol("WM_DELETE_WINDOW", self.close)
@@ -1325,6 +1526,7 @@ class HostUnitsConfigWindow(ctk.CTkToplevel):
         return self._snapshot() != self._initial_snapshot
 
     def close(self):
+        save_window_geometry(self, "window_hosts_config")
         if self.has_unsaved_changes():
             should_close = confirm_action(
                 self,
@@ -1346,69 +1548,103 @@ class HostUnitsConfigWindow(ctk.CTkToplevel):
         self.unit_menu = ctk.CTkOptionMenu(self.left, values=get_unit_names(self.data) or ["Geral"], variable=self.selected_unit, command=lambda _v: self.on_unit_changed())
         self.unit_menu.pack(fill="x", padx=18, pady=(0, 12))
 
-        ctk.CTkButton(self.left, text="Editar Unidades", command=self.open_units_editor, fg_color=THEME["surface_3"], hover_color=THEME["accent_soft"]).pack(fill="x", padx=18, pady=(0, 18))
+        ctk.CTkButton(
+            self.left,
+            text="Editar Unidades",
+            command=self.open_units_editor,
+            fg_color=THEME["surface_3"],
+            hover_color=THEME["accent_soft"],
+            text_color=THEME["secondary_button_text"],
+        ).pack(fill="x", padx=18, pady=(0, 18))
 
         ctk.CTkLabel(self.left, text="Setores", font=FONT_SMALL_BOLD, text_color=THEME["muted"]).pack(anchor="w", padx=18, pady=(0, 6))
         self.sector_frame = ctk.CTkScrollableFrame(self.left, fg_color=THEME["bg"], corner_radius=14)
         self.sector_frame.pack(fill="both", expand=True, padx=18, pady=(0, 14))
 
-        ctk.CTkButton(self.left, text="Editar Setores", command=self.open_sectors_editor, fg_color=THEME["surface_3"], hover_color=THEME["accent_soft"]).pack(fill="x", padx=18, pady=(0, 18))
+        ctk.CTkButton(
+            self.left,
+            text="Editar Setores",
+            command=self.open_sectors_editor,
+            fg_color=THEME["surface_3"],
+            hover_color=THEME["accent_soft"],
+            text_color=THEME["secondary_button_text"],
+        ).pack(fill="x", padx=18, pady=(0, 18))
 
     def build_right_panel(self):
         header = ctk.CTkFrame(self.right, fg_color="transparent")
-        header.grid(row=0, column=0, sticky="ew", padx=18, pady=(18, 8))
+        header.grid(row=0, column=0, sticky="ew", padx=22, pady=(18, 8))
         header.grid_columnconfigure(0, weight=1)
+
         ctk.CTkLabel(header, text="Hosts do Setor", font=FONT_SUBTITLE, text_color=THEME["text"]).grid(row=0, column=0, sticky="w")
         self.path_label = ctk.CTkLabel(header, text="", font=FONT_SMALL, text_color=THEME["muted"])
         self.path_label.grid(row=1, column=0, sticky="w", pady=(2, 0))
 
-        columns = ctk.CTkFrame(self.right, fg_color=THEME["surface_2"], corner_radius=10)
-        columns.grid(row=1, column=0, sticky="ew", padx=18, pady=(0, 8))
-        columns.grid_columnconfigure(0, weight=2)
-        columns.grid_columnconfigure(1, weight=2)
-        columns.grid_columnconfigure(2, weight=1)
-        for col, text in enumerate(["Nome", "Host/IP", "Viewer"]):
-            ctk.CTkLabel(columns, text=text, font=FONT_SMALL_BOLD, text_color=THEME["muted"], anchor="w").grid(row=0, column=col, sticky="ew", padx=14, pady=10)
+        toolbar = ctk.CTkFrame(self.right, fg_color=THEME["surface_2"], corner_radius=14)
+        toolbar.grid(row=1, column=0, sticky="ew", padx=22, pady=(0, 10))
 
-        content = ctk.CTkFrame(self.right, fg_color="transparent")
-        content.grid(row=2, column=0, sticky="nsew", padx=18, pady=(0, 14))
-        content.grid_columnconfigure(0, weight=1)
-        content.grid_rowconfigure(0, weight=1)
-
-        self.host_rows = ctk.CTkScrollableFrame(content, fg_color=THEME["bg"], corner_radius=14)
-        self.host_rows.grid(row=0, column=0, sticky="nsew", padx=(0, 12))
-
-        actions = ctk.CTkFrame(content, width=150, fg_color="transparent")
-        actions.grid(row=0, column=1, sticky="ns")
-        actions.grid_propagate(False)
-
-        action_defs = [
-            ("↑", self.move_host_up),
-            ("↓", self.move_host_down),
-            ("+ Adicionar", self.add_host),
-            ("Editar", self.edit_host),
-            ("Remover", self.remove_host),
-            ("Ordenar A-Z", self.sort_hosts),
+        actions = [
+            ("+ Adicionar", self.add_host, THEME["accent"], 118),
+            ("Editar", self.edit_host, THEME["surface_3"], 92),
+            ("Remover", self.remove_host, THEME["surface_3"], 92),
+            ("↑", self.move_host_up, THEME["surface_3"], 46),
+            ("↓", self.move_host_down, THEME["surface_3"], 46),
+            ("Ordenar A-Z", self.sort_hosts, THEME["surface_3"], 118),
         ]
-        for text, cmd in action_defs:
-            ctk.CTkButton(actions, text=text, command=cmd, height=36, fg_color=THEME["surface_3"], hover_color=THEME["accent_soft"]).pack(fill="x", pady=(0, 9))
+
+        for idx, (label, command, color, width) in enumerate(actions):
+            ctk.CTkButton(
+                toolbar,
+                text=label,
+                width=width,
+                height=34,
+                command=command,
+                fg_color=color,
+                hover_color=THEME["accent_hover"] if color == THEME["accent"] else THEME["accent_soft"],
+                text_color=THEME["button_text"] if color == THEME["accent"] else THEME["secondary_button_text"],
+            ).pack(side="left", padx=(10 if idx == 0 else 4, 4), pady=9)
+
+        table_header = ctk.CTkFrame(self.right, fg_color=THEME["surface_2"], corner_radius=12)
+        table_header.grid(row=2, column=0, sticky="ew", padx=22, pady=(0, 6))
+        table_header.grid_columnconfigure(0, weight=3, uniform="host_table")
+        table_header.grid_columnconfigure(1, weight=3, uniform="host_table")
+        table_header.grid_columnconfigure(2, weight=1, uniform="host_table")
+
+        for col, label in enumerate(("Nome", "Host/IP", "Viewer")):
+            ctk.CTkLabel(
+                table_header,
+                text=label,
+                font=FONT_SMALL_BOLD,
+                text_color=THEME["muted"],
+                anchor="w" if col < 2 else "center",
+            ).grid(row=0, column=col, sticky="ew", padx=16, pady=8)
+
+        self.host_rows = ctk.CTkScrollableFrame(
+            self.right,
+            fg_color=THEME["bg"],
+            corner_radius=14,
+            scrollbar_button_color=THEME["surface_3"],
+            scrollbar_button_hover_color=THEME["accent_soft"],
+        )
+        self.host_rows.grid(row=3, column=0, sticky="nsew", padx=22, pady=(0, 10))
 
         footer = ctk.CTkFrame(self.right, fg_color="transparent")
-        footer.grid(row=3, column=0, sticky="ew", padx=18, pady=(0, 18))
+        footer.grid(row=4, column=0, sticky="ew", padx=22, pady=(0, 16))
+
         ctk.CTkButton(
             footer,
             text="Fechar",
-            width=120,
+            width=118,
             height=38,
             command=self.close,
             fg_color=THEME["surface_3"],
             hover_color=THEME["accent_soft"],
-            text_color=THEME["text"],
+            text_color=THEME["secondary_button_text"],
         ).pack(side="right", padx=(8, 0))
+
         ctk.CTkButton(
             footer,
             text="Salvar",
-            width=120,
+            width=118,
             height=38,
             command=self.save,
             fg_color=THEME["accent"],
@@ -1492,22 +1728,32 @@ class HostUnitsConfigWindow(ctk.CTkToplevel):
         for idx, item in enumerate(hosts):
             selected = idx == self.selected_host_index
             bg = THEME["accent_soft"] if selected else THEME["surface_2"]
-            row = ctk.CTkFrame(self.host_rows, fg_color=bg, corner_radius=12)
-            row.pack(fill="x", padx=8, pady=5)
-            row.grid_columnconfigure(0, weight=2)
-            row.grid_columnconfigure(1, weight=2)
-            row.grid_columnconfigure(2, weight=1)
 
-            labels = [
-                item.get("name", ""),
-                item.get("host", ""),
+            row = ctk.CTkFrame(self.host_rows, fg_color=bg, corner_radius=10, height=36)
+            row.pack(fill="x", padx=8, pady=3)
+            row.pack_propagate(False)
+            row.grid_columnconfigure(0, weight=3, uniform="host_table")
+            row.grid_columnconfigure(1, weight=3, uniform="host_table")
+            row.grid_columnconfigure(2, weight=1, uniform="host_table")
+
+            values = [
+                str(item.get("name") or ""),
+                str(item.get("host") or ""),
                 viewer_display_name(item.get("viewer")),
             ]
-            for col, text in enumerate(labels):
-                lbl = ctk.CTkLabel(row, text=text, font=FONT_NORMAL, text_color=THEME["text"], anchor="w")
-                lbl.grid(row=0, column=col, sticky="ew", padx=14, pady=10)
-                lbl.bind("<Button-1>", lambda _e, i=idx: self.select_host(i))
-                lbl.bind("<Double-Button-1>", lambda _e, i=idx: self.edit_host_index(i))
+
+            for col, value in enumerate(values):
+                label = ctk.CTkLabel(
+                    row,
+                    text=value,
+                    font=("Segoe UI", 12),
+                    text_color=THEME["text"],
+                    anchor="w" if col < 2 else "center",
+                )
+                label.grid(row=0, column=col, sticky="ew", padx=14, pady=7)
+                label.bind("<Button-1>", lambda _e, i=idx: self.select_host(i))
+                label.bind("<Double-Button-1>", lambda _e, i=idx: self.edit_host_index(i))
+
             row.bind("<Button-1>", lambda _e, i=idx: self.select_host(i))
             row.bind("<Double-Button-1>", lambda _e, i=idx: self.edit_host_index(i))
 
@@ -1709,7 +1955,7 @@ class ViewerPathsWindow(ctk.CTkToplevel):
             text_color=THEME["button_text"],
         ).pack(side="right")
 
-        center_window(self, 720, 360)
+        remember_window_geometry(self, "window_viewer_paths", 720, 360)
         self.transient(parent)
         self.grab_set()
 
@@ -1798,12 +2044,13 @@ class SettingsWindow(ctk.CTkToplevel):
             text_color=THEME["button_text"],
             height=40,
         ).pack(fill="x", padx=18, pady=(8, 18))
-        center_window(self, 420, 490)
+        remember_window_geometry(self, "window_settings", 420, 490)
         self.transient(parent)
         self.grab_set()
 
     def run_and_close(self, command):
         try:
+            save_window_geometry(self, "window_settings")
             self.grab_release()
         except Exception:
             pass
@@ -1818,10 +2065,13 @@ class App(ctk.CTk):
     def __init__(self):
         super().__init__()
         self.title("VNC-Menu")
-        self.geometry("980x610")
         self.minsize(900, 560)
 
         self.settings = load_settings()
+        initial_width, initial_height = self.get_saved_main_window_size()
+        self.geometry(f"{initial_width}x{initial_height}")
+        self._main_geometry_save_after = None
+
         self.dark_mode = bool(self.settings.get("dark_mode", True))
         apply_color_theme(self.dark_mode)
         self.configure(fg_color=THEME["bg"])
@@ -1853,7 +2103,50 @@ class App(ctk.CTk):
         self.update_window_title()
         self.refresh_all()
         self.set_mode("connect")
-        center_window(self, 980, 610)
+        restore_window_geometry(self, "main", initial_width, initial_height)
+
+        self.bind("<Configure>", self.schedule_main_window_size_save)
+        self.protocol("WM_DELETE_WINDOW", self.on_main_close)
+
+    def get_saved_main_window_size(self):
+        geometry = get_window_geometries(self.settings).get("main")
+        if geometry and is_valid_geometry(str(geometry)):
+            width, height = get_geometry_size(str(geometry), 980, 610)
+            return max(900, width), max(560, height)
+
+        raw = str(self.settings.get("main_window_size") or "980x610").lower().strip()
+        try:
+            width_text, height_text = raw.split("x", 1)
+            width = max(900, int(width_text))
+            height = max(560, int(height_text))
+            return width, height
+        except Exception:
+            return 980, 610
+
+    def schedule_main_window_size_save(self, event=None):
+        if event is not None and event.widget is not self:
+            return
+
+        if self.state() == "zoomed":
+            return
+
+        if self._main_geometry_save_after:
+            self.after_cancel(self._main_geometry_save_after)
+
+        self._main_geometry_save_after = self.after(700, self.save_main_window_size)
+
+    def save_main_window_size(self):
+        self._main_geometry_save_after = None
+        save_window_geometry(self, "main")
+        self.settings = load_settings()
+
+    def on_main_close(self):
+        if self._main_geometry_save_after:
+            self.after_cancel(self._main_geometry_save_after)
+            self._main_geometry_save_after = None
+
+        self.save_main_window_size()
+        self.destroy()
 
     def build_sidebar(self):
         self.sidebar = ctk.CTkFrame(self, width=260, fg_color=THEME["surface"], corner_radius=22)
@@ -2061,9 +2354,6 @@ class App(ctk.CTk):
             ).pack(anchor="w", padx=18, pady=18)
             return
 
-        # Host buttons are rendered in packed rows instead of grid columns.
-        # This avoids stale grid weights and scales correctly when the user
-        # changes the number of columns or resizes the window.
         cols = max(1, min(int(self.host_columns), 6))
 
         for start in range(0, len(hosts), cols):
@@ -2072,25 +2362,36 @@ class App(ctk.CTk):
             row_frame.pack(fill="x", padx=8, pady=6)
 
             for item in row_hosts:
+                display_name = str(item.get("name") or "Host")
+                if len(display_name) > 22:
+                    display_name = display_name[:21] + "…"
+
+                # Each button sits inside an equal-width cell. This prevents
+                # longer labels from making one button wider/taller than the others.
+                cell = ctk.CTkFrame(row_frame, fg_color="transparent", height=44)
+                cell.pack(side="left", fill="x", expand=True, padx=6)
+                cell.pack_propagate(False)
+
                 card = ctk.CTkButton(
-                    row_frame,
-                    text=str(item.get("name") or "Host"),
-                    font=FONT_BOLD,
+                    cell,
+                    text=display_name,
+                    font=("Segoe UI", 12, "bold"),
                     text_color=THEME["text"],
                     anchor="center",
-                    height=48,
+                    height=44,
                     fg_color=THEME["surface_2"],
                     hover_color=THEME["accent_soft"],
                     corner_radius=14,
                     command=lambda n=item.get("name"), h=item.get("host"), v=item.get("viewer", DEFAULT_VIEWER): self.run_host_action(n, h, v),
                 )
-                card.pack(side="left", fill="x", expand=True, padx=6)
+                card.pack(fill="both", expand=True)
 
-            # Invisible placeholders keep the last row aligned with previous rows.
             missing = cols - len(row_hosts)
             for _ in range(missing):
-                spacer = ctk.CTkFrame(row_frame, fg_color="transparent", height=48)
+                spacer = ctk.CTkFrame(row_frame, fg_color="transparent", height=44)
                 spacer.pack(side="left", fill="x", expand=True, padx=6)
+                spacer.pack_propagate(False)
+
 
     def on_main_unit_changed(self):
         sector_names = get_sector_names(self.hosts_data, self.selected_unit.get()) or ["Geral"]
