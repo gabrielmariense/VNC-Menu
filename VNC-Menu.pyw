@@ -2,6 +2,7 @@ import base64
 import getpass
 import ctypes
 import json
+import os
 import re
 import shutil
 import subprocess
@@ -50,6 +51,12 @@ USER_DATA_DIR.mkdir(parents=True, exist_ok=True)
 USER_HOSTS_JSON = USER_DATA_DIR / "hosts.json"
 CREDS_JSON = USER_DATA_DIR / "creds.json"
 SETTINGS_JSON = USER_DATA_DIR / "settings.json"
+
+# Fallback for Windows environments where Documents\VNC-Menu\settings.json
+# is blocked by ACLs, OneDrive, antivirus, or a stale read-only file.
+_APPDATA_BASE = Path(os.environ.get("APPDATA") or os.environ.get("LOCALAPPDATA") or (Path.home() / "AppData" / "Roaming"))
+FALLBACK_USER_DATA_DIR = _APPDATA_BASE / "VNC-Menu"
+FALLBACK_SETTINGS_JSON = FALLBACK_USER_DATA_DIR / "settings.json"
 
 try:
     _LOG_USERNAME = getpass.getuser()
@@ -633,8 +640,23 @@ def dpapi_decrypt(ciphertext_b64: str) -> str:
 # JSON e dados da aplicação
 # =========================
 def save_json(data, path):
-    Path(path).parent.mkdir(parents=True, exist_ok=True)
-    Path(path).write_text(json.dumps(data, ensure_ascii=False, indent=2), encoding="utf-8")
+    path = Path(path)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    payload = json.dumps(data, ensure_ascii=False, indent=2)
+
+    try:
+        path.write_text(payload, encoding="utf-8")
+        return True
+    except PermissionError:
+        # Common Windows case: settings.json was created as read-only or inherited
+        # restrictive attributes. Try to clear the read-only bit once.
+        try:
+            if path.exists():
+                path.chmod(0o666)
+            path.write_text(payload, encoding="utf-8")
+            return True
+        except PermissionError:
+            raise
 
 
 def sanitize_viewer(value) -> str:
@@ -784,23 +806,52 @@ def save_creds(user: str, pwd: str) -> None:
     CREDS_JSON.write_text(json.dumps({"user": user, "password": dpapi_encrypt(pwd)}, indent=2), encoding="utf-8")
 
 
-def load_settings():
-    if not SETTINGS_JSON.exists():
-        save_json(DEFAULT_SETTINGS, SETTINGS_JSON)
-        return DEFAULT_SETTINGS.copy()
+def _read_settings_file(path: Path) -> dict | None:
     try:
-        data = json.loads(SETTINGS_JSON.read_text(encoding="utf-8"))
-        merged = DEFAULT_SETTINGS.copy()
+        if not path.exists():
+            return None
+        data = json.loads(path.read_text(encoding="utf-8"))
         if isinstance(data, dict):
+            merged = DEFAULT_SETTINGS.copy()
             merged.update(data)
-        return merged
-    except Exception:
-        log_exception()
-        return DEFAULT_SETTINGS.copy()
+            return merged
+    except Exception as e:
+        log_exception(e)
+    return None
+
+
+def _write_settings_file(path: Path, settings: dict) -> bool:
+    try:
+        save_json(settings, path)
+        return True
+    except Exception as e:
+        log_exception(e)
+        return False
+
+
+def load_settings():
+    # Prefer the fallback if it exists, because it means the primary Documents
+    # settings path was not writable on a previous run.
+    fallback_settings = _read_settings_file(FALLBACK_SETTINGS_JSON)
+    if fallback_settings is not None:
+        return fallback_settings
+
+    primary_settings = _read_settings_file(SETTINGS_JSON)
+    if primary_settings is not None:
+        return primary_settings
+
+    settings = DEFAULT_SETTINGS.copy()
+    if not _write_settings_file(SETTINGS_JSON, settings):
+        _write_settings_file(FALLBACK_SETTINGS_JSON, settings)
+    return settings
 
 
 def save_settings(settings):
-    save_json(settings, SETTINGS_JSON)
+    # Try the original Documents location first. If Windows denies it, save to
+    # AppData instead so the app keeps working and settings still persist.
+    if _write_settings_file(SETTINGS_JSON, settings):
+        return True
+    return _write_settings_file(FALLBACK_SETTINGS_JSON, settings)
 
 
 def _settings_path_value(settings: dict, key: str, default_path: str) -> str:
@@ -2308,7 +2359,7 @@ class App(ctk.CTk):
             text="Host manual",
             width=120,
             height=32,
-            command=self.connect_custom_host,
+            command=self.run_custom_host_action,
             fg_color=THEME["surface_3"],
             hover_color=THEME["accent_soft"],
             text_color=THEME["secondary_button_text"],
@@ -2477,9 +2528,14 @@ class App(ctk.CTk):
         if confirm_action(self, "Confirmar reinício", f"Reiniciar:\n{name}?"):
             try:
                 restart_host(host)
-                show_info(self, "Reiniciar", f"Comando enviado para:\n{name}")
             except Exception as e:
                 show_error(self, "Erro", f"Falha ao reiniciar host:\n{e}\n\nLog: {ERROR_LOG}")
+
+    def run_custom_host_action(self):
+        if self.mode.get() == "restart":
+            self.restart_custom_host()
+            return
+        self.connect_custom_host()
 
     def connect_custom_host(self):
         result = ask_custom_connection(self)
@@ -2495,7 +2551,6 @@ class App(ctk.CTk):
         if confirm_action(self, "Confirmar reinício", f"Reiniciar:\n{target}?"):
             try:
                 restart_host(target)
-                show_info(self, "Reiniciar", f"Comando enviado para:\n{target}")
             except Exception as e:
                 show_error(self, "Erro", f"Falha ao reiniciar host:\n{e}\n\nLog: {ERROR_LOG}")
 
