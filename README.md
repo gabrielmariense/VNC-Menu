@@ -1,8 +1,8 @@
 # VNC-Menu
 
-Interface gráfica para Windows que organiza e abre conexões VNC a partir de uma lista estruturada de hosts.
+Interface gráfica para Windows que organiza conexões VNC e algumas tarefas comuns de suporte remoto a partir de uma lista estruturada de hosts.
 
-O objetivo do projeto é facilitar o acesso rápido a várias máquinas, evitando a abertura manual de diversos perfis VNC e reduzindo a repetição de credenciais no dia a dia.
+O projeto foi criado para agilizar o acesso a várias máquinas, reduzir tarefas repetitivas e centralizar operações como conexão VNC, reinício remoto, consulta de sessões e acesso rápido ao compartilhamento administrativo.
 
 <p align="center">
   <img src="assets/VNC-Menu PROMOCIONAL.png" alt="Preview da interface" width="850">
@@ -10,29 +10,24 @@ O objetivo do projeto é facilitar o acesso rápido a várias máquinas, evitand
 
 ## Funcionalidades
 
-- Interface desktop em CustomTkinter para Windows.
 - Organização de hosts por **Unidade > Setor > Host**.
-- Suporte atual somente a **UltraVNC** e **RealVNC**.
-- Conexões UltraVNC usando um `template.vnc` compartilhado.
-- Conexões RealVNC usando arquivos de perfil `.vnc`.
-- Credenciais por usuário criptografadas com Windows DPAPI.
-- Configurações individuais por usuário.
+- Suporte a **UltraVNC** e **RealVNC**.
+- Credenciais UltraVNC por usuário protegidas com **Windows DPAPI**.
 - Listas de hosts compartilhadas ou pessoais.
-- Seleção da lista de hosts no primeiro uso: **Padrão**, **Personalizada** ou **Vazia**.
-- Aviso antes de editar a lista compartilhada.
-- Ação opcional para reiniciar hosts.
-- Consulta de usuário/sessão logada usando `qwinsta`.
-- Logs de auditoria por usuário na pasta `logs` do aplicativo.
-- Modo escuro.
-- Estrutura compatível com PyInstaller.
+- Modos de ação para **Conectar** e **Reiniciar** hosts.
+- Consulta de sessões remotas com `qwinsta`, executada em segundo plano.
+- Menu de contexto por host com **Copiar IP** e **Abrir pasta** (`\\HOST\c$`).
+- Configuração de hosts, viewers, colunas, tema e posicionamento das janelas.
+- Logs de auditoria e erros por usuário.
+- Compatibilidade com empacotamento via **PyInstaller**.
 
 ## Requisitos
 
 - Windows.
 - Python 3.12 ou superior.
-- UltraVNC Viewer instalado para conexões UltraVNC.
-- RealVNC Viewer instalado para conexões RealVNC.
-- Pacotes Python listados em `requirements.txt`.
+- UltraVNC Viewer para conexões UltraVNC.
+- RealVNC Viewer para conexões RealVNC.
+- Dependências listadas em `requirements.txt`.
 
 Dependências atuais:
 
@@ -52,7 +47,7 @@ Clone o repositório e execute:
 INSTALAR.bat
 ```
 
-O instalador verifica se o Python está disponível, tenta instalar pelo `winget` caso esteja ausente, atualiza o `pip`, instala as dependências e valida os imports principais.
+O instalador verifica a disponibilidade do Python, tenta instalá-lo pelo `winget` caso esteja ausente, atualiza o `pip`, instala as dependências e valida os imports principais.
 
 Instalação manual:
 
@@ -63,54 +58,77 @@ py -3 -m pip install -r requirements.txt
 Executar em modo script:
 
 ```bat
-py -3 VNC-Menu-v5.pyw
+py -3 VNC-Menu.pyw
 ```
 
-## Estrutura recomendada
+## Uso
+
+### Organização dos hosts
+
+Os hosts são organizados em:
 
 ```text
-VNC-Menu/
-├─ VNC-Menu-v5.pyw
-├─ requirements.txt
-├─ INSTALAR.bat
-├─ template.vnc
-├─ hosts.json
-├─ realvnc/
-│  └─ exemplo-perfil.vnc
-└─ logs/
-   └─ <usuario-windows>.log
+Unidade
+└─ Setor
+   └─ Host
 ```
 
-Quando empacotado com PyInstaller, os dados do aplicativo ficam dentro de `_internal`:
+Cada host possui:
+
+- `name`: nome exibido na interface;
+- `host`: hostname ou endereço IP;
+- `viewer`: `ultravnc` ou `realvnc`.
+
+### Ações principais
+
+Na tela principal, selecione o modo desejado:
+
+- **Conectar**: abre o viewer configurado para o host.
+- **Reiniciar**: solicita confirmação e envia um reinício remoto.
+- **Usuários**: consulta sessões remotas com `qwinsta`.
+
+A consulta de usuários é executada em segundo plano para manter a interface responsiva e exibe uma janela de progresso durante a operação.
+
+### Host manual
+
+O botão **Host manual** segue o modo atualmente selecionado:
+
+- em **Conectar**, solicita hostname/IP e viewer;
+- em **Reiniciar**, solicita hostname/IP e confirmação.
+
+Conexões manuais UltraVNC não utilizam o preenchimento automático da senha salva.
+
+### Menu de contexto
+
+Clique com o botão direito sobre um host para acessar:
+
+- **Copiar IP**: copia o valor configurado em `host`;
+- **Abrir pasta**: tenta abrir o compartilhamento administrativo:
 
 ```text
-VNC-Menu/
-├─ VNC-Menu.exe
-└─ _internal/
-   ├─ hosts.json
-   ├─ template.vnc
-   └─ realvnc/
+\\HOST\c$
 ```
 
-Arquivos por usuário:
+O acesso a `C$` depende das permissões do usuário, disponibilidade do SMB, firewall e políticas da rede.
+
+### Edição de hosts
+
+A tela:
 
 ```text
-C:\Users\<usuario>\Documents\VNC-Menu\
-├─ creds.json
-├─ settings.json
-└─ hosts.json
+Configurações > Hosts VNC
 ```
 
-Logs por usuário:
+permite adicionar, editar, remover, reordenar e ordenar hosts, além de gerenciar unidades e setores.
 
-```text
-.\logs\<usuario-windows>.log
-.\logs\<usuario-windows>_error.log
-```
+Na lista de hosts:
+
+- clique simples seleciona;
+- duplo clique abre diretamente a edição do host.
 
 ## Formato do hosts.json
 
-A lista de hosts usa uma estrutura JSON baseada em unidades, setores e hosts.
+Exemplo:
 
 ```json
 {
@@ -146,29 +164,77 @@ ultravnc
 realvnc
 ```
 
-Se `viewer` for omitido ou inválido, o app usa `ultravnc` como padrão.
+Se `viewer` for omitido ou inválido, o aplicativo usa `ultravnc` como padrão.
+
+## Modos da lista de hosts
+
+### Padrão
+
+Usa o `hosts.json` compartilhado da instalação.
+
+Indicado quando vários usuários devem utilizar a mesma lista.
+
+### Personalizada
+
+Cria uma cópia pessoal em:
+
+```text
+Documents\VNC-Menu\hosts.json
+```
+
+Indicado quando o usuário precisa editar sua própria lista sem afetar outros usuários.
+
+### Vazia
+
+Cria uma lista pessoal limpa para iniciar uma configuração do zero.
 
 ## UltraVNC
 
-Caminho esperado do UltraVNC Viewer:
+Caminho padrão:
 
 ```text
 C:\Program Files\uvnc bvba\UltraVNC\vncviewer.exe
 ```
 
-O app usa um arquivo `template.vnc` na pasta de dados do aplicativo. Esse template é copiado para um arquivo temporário, o host de destino é inserido e o UltraVNC é iniciado a partir desse perfil temporário.
+O caminho pode ser alterado em:
+
+```text
+Configurações > Caminhos dos Viewers
+```
+
+O aplicativo usa um `template.vnc` compartilhado. Durante a conexão:
+
+1. o template é copiado para um arquivo temporário;
+2. o UltraVNC é iniciado com `-config`;
+3. o destino é passado separadamente como:
+
+```text
+HOST::5900
+```
+
+Fluxo equivalente:
+
+```text
+vncviewer.exe -config <arquivo-temporario.vnc> HOST::5900
+```
+
+Para hosts cadastrados, o aplicativo pode preencher automaticamente as credenciais UltraVNC salvas. Esse preenchimento é desabilitado em conexões manuais.
 
 ## RealVNC
 
-Caminho esperado do RealVNC Viewer:
+Caminho padrão:
 
 ```text
 C:\Program Files\RealVNC\VNC Viewer\vncviewer.exe
 ```
 
-Os perfis RealVNC devem ficar na pasta `realvnc`.
+O caminho também pode ser alterado em:
 
-Formato esperado:
+```text
+Configurações > Caminhos dos Viewers
+```
+
+Os perfis RealVNC ficam na pasta `realvnc` e seguem o formato:
 
 ```text
 <Setor>_<Nome do Host>.vnc
@@ -180,9 +246,9 @@ Exemplo:
 Support_Workstation 01.vnc
 ```
 
-Se o perfil não existir ou estiver vazio, o app mostra uma janela com opções para criar o arquivo ou copiar o nome esperado.
+Se o perfil não existir ou estiver vazio, o aplicativo informa o arquivo esperado.
 
-## Credenciais
+## Credenciais e configurações por usuário
 
 As credenciais são configuradas em:
 
@@ -190,60 +256,47 @@ As credenciais são configuradas em:
 Configurações > Credenciais
 ```
 
-Elas são salvas por usuário em:
+Arquivos individuais ficam em:
 
 ```text
-Documents\VNC-Menu\creds.json
+C:\Users\<usuario>\Documents\VNC-Menu\
+├─ creds.json
+├─ settings.json
+└─ hosts.json
 ```
 
-As senhas são criptografadas com Windows DPAPI. Isso vincula o arquivo de credenciais ao usuário Windows que criou a senha.
+- `creds.json`: credenciais UltraVNC protegidas com Windows DPAPI.
+- `settings.json`: preferências da interface, caminhos dos viewers, seleção atual e geometria das janelas.
+- `hosts.json`: lista pessoal quando o modo **Personalizada** ou **Vazia** é usado.
 
-## Modos da lista de hosts
+Caso o Windows negue acesso de escrita a `Documents\VNC-Menu\settings.json`, o aplicativo utiliza:
 
-### Padrão
+```text
+%APPDATA%\VNC-Menu\settings.json
+```
 
-Usa o `hosts.json` compartilhado da pasta do aplicativo.
+como fallback para evitar falhas de inicialização.
 
-Indicado quando todos os usuários da mesma instalação devem usar a mesma lista.
+## Logs
 
-### Personalizada
-
-Copia o `hosts.json` compartilhado para `Documents\VNC-Menu`.
-
-Indicado quando o usuário precisa editar sua própria lista sem afetar outros usuários.
-
-### Vazia
-
-Cria uma lista pessoal a partir da estrutura padrão do script.
-
-Indicado para iniciar uma configuração limpa.
-
-## Logs de auditoria
-
-O app grava logs por usuário em:
+Os logs ficam na pasta `logs` do aplicativo:
 
 ```text
 .\logs\<usuario-windows>.log
+.\logs\<usuario-windows>_error.log
 ```
 
-Ações registradas incluem:
+São registrados eventos como:
 
 - início do aplicativo;
-- seleção ou troca da lista de hosts;
-- escolha feita no aviso de edição da lista compartilhada;
-- tentativas e início de conexão VNC;
-- tentativas de reinício;
-- comando de reinício enviado ou erro;
-- consultas de usuários logados;
-- alterações em unidades, setores e hosts;
-- salvamento da lista de hosts;
-- renomeação de perfis RealVNC.
-
-Exemplo:
-
-```text
-[2026-06-25 09:30:12] user=john action=CONNECTION_ATTEMPT details=viewer=UltraVNC; name=Workstation 01; host=192.168.1.10; setor=Support
-```
+- conexões VNC;
+- reinícios remotos;
+- consultas `qwinsta`;
+- alterações na lista de hosts;
+- mudanças de configuração;
+- cópia de host/IP;
+- abertura do compartilhamento `C$`;
+- erros internos.
 
 ## Gerando o executável
 
@@ -264,10 +317,10 @@ py -3 -m PyInstaller ^
   --contents-directory _internal ^
   --add-data "template.vnc;." ^
   --add-data "hosts.json;." ^
-  "VNC-Menu-v5.pyw"
+  "VNC-Menu.pyw"
 ```
 
-Depois do build, coloque os perfis RealVNC em:
+Depois do build, os perfis RealVNC podem ser colocados em:
 
 ```text
 dist\VNC-Menu\_internal\realvnc\
@@ -277,11 +330,11 @@ dist\VNC-Menu\_internal\realvnc\
 
 - Atualmente, somente UltraVNC e RealVNC são suportados.
 - Os viewers VNC não são incluídos no projeto.
-- Credenciais não são compartilhadas entre usuários Windows.
-- Alterações na lista compartilhada afetam todos os usuários que utilizam a mesma pasta do aplicativo.
-- A ação de reiniciar hosts depende das permissões do Windows e da política da rede.
-- A consulta com `qwinsta` depende de permissão para consultar sessões remotas no Windows.
+- Credenciais protegidas por DPAPI não são compartilháveis diretamente entre usuários Windows.
+- Reinício remoto, `qwinsta` e acesso a `C$` dependem das permissões e políticas do ambiente.
+- Alterações na lista compartilhada podem afetar todos os usuários da mesma instalação.
+- Arquivos como `creds.json`, `settings.json` e perfis sensíveis não devem ser versionados.
 
 ## Licença
 
-Defina uma licença antes de publicar o projeto.
+Este projeto é distribuído sob a licença MIT. Consulte o arquivo [LICENSE](https://github.com/gabrielmariense/VNC-Menu/blob/main/LICENSE).
