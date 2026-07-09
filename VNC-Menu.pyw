@@ -300,9 +300,18 @@ def safe_filename(s: str) -> str:
 
 
 def realvnc_profile_name(sector_name: str | None, host_name: str) -> str:
+    # Avoid generating names such as "Host.vnc.vnc" when the configured
+    # display name already includes the .vnc extension.
+    clean_host_name = safe_filename(host_name)
+
+    while clean_host_name.lower().endswith(".vnc"):
+        clean_host_name = clean_host_name[:-4].rstrip()
+
+    clean_host_name = clean_host_name or "host"
+
     if sector_name:
-        return f"{safe_filename(sector_name)}_{safe_filename(host_name)}.vnc"
-    return f"{safe_filename(host_name)}.vnc"
+        return f"{safe_filename(sector_name)}_{clean_host_name}.vnc"
+    return f"{clean_host_name}.vnc"
 
 
 def realvnc_profile_path(sector_name: str | None, host_name: str) -> Path:
