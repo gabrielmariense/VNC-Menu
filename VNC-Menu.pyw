@@ -1078,7 +1078,14 @@ def auto_enter_uvnc_credentials(timeout=AUTH_TIMEOUT) -> bool:
         return False
 
 
-def launch_vnc(host: str, viewer: str = DEFAULT_VIEWER, display_name: str | None = None, sector_name: str | None = None, parent=None):
+def launch_vnc(
+    host: str,
+    viewer: str = DEFAULT_VIEWER,
+    display_name: str | None = None,
+    sector_name: str | None = None,
+    parent=None,
+    auto_credentials: bool = True,
+):
     viewer = sanitize_viewer(viewer)
     host = str(host or "").strip()
     target_name = str(display_name or host or "Host").strip()
@@ -1149,7 +1156,8 @@ def launch_vnc(host: str, viewer: str = DEFAULT_VIEWER, display_name: str | None
         )
         audit_log("CONNECTION_STARTED", f"viewer=UltraVNC; name={target_name}; host={host}; template={TEMPLATE_VNC}")
 
-        auto_enter_uvnc_credentials()
+        if auto_credentials:
+            auto_enter_uvnc_credentials()
 
     except Exception as e:
         audit_log("CONNECTION_ERROR", f"viewer={viewer_display_name(viewer)}; host={host}; error={e}")
@@ -1822,6 +1830,8 @@ class HostUnitsConfigWindow(ctk.CTkToplevel):
         for child in self.host_rows.winfo_children():
             child.destroy()
 
+        self.host_row_widgets = {}
+
         self.path_label.configure(text=f"{self.selected_unit.get()} > {self.selected_sector.get()}")
         hosts = self.current_hosts()
 
@@ -1839,6 +1849,7 @@ class HostUnitsConfigWindow(ctk.CTkToplevel):
             bg = THEME["accent_soft"] if selected else THEME["surface_2"]
 
             row = ctk.CTkFrame(self.host_rows, fg_color=bg, corner_radius=10, height=36)
+            self.host_row_widgets[idx] = row
             row.pack(fill="x", padx=8, pady=3)
             row.pack_propagate(False)
             row.grid_columnconfigure(0, weight=3, uniform="host_table")
@@ -1874,7 +1885,17 @@ class HostUnitsConfigWindow(ctk.CTkToplevel):
 
     def select_host(self, idx):
         self.selected_host_index = idx
-        self.render_hosts()
+
+        # Update selection colors in place instead of rebuilding the list.
+        # Rebuilding on the first click destroyed the widget before Tk could
+        # receive the second click, which prevented double-click editing.
+        for row_idx, row in getattr(self, "host_row_widgets", {}).items():
+            try:
+                row.configure(
+                    fg_color=THEME["accent_soft"] if row_idx == idx else THEME["surface_2"]
+                )
+            except Exception:
+                pass
 
     def on_unit_changed(self):
         sectors = get_sector_names(self.data, self.selected_unit.get()) or ["Geral"]
@@ -2494,6 +2515,11 @@ class App(ctk.CTk):
                     command=lambda n=item.get("name"), h=item.get("host"), v=item.get("viewer", DEFAULT_VIEWER): self.run_host_action(n, h, v),
                 )
                 card.pack(fill="both", expand=True)
+                card.bind(
+                    "<Button-3>",
+                    lambda event, h=item.get("host"): self.show_host_context_menu(event, h),
+                    add="+",
+                )
 
             missing = cols - len(row_hosts)
             for _ in range(missing):
@@ -2520,6 +2546,97 @@ class App(ctk.CTk):
         self.settings["selected_sector"] = self.selected_sector.get()
         save_settings(self.settings)
 
+    def copy_host_to_clipboard(self, host):
+        host = str(host or "").strip()
+        if not host:
+            return
+        try:
+            self.clipboard_clear()
+            self.clipboard_append(host)
+            self.update_idletasks()
+            audit_log("HOST_COPIED", f"host={host}")
+        except Exception as e:
+            log_exception(e)
+            show_error(self, "Copiar host", f"Falha ao copiar host/IP:\n{e}")
+
+    def open_host_admin_share(self, host):
+        host = str(host or "").strip().lstrip("\\\\")
+        if not host:
+            return
+
+        unc_path = rf"\\{host}\c$"
+
+        try:
+            # Use the Windows shell directly, matching the behavior of opening
+            # a UNC path through Win+R more closely than explorer.exe.
+            result = ctypes.windll.shell32.ShellExecuteW(
+                None,
+                "open",
+                unc_path,
+                None,
+                None,
+                1,
+            )
+
+            if result <= 32:
+                raise OSError(f"ShellExecuteW falhou com código {result}")
+
+            audit_log("HOST_ADMIN_SHARE_OPENED", f"host={host}; path={unc_path}")
+        except Exception as e:
+            log_exception(e)
+            audit_log("HOST_ADMIN_SHARE_ERROR", f"host={host}; path={unc_path}; error={e}")
+            show_error(
+                self,
+                "Abrir pasta",
+                f"Falha ao abrir:\n{unc_path}\n\n{e}",
+            )
+
+    def show_host_context_menu(self, event, host):
+        host = str(host or "").strip()
+        if not host:
+            return
+
+        # Keep the menu alive while it is open. Destroying it immediately after
+        # tk_popup()/post() can make the entries visible but prevent commands
+        # from executing when clicked.
+        old_menu = getattr(self, "_host_context_menu", None)
+        if old_menu is not None:
+            try:
+                old_menu.destroy()
+            except Exception:
+                pass
+
+        menu = tk.Menu(self, tearoff=0)
+        self._host_context_menu = menu
+
+        def close_menu():
+            try:
+                menu.unpost()
+            except Exception:
+                pass
+            try:
+                menu.destroy()
+            except Exception:
+                pass
+            if getattr(self, "_host_context_menu", None) is menu:
+                self._host_context_menu = None
+
+        def copy_ip():
+            close_menu()
+            self.copy_host_to_clipboard(host)
+
+        def open_folder():
+            close_menu()
+            self.open_host_admin_share(host)
+
+        menu.add_command(label="Copiar IP", command=copy_ip)
+        menu.add_command(label="Abrir pasta", command=open_folder)
+
+        # post() leaves the menu active until the user selects an item or clicks
+        # elsewhere. Do not destroy it in a finally block.
+        menu.post(event.x_root, event.y_root)
+        menu.focus_set()
+
     def run_host_action(self, name, host, viewer=DEFAULT_VIEWER):
         if self.mode.get() == "connect":
             launch_vnc(host, viewer, name, self.selected_sector.get(), self)
@@ -2542,7 +2659,7 @@ class App(ctk.CTk):
         if not result:
             return
         host, viewer = result
-        launch_vnc(host, viewer, parent=self)
+        launch_vnc(host, viewer, parent=self, auto_credentials=False)
 
     def restart_custom_host(self):
         target = ask_text(self, "Reiniciar host", "Digite o hostname ou IP:")
