@@ -10,6 +10,7 @@ import tempfile
 import threading
 import time
 import traceback
+import webbrowser
 from ctypes import wintypes
 from pathlib import Path
 from typing import Any
@@ -27,6 +28,13 @@ from pywinauto.keyboard import send_keys
 ULTRAVNC_EXE = r"C:\Program Files\uvnc bvba\UltraVNC\vncviewer.exe"
 REALVNC_EXE = r"C:\Program Files\RealVNC\VNC Viewer\vncviewer.exe"
 PORT = 5900
+
+APP_NAME = "VNC-Menu"
+APP_VERSION = "1.0"
+APP_AUTHOR = 'Gabriel "GMErebos" Mariense'
+GITHUB_PROFILE_URL = "https://github.com/gabrielmariense"
+GITHUB_URL = "https://github.com/gabrielmariense/VNC-Menu"
+LICENSE_URL = "https://github.com/gabrielmariense/VNC-Menu/blob/main/LICENSE"
 
 VIEWER_ULTRAVNC = "ultravnc"
 VIEWER_REALVNC = "realvnc"
@@ -2138,6 +2146,203 @@ class ViewerPathsWindow(ctk.CTkToplevel):
 
 
 # =========================
+# Janela Sobre
+# =========================
+class AboutWindow(ctk.CTkToplevel):
+    def __init__(self, parent):
+        super().__init__(parent)
+        self.parent = parent
+
+        self.title(f"Sobre o {APP_NAME}")
+        self.geometry("610x430")
+        self.resizable(False, False)
+        self.configure(fg_color=THEME["bg"])
+
+        outer = ctk.CTkFrame(
+            self,
+            fg_color=THEME["surface"],
+            corner_radius=18,
+        )
+        outer.pack(fill="both", expand=True, padx=18, pady=18)
+
+        ctk.CTkLabel(
+            outer,
+            text=APP_NAME,
+            font=("Segoe UI", 26, "bold"),
+            text_color=THEME["text"],
+        ).pack(anchor="w", padx=22, pady=(20, 0))
+
+        ctk.CTkLabel(
+            outer,
+            text=f"Versão {APP_VERSION}",
+            font=FONT_NORMAL,
+            text_color=THEME["muted"],
+        ).pack(anchor="w", padx=22, pady=(2, 12))
+
+        description = (
+            "Uma central de acesso remoto criada para transformar tarefas "
+            "repetitivas de suporte em um fluxo mais rápido, organizado e direto. "
+            "O VNC-Menu reúne conexões UltraVNC e RealVNC, gerenciamento de hosts "
+            "e ferramentas operacionais em uma única interface."
+        )
+
+        ctk.CTkLabel(
+            outer,
+            text=description,
+            font=FONT_NORMAL,
+            text_color=THEME["muted"],
+            justify="left",
+            anchor="w",
+            wraplength=530,
+        ).pack(fill="x", padx=22, pady=(0, 14))
+
+        info = ctk.CTkFrame(
+            outer,
+            fg_color=THEME["surface_2"],
+            corner_radius=14,
+        )
+        info.pack(fill="x", padx=22, pady=(0, 14))
+        info.grid_columnconfigure(1, weight=1)
+
+        links = [
+            (
+                "Desenvolvido por",
+                APP_AUTHOR,
+                GITHUB_PROFILE_URL,
+            ),
+            (
+                "Repositório",
+                "github.com/gabrielmariense/VNC-Menu",
+                GITHUB_URL,
+            ),
+            (
+                "Licença",
+                "MIT License",
+                LICENSE_URL,
+            ),
+        ]
+
+        for row_index, (label, value, url) in enumerate(links):
+            top_pad = 12 if row_index == 0 else 6
+            bottom_pad = 12 if row_index == len(links) - 1 else 6
+
+            ctk.CTkLabel(
+                info,
+                text=label,
+                font=FONT_SMALL_BOLD,
+                text_color=THEME["muted"],
+                anchor="w",
+            ).grid(
+                row=row_index,
+                column=0,
+                sticky="w",
+                padx=(16, 14),
+                pady=(top_pad, bottom_pad),
+            )
+
+            ctk.CTkButton(
+                info,
+                text=value,
+                height=28,
+                command=lambda target=url: self.open_url(target),
+                font=FONT_SMALL_BOLD,
+                fg_color="transparent",
+                hover_color=THEME["accent_soft"],
+                text_color=THEME["accent_hover"],
+                anchor="w",
+                corner_radius=7,
+            ).grid(
+                row=row_index,
+                column=1,
+                sticky="ew",
+                padx=(0, 16),
+                pady=(top_pad, bottom_pad),
+            )
+
+        buttons = ctk.CTkFrame(
+            outer,
+            fg_color="transparent",
+        )
+        buttons.pack(fill="x", padx=22, pady=(0, 10))
+
+        ctk.CTkButton(
+            buttons,
+            text="Pasta de logs",
+            width=145,
+            height=38,
+            command=self.open_logs_folder,
+            fg_color=THEME["surface_3"],
+            hover_color=THEME["accent_soft"],
+            text_color=THEME["secondary_button_text"],
+        ).pack(side="left")
+
+        ctk.CTkButton(
+            buttons,
+            text="Fechar",
+            width=110,
+            height=38,
+            command=self.destroy,
+            fg_color=THEME["accent"],
+            hover_color=THEME["accent_hover"],
+            text_color=THEME["button_text"],
+        ).pack(side="right")
+
+        ctk.CTkLabel(
+            outer,
+            text=f"© 2026 {APP_AUTHOR}",
+            font=FONT_SMALL,
+            text_color=THEME["muted"],
+        ).pack(anchor="center", pady=(0, 14))
+
+        # New geometry key prevents an older oversized About window geometry
+        # from overriding this compact layout.
+        remember_window_geometry(self, "window_about_v3", 610, 430)
+
+        self.transient(parent)
+        self.grab_set()
+        self.focus_force()
+
+    def open_url(self, url: str):
+        try:
+            if not webbrowser.open_new_tab(url):
+                raise RuntimeError(
+                    "O Windows não encontrou um navegador disponível."
+                )
+
+            audit_log(
+                "ABOUT_LINK_OPENED",
+                f"url={url}",
+            )
+        except Exception as e:
+            log_exception(e)
+            show_error(
+                self,
+                "Sobre o VNC-Menu",
+                f"Falha ao abrir o link:\n{url}\n\n{e}",
+            )
+
+    def open_logs_folder(self):
+        try:
+            LOGS_DIR.mkdir(
+                parents=True,
+                exist_ok=True,
+            )
+            os.startfile(str(LOGS_DIR))
+
+            audit_log(
+                "ABOUT_LOGS_FOLDER_OPENED",
+                f"path={LOGS_DIR}",
+            )
+        except Exception as e:
+            log_exception(e)
+            show_error(
+                self,
+                "Sobre o VNC-Menu",
+                f"Falha ao abrir a pasta de logs:\n{LOGS_DIR}\n\n{e}",
+            )
+
+
+# =========================
 # Janela de configurações
 # =========================
 class SettingsWindow(ctk.CTkToplevel):
@@ -2145,7 +2350,7 @@ class SettingsWindow(ctk.CTkToplevel):
         super().__init__(parent)
         self.parent = parent
         self.title("Configurações")
-        self.geometry("420x490")
+        self.geometry("420x540")
         self.resizable(False, False)
         self.configure(fg_color=THEME["bg"])
 
@@ -2162,6 +2367,7 @@ class SettingsWindow(ctk.CTkToplevel):
             ("Caminhos dos Viewers", parent.open_viewer_paths),
             ("Colunas dos Hosts", parent.open_host_columns_config),
             ("Alternar modo escuro", parent.toggle_dark_mode),
+            ("Sobre o VNC-Menu", parent.open_about),
         ]
         for text, cmd in actions:
             ctk.CTkButton(
@@ -2183,7 +2389,7 @@ class SettingsWindow(ctk.CTkToplevel):
             text_color=THEME["button_text"],
             height=40,
         ).pack(fill="x", padx=18, pady=(8, 18))
-        remember_window_geometry(self, "window_settings", 420, 490)
+        remember_window_geometry(self, "window_settings", 420, 540)
         self.transient(parent)
         self.grab_set()
 
@@ -2400,7 +2606,28 @@ class App(ctk.CTk):
 
         self.footer = ctk.CTkFrame(self.main, fg_color="transparent")
         self.footer.grid(row=3, column=0, sticky="ew", padx=22, pady=(0, 18))
-        self.count_label = ctk.CTkLabel(self.footer, text="", font=FONT_SMALL, text_color=THEME["muted"])
+
+        self.signature_button = ctk.CTkButton(
+            self.footer,
+            text=f"{APP_NAME} v{APP_VERSION} • {APP_AUTHOR}",
+            width=235,
+            height=26,
+            command=self.open_about,
+            font=FONT_SMALL,
+            fg_color="transparent",
+            hover_color=THEME["accent_soft"],
+            text_color=THEME["muted"],
+            anchor="w",
+            corner_radius=8,
+        )
+        self.signature_button.pack(side="left")
+
+        self.count_label = ctk.CTkLabel(
+            self.footer,
+            text="",
+            font=FONT_SMALL,
+            text_color=THEME["muted"],
+        )
         self.count_label.pack(side="right")
 
     def set_mode(self, mode):
@@ -2691,6 +2918,9 @@ class App(ctk.CTk):
 
     def open_settings(self):
         SettingsWindow(self)
+
+    def open_about(self):
+        AboutWindow(self)
 
     def open_hosts_source_config(self):
         source = choose_hosts_source_dialog(self, required=False)

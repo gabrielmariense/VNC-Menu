@@ -1,5 +1,5 @@
-pywinauto==0.6.9
-pyinstaller>=6.0,<7.0
-pywin32>=306
-comtypes>=1.4.0
-customtkinter>=5.2.2
+pywinauto
+pyinstaller
+pywin32
+comtypes
+customtkinter
