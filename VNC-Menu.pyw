@@ -41,6 +41,10 @@ VIEWER_REALVNC = "realvnc"
 VIEWER_OPTIONS = [VIEWER_ULTRAVNC, VIEWER_REALVNC]
 DEFAULT_VIEWER = VIEWER_ULTRAVNC
 
+LOGIN_MODE_AUTO = "auto"
+LOGIN_MODE_MANUAL = "manual"
+LOGIN_MODE_OPTIONS = {LOGIN_MODE_AUTO, LOGIN_MODE_MANUAL}
+
 AUTH_TIMEOUT = 12
 AUTH_TITLE_RE = r".*(UltraVNC|VNC).*(Auth|Authentication).*"
 
@@ -109,6 +113,7 @@ DEFAULT_SETTINGS = {
     "window_geometries": {},
     "ultravnc_exe": ULTRAVNC_EXE,
     "realvnc_exe": REALVNC_EXE,
+    "login_mode": LOGIN_MODE_AUTO,
 }
 
 HOSTS_SOURCE_SHARED = "padrao"
@@ -690,6 +695,13 @@ def viewer_display_name(viewer: str) -> str:
     return "UltraVNC"
 
 
+def normalize_login_mode(value) -> str:
+    value = str(value or "").strip().lower()
+    if value not in LOGIN_MODE_OPTIONS:
+        return LOGIN_MODE_AUTO
+    return value
+
+
 def sanitize_host_list(data):
     hosts = []
     if not isinstance(data, list):
@@ -1101,7 +1113,7 @@ def launch_vnc(
     display_name: str | None = None,
     sector_name: str | None = None,
     parent=None,
-    auto_credentials: bool = True,
+    automatic_login: bool = True,
 ):
     viewer = sanitize_viewer(viewer)
     host = str(host or "").strip()
@@ -1114,7 +1126,11 @@ def launch_vnc(
 
     audit_log(
         "CONNECTION_ATTEMPT",
-        f"viewer={viewer_display_name(viewer)}; name={target_name}; host={host}; setor={sector_name or '-'}",
+        (
+            f"viewer={viewer_display_name(viewer)}; name={target_name}; "
+            f"host={host}; setor={sector_name or '-'}; "
+            f"login_mode={'automatico' if automatic_login else 'manual'}"
+        ),
     )
 
     try:
@@ -1125,6 +1141,22 @@ def launch_vnc(
             if not realvnc_exe:
                 audit_log("CONNECTION_ERROR", f"viewer=RealVNC; host={host}; reason=viewer_not_found; path={configured_realvnc}")
                 show_error(parent, "Erro", f"RealVNC Viewer não encontrado:\n{configured_realvnc}")
+                return
+
+            if not automatic_login:
+                subprocess.Popen(
+                    [realvnc_exe, host],
+                    stdout=subprocess.DEVNULL,
+                    stderr=subprocess.DEVNULL,
+                    cwd=str(Path(realvnc_exe).parent),
+                )
+                audit_log(
+                    "CONNECTION_STARTED",
+                    (
+                        f"viewer=RealVNC; name={target_name}; host={host}; "
+                        "login_mode=manual; profile=bypassed"
+                    ),
+                )
                 return
 
             profile_name = realvnc_profile_name(sector_name, target_name)
@@ -1173,7 +1205,7 @@ def launch_vnc(
         )
         audit_log("CONNECTION_STARTED", f"viewer=UltraVNC; name={target_name}; host={host}; template={TEMPLATE_VNC}")
 
-        if auto_credentials:
+        if automatic_login:
             auto_enter_uvnc_credentials()
 
     except Exception as e:
@@ -2439,6 +2471,11 @@ class App(ctk.CTk):
         self.selected_sector = tk.StringVar(value=saved_sector)
         self.host_columns = get_host_columns(self.settings)
         self.mode = tk.StringVar(value="connect")
+        self.login_mode = tk.StringVar(
+            value=normalize_login_mode(
+                self.settings.get("login_mode", LOGIN_MODE_AUTO)
+            )
+        )
 
         self.grid_columnconfigure(1, weight=1)
         self.grid_rowconfigure(0, weight=1)
@@ -2588,10 +2625,33 @@ class App(ctk.CTk):
         hint = ctk.CTkFrame(self.main, fg_color=THEME["surface_2"], corner_radius=16)
         hint.grid(row=1, column=0, sticky="ew", padx=22, pady=(0, 16))
         hint.grid_columnconfigure(0, weight=1)
-        self.mode_label = ctk.CTkLabel(hint, text="", font=FONT_NORMAL, text_color=THEME["muted"], anchor="w")
-        self.mode_label.grid(row=0, column=0, sticky="ew", padx=16, pady=12)
-        ctk.CTkButton(
+
+        self.mode_label = ctk.CTkLabel(
             hint,
+            text="",
+            font=FONT_NORMAL,
+            text_color=THEME["muted"],
+            anchor="w",
+        )
+        self.mode_label.grid(
+            row=0,
+            column=0,
+            sticky="ew",
+            padx=(16, 10),
+            pady=12,
+        )
+
+        hint_actions = ctk.CTkFrame(hint, fg_color="transparent")
+        hint_actions.grid(
+            row=0,
+            column=1,
+            sticky="e",
+            padx=(0, 12),
+            pady=10,
+        )
+
+        ctk.CTkButton(
+            hint_actions,
             text="Host manual",
             width=120,
             height=32,
@@ -2599,7 +2659,18 @@ class App(ctk.CTk):
             fg_color=THEME["surface_3"],
             hover_color=THEME["accent_soft"],
             text_color=THEME["secondary_button_text"],
-        ).grid(row=0, column=1, padx=12, pady=10)
+        ).pack(side="left", padx=(0, 8))
+
+        self.btn_login_mode = ctk.CTkButton(
+            hint_actions,
+            text="",
+            width=145,
+            height=32,
+            command=self.toggle_login_mode,
+            text_color=THEME["button_text"],
+        )
+        self.btn_login_mode.pack(side="left")
+        self.update_login_mode_button()
 
         self.host_grid = ctk.CTkScrollableFrame(self.main, fg_color=THEME["bg"], corner_radius=18)
         self.host_grid.grid(row=2, column=0, sticky="nsew", padx=22, pady=(0, 18))
@@ -2630,16 +2701,54 @@ class App(ctk.CTk):
         )
         self.count_label.pack(side="right")
 
+    def update_login_mode_button(self):
+        if not hasattr(self, "btn_login_mode"):
+            return
+
+        mode = normalize_login_mode(self.login_mode.get())
+
+        if mode == LOGIN_MODE_MANUAL:
+            self.btn_login_mode.configure(
+                text="Login manual",
+                fg_color=THEME["surface_3"],
+                hover_color=THEME["accent_soft"],
+                text_color=THEME["secondary_button_text"],
+            )
+        else:
+            self.btn_login_mode.configure(
+                text="Login automático",
+                fg_color=THEME["accent"],
+                hover_color=THEME["accent_hover"],
+                text_color=THEME["button_text"],
+            )
+
+    def toggle_login_mode(self):
+        current = normalize_login_mode(self.login_mode.get())
+        new_mode = (
+            LOGIN_MODE_MANUAL
+            if current == LOGIN_MODE_AUTO
+            else LOGIN_MODE_AUTO
+        )
+
+        self.login_mode.set(new_mode)
+        self.settings["login_mode"] = new_mode
+        save_settings(self.settings)
+        self.update_login_mode_button()
+        audit_log("LOGIN_MODE_CHANGED", f"mode={new_mode}")
+
+    def automatic_login_enabled(self) -> bool:
+        return normalize_login_mode(self.login_mode.get()) == LOGIN_MODE_AUTO
+
     def set_mode(self, mode):
         self.mode.set(mode)
         if mode == "connect":
             self.btn_connect.configure(fg_color=THEME["accent"], hover_color=THEME["accent_hover"], text_color=THEME["button_text"])
             self.btn_restart.configure(fg_color=THEME["surface_3"], hover_color=THEME["accent_soft"], text_color=THEME["secondary_button_text"])
-            self.mode_label.configure(text="Modo atual: conectar ao host selecionado.")
+            self.mode_label.configure(text="CONECTAR AO HOST:")
         else:
             self.btn_connect.configure(fg_color=THEME["surface_3"], hover_color=THEME["accent_soft"], text_color=THEME["secondary_button_text"])
             self.btn_restart.configure(fg_color=THEME["warning"], hover_color=THEME["warning_hover"], text_color=THEME["button_text"])
-            self.mode_label.configure(text="Modo atual: reiniciar o host selecionado. A confirmação será solicitada.")
+            self.mode_label.configure(text="REINICIAR O HOST:")
 
     def toggle_dark_mode(self):
         self.dark_mode = not self.dark_mode
@@ -2875,7 +2984,14 @@ class App(ctk.CTk):
 
     def run_host_action(self, name, host, viewer=DEFAULT_VIEWER):
         if self.mode.get() == "connect":
-            launch_vnc(host, viewer, name, self.selected_sector.get(), self)
+            launch_vnc(
+                host,
+                viewer,
+                name,
+                self.selected_sector.get(),
+                self,
+                automatic_login=self.automatic_login_enabled(),
+            )
             return
 
         if confirm_action(self, "Confirmar reinício", f"Reiniciar:\n{name}?"):
@@ -2895,7 +3011,12 @@ class App(ctk.CTk):
         if not result:
             return
         host, viewer = result
-        launch_vnc(host, viewer, parent=self, auto_credentials=False)
+        launch_vnc(
+            host,
+            viewer,
+            parent=self,
+            automatic_login=self.automatic_login_enabled(),
+        )
 
     def restart_custom_host(self):
         target = ask_text(self, "Reiniciar host", "Digite o hostname ou IP:")
