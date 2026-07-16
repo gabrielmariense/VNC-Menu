@@ -30,7 +30,7 @@ REALVNC_EXE = r"C:\Program Files\RealVNC\VNC Viewer\vncviewer.exe"
 PORT = 5900
 
 APP_NAME = "VNC-Menu"
-APP_VERSION = "1.2"
+APP_VERSION = "1.3"
 APP_AUTHOR = 'Gabriel "GMErebos" Mariense'
 GITHUB_PROFILE_URL = "https://github.com/gabrielmariense"
 GITHUB_URL = "https://github.com/gabrielmariense/VNC-Menu"
@@ -130,41 +130,41 @@ ctk.set_default_color_theme("blue")
 ctk.set_widget_scaling(1.0)
 
 DARK_THEME = {
-    "bg": "#07111f",
-    "surface": "#0b1726",
-    "surface_2": "#10243a",
-    "surface_3": "#1b3554",
-    "border": "#2a4a66",
-    "accent": "#2f81f7",
-    "accent_hover": "#58a6ff",
-    "accent_soft": "#1b4d7a",
-    "text": "#f8fbff",
-    "muted": "#a9bed5",
+    "bg": "#21182d",
+    "surface": "#2b2039",
+    "surface_2": "#38294a",
+    "surface_3": "#553d70",
+    "border": "#70568d",
+    "accent": "#8b5cf6",
+    "accent_hover": "#a78bfa",
+    "accent_soft": "#634591",
+    "text": "#fff9ff",
+    "muted": "#d3c0df",
     "button_text": "#ffffff",
-    "secondary_button_text": "#eaf3ff",
-    "danger": "#9b2c2c",
-    "danger_hover": "#b83a3a",
-    "warning": "#b7791f",
-    "warning_hover": "#d69e2e",
+    "secondary_button_text": "#ffffff",
+    "danger": "#a83b5b",
+    "danger_hover": "#c44d70",
+    "warning": "#b7793f",
+    "warning_hover": "#d39458",
 }
 
 LIGHT_THEME = {
-    "bg": "#c9d8e8",
-    "surface": "#f4f8fc",
-    "surface_2": "#e3eef8",
-    "surface_3": "#4e6e8e",
-    "border": "#9ab0c7",
-    "accent": "#2563eb",
-    "accent_hover": "#1d4ed8",
-    "accent_soft": "#b9d4f0",
-    "text": "#0f1b2a",
-    "muted": "#40546a",
+    "bg": "#dcb9c5",
+    "surface": "#fff4f6",
+    "surface_2": "#f1dce4",
+    "surface_3": "#d7a8bc",
+    "border": "#c792a9",
+    "accent": "#7c4dc4",
+    "accent_hover": "#693ba9",
+    "accent_soft": "#e3bfd0",
+    "text": "#2f1d2e",
+    "muted": "#674557",
     "button_text": "#ffffff",
-    "secondary_button_text": "#ffffff",
-    "danger": "#b42318",
-    "danger_hover": "#d92d20",
-    "warning": "#b7791f",
-    "warning_hover": "#945c12",
+    "secondary_button_text": "#2f1d2e",
+    "danger": "#a82f4c",
+    "danger_hover": "#c23d5c",
+    "warning": "#a96832",
+    "warning_hover": "#8c5226",
 }
 
 THEME = DARK_THEME.copy()
@@ -407,8 +407,8 @@ def confirm_action(parent, title, message) -> bool:
     def no():
         win.destroy()
 
-    ctk.CTkButton(buttons, text="Cancelar", command=no, fg_color=THEME["surface_3"], hover_color=THEME["accent_soft"]).pack(side="right", padx=(8, 0))
-    ctk.CTkButton(buttons, text="Confirmar", command=yes, fg_color=THEME["accent"], hover_color=THEME["accent_hover"]).pack(side="right")
+    ctk.CTkButton(buttons, text_color=THEME["secondary_button_text"], font=FONT_BOLD, text="Cancelar", command=no, fg_color=THEME["surface_3"], hover_color=THEME["accent_soft"]).pack(side="right", padx=(8, 0))
+    ctk.CTkButton(buttons, text_color=THEME["button_text"], font=FONT_BOLD, text="Confirmar", command=yes, fg_color=THEME["accent"], hover_color=THEME["accent_hover"]).pack(side="right")
 
     remember_window_geometry(win, f"dialog_text_{safe_filename(title)}", 420, 210)
     modal_window(win, parent)
@@ -470,6 +470,7 @@ def confirm_empty_list_overwrite(parent) -> bool:
 
     ctk.CTkButton(
         buttons,
+        font=FONT_BOLD,
         text="Cancelar",
         width=120,
         height=38,
@@ -481,6 +482,7 @@ def confirm_empty_list_overwrite(parent) -> bool:
 
     ctk.CTkButton(
         buttons,
+        font=FONT_BOLD,
         text="Sobrescrever",
         width=135,
         height=38,
@@ -516,7 +518,15 @@ def ask_text(parent: Any, title: str, label: str, initial: str = "") -> str | No
     ctk.CTkLabel(box, text=title, font=FONT_SUBTITLE, text_color=THEME["text"]).pack(anchor="w", padx=18, pady=(18, 8))
     ctk.CTkLabel(box, text=label, font=FONT_NORMAL, text_color=THEME["muted"]).pack(anchor="w", padx=18, pady=(0, 8))
 
-    entry = ctk.CTkEntry(box, width=380, height=38)
+    entry = ctk.CTkEntry(
+        box,
+        width=380,
+        height=38,
+        fg_color=THEME["surface_2"],
+        border_color=THEME["border"],
+        text_color=THEME["text"],
+        placeholder_text_color=THEME["muted"],
+    )
     entry.pack(fill="x", padx=18, pady=(0, 18))
     entry.insert(0, initial or "")
     entry.focus_set()
@@ -533,8 +543,8 @@ def ask_text(parent: Any, title: str, label: str, initial: str = "") -> str | No
     def cancel():
         win.destroy()
 
-    ctk.CTkButton(buttons, text="Cancelar", command=cancel, fg_color=THEME["surface_3"], hover_color=THEME["accent_soft"]).pack(side="right", padx=(8, 0))
-    ctk.CTkButton(buttons, text="OK", command=ok, fg_color=THEME["accent"], hover_color=THEME["accent_hover"]).pack(side="right")
+    ctk.CTkButton(buttons, text_color=THEME["secondary_button_text"], font=FONT_BOLD, text="Cancelar", command=cancel, fg_color=THEME["surface_3"], hover_color=THEME["accent_soft"]).pack(side="right", padx=(8, 0))
+    ctk.CTkButton(buttons, text_color=THEME["button_text"], font=FONT_BOLD, text="OK", command=ok, fg_color=THEME["accent"], hover_color=THEME["accent_hover"]).pack(side="right")
     win.bind("<Return>", ok)
     win.bind("<Escape>", lambda _e: cancel())
 
@@ -558,18 +568,47 @@ def ask_host_details(parent: Any, title: str, initial: dict[str, str] | None = N
     ctk.CTkLabel(box, text=title, font=FONT_SUBTITLE, text_color=THEME["text"]).grid(row=0, column=0, columnspan=2, sticky="w", padx=18, pady=(18, 16))
 
     ctk.CTkLabel(box, text="Nome", font=FONT_NORMAL, text_color=THEME["muted"]).grid(row=1, column=0, sticky="w", padx=18, pady=(0, 6))
-    name_entry = ctk.CTkEntry(box, width=360, height=36)
+    name_entry = ctk.CTkEntry(
+        box,
+        width=360,
+        height=36,
+        fg_color=THEME["surface_2"],
+        border_color=THEME["border"],
+        text_color=THEME["text"],
+        placeholder_text_color=THEME["muted"],
+    )
     name_entry.grid(row=2, column=0, columnspan=2, sticky="ew", padx=18, pady=(0, 14))
     name_entry.insert(0, initial.get("name", ""))
 
     ctk.CTkLabel(box, text="Host/IP", font=FONT_NORMAL, text_color=THEME["muted"]).grid(row=3, column=0, sticky="w", padx=18, pady=(0, 6))
-    host_entry = ctk.CTkEntry(box, width=360, height=36)
+    host_entry = ctk.CTkEntry(
+        box,
+        width=360,
+        height=36,
+        fg_color=THEME["surface_2"],
+        border_color=THEME["border"],
+        text_color=THEME["text"],
+        placeholder_text_color=THEME["muted"],
+    )
     host_entry.grid(row=4, column=0, columnspan=2, sticky="ew", padx=18, pady=(0, 14))
     host_entry.insert(0, initial.get("host", ""))
 
     ctk.CTkLabel(box, text="Viewer", font=FONT_NORMAL, text_color=THEME["muted"]).grid(row=5, column=0, sticky="w", padx=18, pady=(0, 6))
     viewer_var = tk.StringVar(value=sanitize_viewer(initial.get("viewer", DEFAULT_VIEWER)))
-    viewer_menu = ctk.CTkOptionMenu(box, values=VIEWER_OPTIONS, variable=viewer_var, width=180)
+    viewer_menu = ctk.CTkOptionMenu(
+        box,
+        font=FONT_BOLD,
+        values=VIEWER_OPTIONS,
+        variable=viewer_var,
+        width=180,
+        fg_color=THEME["surface_3"],
+        button_color=THEME["accent_soft"],
+        button_hover_color=THEME["accent_hover"],
+        text_color=THEME["secondary_button_text"],
+        dropdown_fg_color=THEME["surface"],
+        dropdown_hover_color=THEME["accent_soft"],
+        dropdown_text_color=THEME["text"],
+    )
     viewer_menu.grid(row=6, column=0, sticky="w", padx=18, pady=(0, 18))
 
     buttons = ctk.CTkFrame(box, fg_color="transparent")
@@ -587,8 +626,8 @@ def ask_host_details(parent: Any, title: str, initial: dict[str, str] | None = N
     def cancel():
         win.destroy()
 
-    ctk.CTkButton(buttons, text="Cancelar", command=cancel, fg_color=THEME["surface_3"], hover_color=THEME["accent_soft"]).pack(side="right", padx=(8, 0))
-    ctk.CTkButton(buttons, text="Salvar", command=ok, fg_color=THEME["accent"], hover_color=THEME["accent_hover"]).pack(side="right")
+    ctk.CTkButton(buttons, text_color=THEME["secondary_button_text"], font=FONT_BOLD, text="Cancelar", command=cancel, fg_color=THEME["surface_3"], hover_color=THEME["accent_soft"]).pack(side="right", padx=(8, 0))
+    ctk.CTkButton(buttons, text_color=THEME["button_text"], font=FONT_BOLD, text="Salvar", command=ok, fg_color=THEME["accent"], hover_color=THEME["accent_hover"]).pack(side="right")
     win.bind("<Return>", ok)
     win.bind("<Escape>", lambda _e: cancel())
 
@@ -611,12 +650,34 @@ def ask_custom_connection(parent: Any) -> tuple[str, str] | None:
     ctk.CTkLabel(box, text="Conexão manual", font=FONT_SUBTITLE, text_color=THEME["text"]).pack(anchor="w", padx=18, pady=(18, 8))
     ctk.CTkLabel(box, text="Digite o hostname ou IP e selecione o viewer.", font=FONT_NORMAL, text_color=THEME["muted"]).pack(anchor="w", padx=18, pady=(0, 14))
 
-    entry = ctk.CTkEntry(box, width=380, height=38, placeholder_text="hostname ou IP")
+    entry = ctk.CTkEntry(
+        box,
+        width=380,
+        height=38,
+        placeholder_text="hostname ou IP",
+        fg_color=THEME["surface_2"],
+        border_color=THEME["border"],
+        text_color=THEME["text"],
+        placeholder_text_color=THEME["muted"],
+    )
     entry.pack(fill="x", padx=18, pady=(0, 14))
     entry.focus_set()
 
     viewer_var = tk.StringVar(value=DEFAULT_VIEWER)
-    ctk.CTkOptionMenu(box, values=VIEWER_OPTIONS, variable=viewer_var, width=180).pack(anchor="w", padx=18, pady=(0, 18))
+    ctk.CTkOptionMenu(
+        box,
+        font=FONT_BOLD,
+        values=VIEWER_OPTIONS,
+        variable=viewer_var,
+        width=180,
+        fg_color=THEME["surface_3"],
+        button_color=THEME["accent_soft"],
+        button_hover_color=THEME["accent_hover"],
+        text_color=THEME["secondary_button_text"],
+        dropdown_fg_color=THEME["surface"],
+        dropdown_hover_color=THEME["accent_soft"],
+        dropdown_text_color=THEME["text"],
+    ).pack(anchor="w", padx=18, pady=(0, 18))
 
     buttons = ctk.CTkFrame(box, fg_color="transparent")
     buttons.pack(fill="x", padx=18, pady=(0, 18))
@@ -632,8 +693,8 @@ def ask_custom_connection(parent: Any) -> tuple[str, str] | None:
     def cancel():
         win.destroy()
 
-    ctk.CTkButton(buttons, text="Cancelar", command=cancel, fg_color=THEME["surface_3"], hover_color=THEME["accent_soft"]).pack(side="right", padx=(8, 0))
-    ctk.CTkButton(buttons, text="Conectar", command=ok, fg_color=THEME["accent"], hover_color=THEME["accent_hover"]).pack(side="right")
+    ctk.CTkButton(buttons, text_color=THEME["secondary_button_text"], font=FONT_BOLD, text="Cancelar", command=cancel, fg_color=THEME["surface_3"], hover_color=THEME["accent_soft"]).pack(side="right", padx=(8, 0))
+    ctk.CTkButton(buttons, text_color=THEME["button_text"], font=FONT_BOLD, text="Conectar", command=ok, fg_color=THEME["accent"], hover_color=THEME["accent_hover"]).pack(side="right")
     win.bind("<Return>", ok)
     win.bind("<Escape>", lambda _e: cancel())
 
@@ -683,9 +744,9 @@ def show_realvnc_profile_dialog(parent, profile_path: Path, profile_name: str):
         except Exception as e:
             show_error(win, "RealVNC", f"Falha ao copiar nome:\n{e}")
 
-    ctk.CTkButton(buttons, text="Fechar", command=win.destroy, fg_color=THEME["surface_3"], hover_color=THEME["accent_soft"]).pack(side="right", padx=(8, 0))
-    ctk.CTkButton(buttons, text="Copiar nome", command=copy_name, fg_color=THEME["surface_3"], hover_color=THEME["accent_soft"]).pack(side="right", padx=(8, 0))
-    ctk.CTkButton(buttons, text="Criar arquivo", command=create_empty, fg_color=THEME["accent"], hover_color=THEME["accent_hover"]).pack(side="right")
+    ctk.CTkButton(buttons, text_color=THEME["secondary_button_text"], font=FONT_BOLD, text="Fechar", command=win.destroy, fg_color=THEME["surface_3"], hover_color=THEME["accent_soft"]).pack(side="right", padx=(8, 0))
+    ctk.CTkButton(buttons, text_color=THEME["secondary_button_text"], font=FONT_BOLD, text="Copiar nome", command=copy_name, fg_color=THEME["surface_3"], hover_color=THEME["accent_soft"]).pack(side="right", padx=(8, 0))
+    ctk.CTkButton(buttons, text_color=THEME["button_text"], font=FONT_BOLD, text="Criar arquivo", command=create_empty, fg_color=THEME["accent"], hover_color=THEME["accent_hover"]).pack(side="right")
 
     remember_window_geometry(win, "dialog_hosts_source_select", 620, 335)
     modal_window(win, parent)
@@ -1124,11 +1185,11 @@ def choose_hosts_source_dialog(parent, required=False) -> str | None:
         result["value"] = value
         win.destroy()
 
-    ctk.CTkButton(buttons, text="Padrão", command=lambda: choose(HOSTS_SOURCE_SHARED), fg_color=THEME["accent"], hover_color=THEME["accent_hover"]).pack(side="left", padx=(0, 8))
-    ctk.CTkButton(buttons, text="Personalizada", command=lambda: choose(HOSTS_SOURCE_CUSTOM), fg_color=THEME["surface_3"], hover_color=THEME["accent_soft"]).pack(side="left", padx=(0, 8))
-    ctk.CTkButton(buttons, text="Vazia", command=lambda: choose(HOSTS_SOURCE_EMPTY), fg_color=THEME["surface_3"], hover_color=THEME["accent_soft"]).pack(side="left", padx=(0, 8))
+    ctk.CTkButton(buttons, text_color=THEME["button_text"], font=FONT_BOLD, text="Padrão", command=lambda: choose(HOSTS_SOURCE_SHARED), fg_color=THEME["accent"], hover_color=THEME["accent_hover"]).pack(side="left", padx=(0, 8))
+    ctk.CTkButton(buttons, text_color=THEME["secondary_button_text"], font=FONT_BOLD, text="Personalizada", command=lambda: choose(HOSTS_SOURCE_CUSTOM), fg_color=THEME["surface_3"], hover_color=THEME["accent_soft"]).pack(side="left", padx=(0, 8))
+    ctk.CTkButton(buttons, text_color=THEME["secondary_button_text"], font=FONT_BOLD, text="Vazia", command=lambda: choose(HOSTS_SOURCE_EMPTY), fg_color=THEME["surface_3"], hover_color=THEME["accent_soft"]).pack(side="left", padx=(0, 8))
     if not required:
-        ctk.CTkButton(buttons, text="Cancelar", command=win.destroy, fg_color=THEME["surface_3"], hover_color=THEME["accent_soft"]).pack(side="right")
+        ctk.CTkButton(buttons, text_color=THEME["secondary_button_text"], font=FONT_BOLD, text="Cancelar", command=win.destroy, fg_color=THEME["surface_3"], hover_color=THEME["accent_soft"]).pack(side="right")
 
     remember_window_geometry(win, "dialog_hosts_source_select", 620)
     modal_window(win, parent)
@@ -1179,16 +1240,18 @@ def shared_hosts_edit_warning(parent):
         result["value"] = value
         win.destroy()
 
-    ctk.CTkButton(buttons, text="Cancelar", command=lambda: choose("cancel"), fg_color=THEME["surface_3"], hover_color=THEME["accent_soft"]).pack(side="right", padx=(8, 0))
+    ctk.CTkButton(buttons, text_color=THEME["secondary_button_text"], font=FONT_BOLD, text="Cancelar", command=lambda: choose("cancel"), fg_color=THEME["surface_3"], hover_color=THEME["accent_soft"]).pack(side="right", padx=(8, 0))
     personal_button_text = "Usar personalizada" if personal_exists else "Criar cópia"
     ctk.CTkButton(
         buttons,
+        text_color=THEME["secondary_button_text"],
+        font=FONT_BOLD,
         text=personal_button_text,
         command=lambda: choose("copy"),
         fg_color=THEME["surface_3"],
         hover_color=THEME["accent_soft"],
     ).pack(side="right", padx=(8, 0))
-    ctk.CTkButton(buttons, text="Editar padrão", command=lambda: choose("continue"), fg_color=THEME["accent"], hover_color=THEME["accent_hover"]).pack(side="right")
+    ctk.CTkButton(buttons, text_color=THEME["button_text"], font=FONT_BOLD, text="Editar padrão", command=lambda: choose("continue"), fg_color=THEME["accent"], hover_color=THEME["accent_hover"]).pack(side="right")
 
     remember_window_geometry(win, "dialog_shared_hosts_warning", 610)
     modal_window(win, parent)
@@ -1475,6 +1538,7 @@ def show_text_window(parent, title, content):
 
     ctk.CTkButton(
         outer,
+        font=FONT_BOLD,
         text="Fechar",
         width=140,
         height=36,
@@ -1577,12 +1641,27 @@ class CredsWindow(ctk.CTkToplevel):
         ctk.CTkLabel(box, text="Salvas por usuário usando Windows DPAPI.", font=FONT_NORMAL, text_color=THEME["muted"]).pack(anchor="w", padx=18, pady=(0, 18))
 
         ctk.CTkLabel(box, text="Usuário", font=FONT_NORMAL, text_color=THEME["muted"]).pack(anchor="w", padx=18, pady=(0, 6))
-        self.user_entry = ctk.CTkEntry(box, height=36)
+        self.user_entry = ctk.CTkEntry(
+            box,
+            height=36,
+            fg_color=THEME["surface_2"],
+            border_color=THEME["border"],
+            text_color=THEME["text"],
+            placeholder_text_color=THEME["muted"],
+        )
         self.user_entry.pack(fill="x", padx=18, pady=(0, 14))
         self.user_entry.insert(0, user)
 
         ctk.CTkLabel(box, text="Senha", font=FONT_NORMAL, text_color=THEME["muted"]).pack(anchor="w", padx=18, pady=(0, 6))
-        self.pwd_entry = ctk.CTkEntry(box, height=36, show="*")
+        self.pwd_entry = ctk.CTkEntry(
+            box,
+            height=36,
+            show="*",
+            fg_color=THEME["surface_2"],
+            border_color=THEME["border"],
+            text_color=THEME["text"],
+            placeholder_text_color=THEME["muted"],
+        )
         self.pwd_entry.pack(fill="x", padx=18, pady=(0, 18))
         self.pwd_entry.insert(0, pwd)
 
@@ -1590,6 +1669,7 @@ class CredsWindow(ctk.CTkToplevel):
         buttons.pack(fill="x", padx=18, pady=(8, 18))
         ctk.CTkButton(
             buttons,
+            font=FONT_BOLD,
             text="Cancelar",
             width=130,
             height=42,
@@ -1600,6 +1680,7 @@ class CredsWindow(ctk.CTkToplevel):
         ).pack(side="right", padx=(10, 0))
         ctk.CTkButton(
             buttons,
+            font=FONT_BOLD,
             text="Salvar",
             width=130,
             height=42,
@@ -1658,9 +1739,9 @@ class SimpleListEditor(ctk.CTkToplevel):
             ("Remover", self.remove_item),
             ("A-Z", self.sort_items),
         ]:
-            ctk.CTkButton(actions, text=text, command=cmd, width=70, fg_color=THEME["surface_3"], hover_color=THEME["accent_soft"]).pack(side="left", padx=(0, 8))
+            ctk.CTkButton(actions, text_color=THEME["secondary_button_text"], font=FONT_BOLD, text=text, command=cmd, width=70, fg_color=THEME["surface_3"], hover_color=THEME["accent_soft"]).pack(side="left", padx=(0, 8))
 
-        ctk.CTkButton(actions, text="Fechar", command=self.destroy, width=80, fg_color=THEME["accent"], hover_color=THEME["accent_hover"]).pack(side="right")
+        ctk.CTkButton(actions, text_color=THEME["button_text"], font=FONT_BOLD, text="Fechar", command=self.destroy, width=80, fg_color=THEME["accent"], hover_color=THEME["accent_hover"]).pack(side="right")
 
         self.render_items()
         remember_window_geometry(self, f"window_list_editor_{safe_filename(title)}", 520, 520)
@@ -1685,11 +1766,21 @@ class SimpleListEditor(ctk.CTkToplevel):
             selected = idx == self.selected_index
             row = ctk.CTkButton(
                 self.list_frame,
+                font=FONT_BOLD,
                 text=self.get_item_name(item),
                 anchor="w",
                 height=38,
-                fg_color=THEME["accent_soft"] if selected else THEME["surface_2"],
-                hover_color=THEME["accent_soft"],
+                fg_color=THEME["accent"] if selected else THEME["surface_2"],
+                hover_color=(
+                    THEME["accent_hover"]
+                    if selected
+                    else THEME["accent_soft"]
+                ),
+                text_color=(
+                    THEME["button_text"]
+                    if selected
+                    else THEME["text"]
+                ),
                 command=lambda i=idx: self.select(i),
             )
             row.pack(fill="x", padx=8, pady=5)
@@ -1849,11 +1940,25 @@ class HostUnitsConfigWindow(ctk.CTkToplevel):
         ctk.CTkLabel(self.left, text="Lista de Hosts", font=FONT_SUBTITLE, text_color=THEME["text"]).pack(anchor="w", padx=18, pady=(20, 14))
 
         ctk.CTkLabel(self.left, text="Unidade", font=FONT_SMALL_BOLD, text_color=THEME["muted"]).pack(anchor="w", padx=18, pady=(0, 6))
-        self.unit_menu = ctk.CTkOptionMenu(self.left, values=get_unit_names(self.data) or ["Geral"], variable=self.selected_unit, command=lambda _v: self.on_unit_changed())
+        self.unit_menu = ctk.CTkOptionMenu(
+            self.left,
+            font=FONT_BOLD,
+            values=get_unit_names(self.data) or ["Geral"],
+            variable=self.selected_unit,
+            command=lambda _v: self.on_unit_changed(),
+            fg_color=THEME["surface_3"],
+            button_color=THEME["accent_soft"],
+            button_hover_color=THEME["accent_hover"],
+            text_color=THEME["secondary_button_text"],
+            dropdown_fg_color=THEME["surface"],
+            dropdown_hover_color=THEME["accent_soft"],
+            dropdown_text_color=THEME["text"],
+        )
         self.unit_menu.pack(fill="x", padx=18, pady=(0, 12))
 
         ctk.CTkButton(
             self.left,
+            font=FONT_BOLD,
             text="Editar Unidades",
             command=self.open_units_editor,
             fg_color=THEME["surface_3"],
@@ -1867,6 +1972,7 @@ class HostUnitsConfigWindow(ctk.CTkToplevel):
 
         ctk.CTkButton(
             self.left,
+            font=FONT_BOLD,
             text="Editar Setores",
             command=self.open_sectors_editor,
             fg_color=THEME["surface_3"],
@@ -1898,6 +2004,7 @@ class HostUnitsConfigWindow(ctk.CTkToplevel):
         for idx, (label, command, color, width) in enumerate(actions):
             ctk.CTkButton(
                 toolbar,
+                font=FONT_BOLD,
                 text=label,
                 width=width,
                 height=34,
@@ -1936,6 +2043,7 @@ class HostUnitsConfigWindow(ctk.CTkToplevel):
 
         ctk.CTkButton(
             footer,
+            font=FONT_BOLD,
             text="Fechar",
             width=118,
             height=38,
@@ -1947,6 +2055,7 @@ class HostUnitsConfigWindow(ctk.CTkToplevel):
 
         ctk.CTkButton(
             footer,
+            font=FONT_BOLD,
             text="Salvar",
             width=118,
             height=38,
@@ -2004,11 +2113,21 @@ class HostUnitsConfigWindow(ctk.CTkToplevel):
             selected = name == self.selected_sector.get()
             btn = ctk.CTkButton(
                 self.sector_frame,
+                font=FONT_BOLD,
                 text=name,
                 anchor="w",
                 height=38,
-                fg_color=THEME["accent_soft"] if selected else THEME["surface_2"],
-                hover_color=THEME["accent_soft"],
+                fg_color=THEME["accent"] if selected else THEME["surface_2"],
+                hover_color=(
+                    THEME["accent_hover"]
+                    if selected
+                    else THEME["accent_soft"]
+                ),
+                text_color=(
+                    THEME["button_text"]
+                    if selected
+                    else THEME["text"]
+                ),
                 command=lambda n=name: self.select_sector(n),
             )
             btn.pack(fill="x", padx=8, pady=5)
@@ -2241,6 +2360,7 @@ class ViewerPathsWindow(ctk.CTkToplevel):
 
         ctk.CTkButton(
             buttons,
+            font=FONT_BOLD,
             text="Restaurar padrão",
             width=150,
             height=40,
@@ -2252,6 +2372,7 @@ class ViewerPathsWindow(ctk.CTkToplevel):
 
         ctk.CTkButton(
             buttons,
+            font=FONT_BOLD,
             text="Cancelar",
             width=120,
             height=40,
@@ -2263,6 +2384,7 @@ class ViewerPathsWindow(ctk.CTkToplevel):
 
         ctk.CTkButton(
             buttons,
+            font=FONT_BOLD,
             text="Salvar",
             width=120,
             height=40,
@@ -2278,10 +2400,19 @@ class ViewerPathsWindow(ctk.CTkToplevel):
 
     def _path_row(self, parent, row: int, label: str, variable: tk.StringVar):
         ctk.CTkLabel(parent, text=label, font=FONT_SMALL_BOLD, text_color=THEME["muted"]).grid(row=row, column=0, columnspan=3, sticky="w", padx=18, pady=(0, 6))
-        entry = ctk.CTkEntry(parent, textvariable=variable, height=38)
+        entry = ctk.CTkEntry(
+            parent,
+            textvariable=variable,
+            height=38,
+            fg_color=THEME["surface_2"],
+            border_color=THEME["border"],
+            text_color=THEME["text"],
+            placeholder_text_color=THEME["muted"],
+        )
         entry.grid(row=row + 1, column=0, sticky="ew", padx=(18, 8), pady=(0, 12))
         ctk.CTkButton(
             parent,
+            font=FONT_BOLD,
             text="Selecionar",
             width=110,
             height=38,
@@ -2437,6 +2568,7 @@ class AboutWindow(ctk.CTkToplevel):
 
         ctk.CTkButton(
             buttons,
+            font=FONT_BOLD,
             text="Pasta de logs",
             width=145,
             height=38,
@@ -2448,6 +2580,7 @@ class AboutWindow(ctk.CTkToplevel):
 
         ctk.CTkButton(
             buttons,
+            font=FONT_BOLD,
             text="Fechar",
             width=110,
             height=38,
@@ -2542,6 +2675,7 @@ class SettingsWindow(ctk.CTkToplevel):
         for text, cmd in actions:
             ctk.CTkButton(
                 box,
+                font=FONT_BOLD,
                 text=text,
                 command=lambda c=cmd: self.run_and_close(c),
                 height=40,
@@ -2552,6 +2686,7 @@ class SettingsWindow(ctk.CTkToplevel):
 
         ctk.CTkButton(
             box,
+            font=FONT_BOLD,
             text="Fechar",
             command=self.destroy,
             fg_color=THEME["accent"],
@@ -2567,10 +2702,23 @@ class SettingsWindow(ctk.CTkToplevel):
         try:
             save_window_geometry(self, "window_settings")
             self.grab_release()
-        except Exception:
+
+            # Hide the window without withdrawing or destroying it.
+            # CustomTkinter may still have pending focus and Windows title-bar
+            # callbacks while the appearance mode is being changed.
+            self.attributes("-alpha", 0.0)
+        except tk.TclError:
             pass
-        self.destroy()
-        self.parent.after(80, command)
+
+        def safe_destroy():
+            try:
+                if self.winfo_exists():
+                    self.destroy()
+            except tk.TclError:
+                pass
+
+        self.parent.after(100, command)
+        self.parent.after(1000, safe_destroy)
 
 
 # =========================
@@ -2680,13 +2828,14 @@ class App(ctk.CTk):
         ctk.CTkLabel(self.sidebar, text="UNIDADE", font=FONT_SMALL_BOLD, text_color=THEME["muted"]).pack(anchor="w", padx=20, pady=(0, 6))
         self.unit_menu = ctk.CTkOptionMenu(
             self.sidebar,
+            font=FONT_BOLD,
             values=self.unit_names,
             variable=self.selected_unit,
             command=lambda _v: self.on_main_unit_changed(),
             fg_color=THEME["surface_3"],
             button_color=THEME["accent_soft"],
             button_hover_color=THEME["accent_hover"],
-            text_color=THEME["button_text"],
+            text_color=THEME["secondary_button_text"],
             dropdown_fg_color=THEME["surface"],
             dropdown_hover_color=THEME["accent_soft"],
             dropdown_text_color=THEME["text"],
@@ -2699,12 +2848,13 @@ class App(ctk.CTk):
 
         ctk.CTkButton(
             self.sidebar,
+            font=FONT_BOLD,
             text="Configurações",
             height=42,
             command=self.open_settings,
             fg_color=THEME["surface_3"],
             hover_color=THEME["accent_soft"],
-            text_color=THEME["secondary_button_text"],
+            text_color=THEME["text"],
         ).pack(fill="x", padx=20, pady=(0, 20))
 
     def build_main_panel(self):
@@ -2728,6 +2878,7 @@ class App(ctk.CTk):
 
         self.btn_connect = ctk.CTkButton(
             actions,
+            font=FONT_BOLD,
             text="Conectar",
             width=110,
             height=38,
@@ -2739,6 +2890,7 @@ class App(ctk.CTk):
 
         self.btn_restart = ctk.CTkButton(
             actions,
+            font=FONT_BOLD,
             text="Reiniciar",
             width=110,
             height=38,
@@ -2750,6 +2902,7 @@ class App(ctk.CTk):
 
         self.btn_users = ctk.CTkButton(
             actions,
+            font=FONT_BOLD,
             text="Usuários",
             width=110,
             height=38,
@@ -2790,6 +2943,7 @@ class App(ctk.CTk):
 
         ctk.CTkButton(
             hint_actions,
+            font=FONT_BOLD,
             text="Host manual",
             width=120,
             height=32,
@@ -2801,6 +2955,7 @@ class App(ctk.CTk):
 
         self.btn_login_mode = ctk.CTkButton(
             hint_actions,
+            font=FONT_BOLD,
             text="",
             width=145,
             height=32,
@@ -2939,12 +3094,21 @@ class App(ctk.CTk):
             selected = name == self.selected_sector.get()
             btn = ctk.CTkButton(
                 self.sector_frame,
+                font=FONT_BOLD,
                 text=name,
                 anchor="w",
                 height=38,
-                fg_color=THEME["accent_soft"] if selected else THEME["surface_2"],
-                hover_color=THEME["accent_soft"],
-                text_color=THEME["text"],
+                fg_color=THEME["accent"] if selected else THEME["surface_2"],
+                hover_color=(
+                    THEME["accent_hover"]
+                    if selected
+                    else THEME["accent_soft"]
+                ),
+                text_color=(
+                    THEME["button_text"]
+                    if selected
+                    else THEME["text"]
+                ),
                 command=lambda n=name: self.set_sector(n),
             )
             btn.pack(fill="x", padx=8, pady=5)
