@@ -942,29 +942,50 @@ def update_hosts_file_setting(settings):
     save_settings(settings)
 
 
-def copy_shared_hosts_to_user(overwrite=True):
+def copy_shared_hosts_to_user(overwrite=False):
+    """
+    Create the personal hosts file only when it does not already exist.
+
+    A previously configured personal list must never be replaced merely because
+    the user switched to the shared list and later selected Personalizada again.
+    """
     USER_HOSTS_JSON.parent.mkdir(parents=True, exist_ok=True)
+
     if USER_HOSTS_JSON.exists() and not overwrite:
-        return
+        return "existing"
+
     if SHARED_HOSTS_JSON.exists():
         shutil.copy2(SHARED_HOSTS_JSON, USER_HOSTS_JSON)
-    else:
-        save_json(DEFAULT_HOSTS, USER_HOSTS_JSON)
+        return "copied"
+
+    save_json(DEFAULT_HOSTS, USER_HOSTS_JSON)
+    return "created_default"
 
 
 def create_empty_user_hosts(overwrite=True):
     USER_HOSTS_JSON.parent.mkdir(parents=True, exist_ok=True)
     if USER_HOSTS_JSON.exists() and not overwrite:
-        return
+        return "existing"
     save_json(DEFAULT_HOSTS, USER_HOSTS_JSON)
+    return "created_empty"
 
 
 def set_hosts_source(settings, source: str, overwrite_user_file=True):
     source = normalize_hosts_source(source) or HOSTS_SOURCE_SHARED
+
     if source == HOSTS_SOURCE_CUSTOM:
-        copy_shared_hosts_to_user(overwrite=overwrite_user_file)
+        # Selecting Personalizada only changes the active source when a
+        # personal hosts.json already exists. The shared list is copied only
+        # on the first use, preventing accidental loss of custom hosts.
+        personal_state = copy_shared_hosts_to_user(overwrite=False)
+        audit_log(
+            "PERSONAL_HOSTS_SOURCE_PREPARED",
+            f"state={personal_state}; file={USER_HOSTS_JSON}",
+        )
+
     elif source == HOSTS_SOURCE_EMPTY:
         create_empty_user_hosts(overwrite=overwrite_user_file)
+
     settings["hosts_source"] = source
     settings["hosts_file"] = str(get_hosts_path_for_source(source))
     save_settings(settings)
@@ -988,7 +1009,8 @@ def choose_hosts_source_dialog(parent, required=False):
     msg = (
         "Escolha como esta instalação deve carregar os hosts.\n\n"
         "Padrão: lista compartilhada da pasta do aplicativo.\n"
-        "Personalizada: cópia pessoal em Documents\\VNC-Menu.\n"
+        "Personalizada: usa sua lista em Documents\\VNC-Menu; "
+        "uma cópia da lista padrão é criada somente no primeiro uso.\n"
         "Vazia: lista pessoal limpa para este usuário."
     )
     ctk.CTkLabel(box, text=msg, font=FONT_NORMAL, text_color=THEME["muted"], justify="left").pack(anchor="w", padx=18, pady=(0, 16))
@@ -1033,11 +1055,18 @@ def shared_hosts_edit_warning(parent):
     box.pack(fill="both", expand=True, padx=18, pady=18)
 
     ctk.CTkLabel(box, text="Lista compartilhada", font=FONT_SUBTITLE, text_color=THEME["text"]).pack(anchor="w", padx=18, pady=(18, 8))
+    personal_exists = USER_HOSTS_JSON.exists()
+    personal_action = (
+        "Usar personalizada: abre a lista pessoal já existente."
+        if personal_exists
+        else "Criar cópia: cria uma lista pessoal a partir da lista padrão."
+    )
+
     msg = (
         "A lista Padrão é compartilhada.\n"
         "Qualquer alteração pode afetar outros usuários desta instalação.\n\n"
         "Editar padrão: altera o arquivo compartilhado.\n"
-        "Criar cópia: muda para uma lista pessoal deste usuário."
+        f"{personal_action}"
     )
     ctk.CTkLabel(box, text=msg, font=FONT_NORMAL, text_color=THEME["muted"], justify="left").pack(anchor="w", padx=18, pady=(0, 16))
 
@@ -1049,7 +1078,14 @@ def shared_hosts_edit_warning(parent):
         win.destroy()
 
     ctk.CTkButton(buttons, text="Cancelar", command=lambda: choose("cancel"), fg_color=THEME["surface_3"], hover_color=THEME["accent_soft"]).pack(side="right", padx=(8, 0))
-    ctk.CTkButton(buttons, text="Criar cópia", command=lambda: choose("copy"), fg_color=THEME["surface_3"], hover_color=THEME["accent_soft"]).pack(side="right", padx=(8, 0))
+    personal_button_text = "Usar personalizada" if personal_exists else "Criar cópia"
+    ctk.CTkButton(
+        buttons,
+        text=personal_button_text,
+        command=lambda: choose("copy"),
+        fg_color=THEME["surface_3"],
+        hover_color=THEME["accent_soft"],
+    ).pack(side="right", padx=(8, 0))
     ctk.CTkButton(buttons, text="Editar padrão", command=lambda: choose("continue"), fg_color=THEME["accent"], hover_color=THEME["accent_hover"]).pack(side="right")
 
     remember_window_geometry(win, "dialog_shared_hosts_warning", 610)
@@ -2744,11 +2780,11 @@ class App(ctk.CTk):
         if mode == "connect":
             self.btn_connect.configure(fg_color=THEME["accent"], hover_color=THEME["accent_hover"], text_color=THEME["button_text"])
             self.btn_restart.configure(fg_color=THEME["surface_3"], hover_color=THEME["accent_soft"], text_color=THEME["secondary_button_text"])
-            self.mode_label.configure(text="CONECTAR AO HOST:")
+            self.mode_label.configure(text="Modo atual: conectar ao host selecionado.")
         else:
             self.btn_connect.configure(fg_color=THEME["surface_3"], hover_color=THEME["accent_soft"], text_color=THEME["secondary_button_text"])
             self.btn_restart.configure(fg_color=THEME["warning"], hover_color=THEME["warning_hover"], text_color=THEME["button_text"])
-            self.mode_label.configure(text="REINICIAR O HOST:")
+            self.mode_label.configure(text="Modo atual: reiniciar o host selecionado. A confirmação será solicitada.")
 
     def toggle_dark_mode(self):
         self.dark_mode = not self.dark_mode
