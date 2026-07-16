@@ -415,6 +415,94 @@ def confirm_action(parent, title, message) -> bool:
     return result["value"]
 
 
+def confirm_empty_list_overwrite(parent) -> bool:
+    result = {"value": False}
+
+    win = ctk.CTkToplevel(parent)
+    win.title("Sobrescrever lista pessoal")
+    win.resizable(False, False)
+    win.configure(fg_color=THEME["bg"])
+
+    box = ctk.CTkFrame(
+        win,
+        fg_color=THEME["surface"],
+        corner_radius=18,
+    )
+    box.pack(fill="both", expand=True, padx=18, pady=18)
+
+    ctk.CTkLabel(
+        box,
+        text="Sobrescrever lista pessoal?",
+        font=FONT_SUBTITLE,
+        text_color=THEME["text"],
+    ).pack(anchor="w", padx=18, pady=(18, 8))
+
+    message = (
+        "Já existe uma lista pessoal salva neste computador.\n\n"
+        f"Arquivo:\n{USER_HOSTS_JSON}\n\n"
+        "Ao selecionar Vazia, essa lista será substituída por uma nova "
+        "lista limpa e todos os hosts personalizados atuais serão perdidos."
+    )
+
+    ctk.CTkLabel(
+        box,
+        text=message,
+        font=FONT_NORMAL,
+        text_color=THEME["muted"],
+        justify="left",
+        anchor="w",
+        wraplength=520,
+    ).pack(fill="x", padx=18, pady=(0, 18))
+
+    buttons = ctk.CTkFrame(
+        box,
+        fg_color="transparent",
+    )
+    buttons.pack(fill="x", padx=18, pady=(0, 18))
+
+    def cancel():
+        result["value"] = False
+        win.destroy()
+
+    def confirm():
+        result["value"] = True
+        win.destroy()
+
+    ctk.CTkButton(
+        buttons,
+        text="Cancelar",
+        width=120,
+        height=38,
+        command=cancel,
+        fg_color=THEME["surface_3"],
+        hover_color=THEME["accent_soft"],
+        text_color=THEME["secondary_button_text"],
+    ).pack(side="right", padx=(8, 0))
+
+    ctk.CTkButton(
+        buttons,
+        text="Sobrescrever",
+        width=135,
+        height=38,
+        command=confirm,
+        fg_color=THEME["danger"],
+        hover_color=THEME["danger_hover"],
+        text_color=THEME["button_text"],
+    ).pack(side="right")
+
+    win.protocol("WM_DELETE_WINDOW", cancel)
+    win.bind("<Escape>", lambda _event: cancel())
+
+    remember_window_geometry(
+        win,
+        "dialog_empty_hosts_overwrite_v2",
+        600,
+        330,
+    )
+    modal_window(win, parent)
+    return result["value"]
+
+
 def ask_text(parent: Any, title: str, label: str, initial: str = "") -> str | None:
     result: dict[str, str | None] = {"value": None}
     win = ctk.CTkToplevel(parent)
@@ -994,8 +1082,8 @@ def set_hosts_source(settings, source: str, overwrite_user_file=True):
 # =========================
 # Seleção da lista de hosts
 # =========================
-def choose_hosts_source_dialog(parent, required=False):
-    result = {"value": None}
+def choose_hosts_source_dialog(parent, required=False) -> str | None:
+    result: dict[str, str | None] = {"value": None}
     win = ctk.CTkToplevel(parent)
     win.title("Selecionar lista de hosts")
     win.resizable(False, False)
@@ -1009,8 +1097,7 @@ def choose_hosts_source_dialog(parent, required=False):
     msg = (
         "Escolha como esta instalação deve carregar os hosts.\n\n"
         "Padrão: lista compartilhada da pasta do aplicativo.\n"
-        "Personalizada: usa sua lista em Documents\\VNC-Menu; "
-        "uma cópia da lista padrão é criada somente no primeiro uso.\n"
+        "Personalizada: lista própria em Documents\\VNC-Menu;\n"
         "Vazia: lista pessoal limpa para este usuário."
     )
     ctk.CTkLabel(box, text=msg, font=FONT_NORMAL, text_color=THEME["muted"], justify="left").pack(anchor="w", padx=18, pady=(0, 16))
@@ -1018,7 +1105,22 @@ def choose_hosts_source_dialog(parent, required=False):
     buttons = ctk.CTkFrame(box, fg_color="transparent")
     buttons.pack(fill="x", padx=18, pady=(0, 18))
 
-    def choose(value):
+    def choose(value: str) -> None:
+        if value == HOSTS_SOURCE_EMPTY and USER_HOSTS_JSON.exists():
+            confirmed = confirm_empty_list_overwrite(win)
+
+            if not confirmed:
+                audit_log(
+                    "EMPTY_HOSTS_SOURCE_OVERWRITE_CANCELLED",
+                    f"file={USER_HOSTS_JSON}",
+                )
+                return
+
+            audit_log(
+                "EMPTY_HOSTS_SOURCE_OVERWRITE_CONFIRMED",
+                f"file={USER_HOSTS_JSON}",
+            )
+
         result["value"] = value
         win.destroy()
 
