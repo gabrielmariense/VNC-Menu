@@ -3037,11 +3037,11 @@ class App(ctk.CTk):
         if mode == "connect":
             self.btn_connect.configure(fg_color=THEME["accent"], hover_color=THEME["accent_hover"], text_color=THEME["button_text"])
             self.btn_restart.configure(fg_color=THEME["surface_3"], hover_color=THEME["accent_soft"], text_color=THEME["secondary_button_text"])
-            self.mode_label.configure(text="Modo atual: conectar ao host selecionado.")
+            self.mode_label.configure(text="Modo atual: CONECTAR.")
         else:
             self.btn_connect.configure(fg_color=THEME["surface_3"], hover_color=THEME["accent_soft"], text_color=THEME["secondary_button_text"])
             self.btn_restart.configure(fg_color=THEME["warning"], hover_color=THEME["warning_hover"], text_color=THEME["button_text"])
-            self.mode_label.configure(text="Modo atual: reiniciar o host selecionado. A confirmação será solicitada.")
+            self.mode_label.configure(text="Modo atual: REINICIAR.")
 
     def toggle_dark_mode(self):
         self.dark_mode = not self.dark_mode
