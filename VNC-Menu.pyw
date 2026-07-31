@@ -35,7 +35,7 @@ REALVNC_EXE = r"C:\Program Files\RealVNC\VNC Viewer\vncviewer.exe"
 PORT = 5900
 
 APP_NAME = "VNC-Menu"
-APP_VERSION = "1.4.3"
+APP_VERSION = "1.4.4"
 APP_AUTHOR = 'Gabriel "GMErebos" Mariense'
 GITHUB_PROFILE_URL = "https://github.com/gabrielmariense"
 GITHUB_URL = "https://github.com/gabrielmariense/VNC-Menu"
@@ -2763,6 +2763,61 @@ class ViewerPathsWindow(ctk.CTkToplevel):
 # =========================
 # Janelas de atualização
 # =========================
+def format_release_notes_for_display(markdown_text: str) -> str:
+    """Convert common GitHub release Markdown into clean readable text."""
+    source_lines = str(markdown_text or "").replace("\r\n", "\n").splitlines()
+    output = []
+    first_content_seen = False
+
+    for raw_line in source_lines:
+        line = raw_line.strip()
+
+        if not line:
+            if output and output[-1] != "":
+                output.append("")
+            continue
+
+        if line.startswith("```"):
+            continue
+
+        heading_match = re.match(r"^#{1,6}\s+(.+)$", line)
+        if heading_match:
+            heading = heading_match.group(1).strip()
+
+            if not first_content_seen and re.match(
+                r"(?i)^vnc-menu\s+v?\d",
+                heading,
+            ):
+                first_content_seen = True
+                continue
+
+            heading = re.sub(r"[*_`]", "", heading).strip()
+            if output and output[-1] != "":
+                output.append("")
+            output.append(heading.upper())
+            first_content_seen = True
+            continue
+
+        bullet_match = re.match(r"^[-*+]\s+(.+)$", line)
+        if bullet_match:
+            content = bullet_match.group(1).strip()
+            content = re.sub(r"\[([^\]]+)\]\([^\)]+\)", r"\1", content)
+            content = re.sub(r"[*_`]", "", content)
+            output.append(f"• {content}")
+            first_content_seen = True
+            continue
+
+        line = re.sub(r"\[([^\]]+)\]\([^\)]+\)", r"\1", line)
+        line = re.sub(r"[*_`]", "", line)
+        output.append(line)
+        first_content_seen = True
+
+    while output and output[-1] == "":
+        output.pop()
+
+    return "\n".join(output) or "Nenhuma nota de versão informada."
+
+
 class UpdateCheckProgressWindow(ctk.CTkToplevel):
     def __init__(self, parent):
         super().__init__(parent)
@@ -2869,52 +2924,178 @@ class UpdateAvailableWindow(ctk.CTkToplevel):
         super().__init__(parent)
         self.parent = parent
         self.release = release
-        self.latest_version = normalize_release_version(release.get("tag_name", ""))
+        self.latest_version = normalize_release_version(
+            release.get("tag_name", "")
+        )
+
+        notes = format_release_notes_for_display(
+            str(release.get("body") or "")
+        )
+
+        # Size the window from the amount of release-note text instead of using
+        # one oversized fixed height. Keep enough room for all footer buttons.
+        note_lines = max(len(notes.splitlines()), 1)
+        notes_height = min(max(105 + (note_lines * 18), 145), 220)
+        window_height = min(max(315 + notes_height, 450), 525)
 
         self.title("Atualização disponível")
-        self.geometry("680x510")
-        self.minsize(620, 460)
+        self.geometry(f"660x{window_height}")
+        self.resizable(False, False)
         self.configure(fg_color=THEME["bg"])
+        self.protocol("WM_DELETE_WINDOW", self.destroy)
 
-        outer = ctk.CTkFrame(self, fg_color=THEME["surface"], corner_radius=18)
-        outer.pack(fill="both", expand=True, padx=18, pady=18)
+        outer = ctk.CTkFrame(
+            self,
+            fg_color=THEME["surface"],
+            corner_radius=20,
+        )
+        outer.pack(fill="both", expand=True, padx=14, pady=14)
+
+        header = ctk.CTkFrame(
+            outer,
+            fg_color="transparent",
+        )
+        header.pack(fill="x", padx=20, pady=(18, 12))
 
         ctk.CTkLabel(
-            outer,
+            header,
             text="Nova atualização disponível",
-            font=FONT_SUBTITLE,
+            font=("Segoe UI", 20, "bold"),
             text_color=THEME["text"],
-        ).pack(anchor="w", padx=20, pady=(18, 6))
+        ).pack(anchor="w")
 
         ctk.CTkLabel(
-            outer,
-            text=f"Instalada: {APP_VERSION}    Nova: {self.latest_version}",
-            font=FONT_BOLD,
-            text_color=THEME["accent_hover"],
-        ).pack(anchor="w", padx=20, pady=(0, 12))
+            header,
+            text="Uma versão mais recente do VNC-Menu está pronta para instalação.",
+            font=FONT_NORMAL,
+            text_color=THEME["muted"],
+        ).pack(anchor="w", pady=(4, 0))
 
-        notes = str(release.get("body") or "Nenhuma nota de versão informada.").strip()
+        version_card = ctk.CTkFrame(
+            outer,
+            fg_color=THEME["surface_2"],
+            corner_radius=15,
+        )
+        version_card.pack(fill="x", padx=20, pady=(0, 14))
+        version_card.grid_columnconfigure((0, 2), weight=1)
+
+        current_box = ctk.CTkFrame(
+            version_card,
+            fg_color="transparent",
+        )
+        current_box.grid(
+            row=0,
+            column=0,
+            sticky="ew",
+            padx=(16, 8),
+            pady=12,
+        )
+
+        ctk.CTkLabel(
+            current_box,
+            text="VERSÃO INSTALADA",
+            font=FONT_SMALL_BOLD,
+            text_color=THEME["muted"],
+        ).pack(anchor="w")
+
+        ctk.CTkLabel(
+            current_box,
+            text=APP_VERSION,
+            font=("Segoe UI", 19, "bold"),
+            text_color=THEME["text"],
+        ).pack(anchor="w", pady=(2, 0))
+
+        ctk.CTkLabel(
+            version_card,
+            text="→",
+            font=("Segoe UI", 22, "bold"),
+            text_color=THEME["accent_hover"],
+        ).grid(row=0, column=1, padx=10)
+
+        new_box = ctk.CTkFrame(
+            version_card,
+            fg_color="transparent",
+        )
+        new_box.grid(
+            row=0,
+            column=2,
+            sticky="ew",
+            padx=(8, 16),
+            pady=12,
+        )
+
+        ctk.CTkLabel(
+            new_box,
+            text="NOVA VERSÃO",
+            font=FONT_SMALL_BOLD,
+            text_color=THEME["muted"],
+        ).pack(anchor="w")
+
+        ctk.CTkLabel(
+            new_box,
+            text=self.latest_version,
+            font=("Segoe UI", 19, "bold"),
+            text_color=THEME["accent_hover"],
+        ).pack(anchor="w", pady=(2, 0))
+
+        notes_header = ctk.CTkFrame(
+            outer,
+            fg_color="transparent",
+        )
+        notes_header.pack(fill="x", padx=20, pady=(0, 7))
+
+        ctk.CTkLabel(
+            notes_header,
+            text="Notas da versão",
+            font=FONT_BOLD,
+            text_color=THEME["text"],
+        ).pack(side="left")
+
+        release_name = str(release.get("name") or "").strip()
+        if release_name:
+            ctk.CTkLabel(
+                notes_header,
+                text=release_name,
+                font=FONT_SMALL,
+                text_color=THEME["muted"],
+            ).pack(side="right")
+
         notes_box = ctk.CTkTextbox(
             outer,
-            height=280,
+            height=notes_height,
             font=("Segoe UI", 12),
             fg_color=THEME["bg"],
             text_color=THEME["text"],
-            corner_radius=12,
+            border_width=1,
+            border_color=THEME["border"],
+            corner_radius=13,
             wrap="word",
+            spacing1=3,
+            spacing3=3,
         )
-        notes_box.pack(fill="both", expand=True, padx=20, pady=(0, 14))
+        notes_box.pack(
+            fill="both",
+            expand=True,
+            padx=20,
+            pady=(0, 14),
+        )
         notes_box.insert("1.0", notes)
         notes_box.configure(state="disabled")
 
-        buttons = ctk.CTkFrame(outer, fg_color="transparent")
-        buttons.pack(fill="x", padx=20, pady=(0, 18))
+        footer = ctk.CTkFrame(
+            outer,
+            fg_color="transparent",
+            height=42,
+        )
+        footer.pack(fill="x", padx=20, pady=(0, 18))
+        footer.pack_propagate(False)
 
         ctk.CTkButton(
-            buttons,
+            footer,
             text="Atualizar agora",
             font=FONT_BOLD,
-            width=145,
+            width=148,
+            height=38,
             command=self.start_update,
             fg_color=THEME["accent"],
             hover_color=THEME["accent_hover"],
@@ -2922,41 +3103,52 @@ class UpdateAvailableWindow(ctk.CTkToplevel):
         ).pack(side="left")
 
         ctk.CTkButton(
-            buttons,
+            footer,
             text="Ver no GitHub",
             font=FONT_BOLD,
             width=125,
+            height=38,
             command=self.open_release,
             fg_color=THEME["surface_3"],
             hover_color=THEME["accent_soft"],
             text_color=THEME["secondary_button_text"],
-        ).pack(side="left", padx=(8, 0))
+        ).pack(side="left", padx=(9, 0))
 
         ctk.CTkButton(
-            buttons,
+            footer,
             text="Ignorar versão",
             font=FONT_BOLD,
-            width=130,
+            width=128,
+            height=38,
             command=self.skip_version,
-            fg_color=THEME["surface_3"],
-            hover_color=THEME["accent_soft"],
-            text_color=THEME["secondary_button_text"],
-        ).pack(side="right", padx=(8, 0))
-
-        ctk.CTkButton(
-            buttons,
-            text="Agora não",
-            font=FONT_BOLD,
-            width=105,
-            command=self.destroy,
             fg_color=THEME["surface_3"],
             hover_color=THEME["accent_soft"],
             text_color=THEME["secondary_button_text"],
         ).pack(side="right")
 
-        remember_window_geometry(self, "window_update_available", 680, 510)
+        ctk.CTkButton(
+            footer,
+            text="Agora não",
+            font=FONT_BOLD,
+            width=105,
+            height=38,
+            command=self.destroy,
+            fg_color=THEME["surface_3"],
+            hover_color=THEME["accent_soft"],
+            text_color=THEME["secondary_button_text"],
+        ).pack(side="right", padx=(0, 9))
+
+        # New key prevents a previously saved larger geometry from returning.
+        remember_window_geometry(
+            self,
+            "window_update_available_v3",
+            660,
+            window_height,
+        )
         self.transient(parent)
         self.grab_set()
+        self.lift()
+        self.focus_force()
 
     def start_update(self):
         try:
@@ -2964,16 +3156,26 @@ class UpdateAvailableWindow(ctk.CTkToplevel):
         except Exception:
             pass
         self.destroy()
-        self.parent.after(80, lambda: self.parent.download_and_install_update(self.release))
+        self.parent.after(
+            80,
+            lambda: self.parent.download_and_install_update(self.release),
+        )
 
     def open_release(self):
-        url = str(self.release.get("html_url") or GITHUB_RELEASES_URL)
+        url = str(
+            self.release.get("html_url") or GITHUB_RELEASES_URL
+        )
         webbrowser.open_new_tab(url)
 
     def skip_version(self):
-        self.parent.settings["skipped_update_version"] = self.latest_version
+        self.parent.settings["skipped_update_version"] = (
+            self.latest_version
+        )
         save_settings(self.parent.settings)
-        audit_log("UPDATE_VERSION_SKIPPED", f"version={self.latest_version}")
+        audit_log(
+            "UPDATE_VERSION_SKIPPED",
+            f"version={self.latest_version}",
+        )
         self.destroy()
 
 
