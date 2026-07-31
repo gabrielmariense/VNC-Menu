@@ -13,3 +13,7 @@
 /_internal
 /realvnc/*.vnc
 /logs/*.log
+/release
+CREATE-UPDATE-PACKAGE.ps1
+UPDATE-RELEASE-GRUIDE.md
+/data

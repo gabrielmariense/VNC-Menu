@@ -1,16 +1,21 @@
 import base64
 import getpass
 import ctypes
+import hashlib
 import json
 import os
 import re
 import shutil
 import subprocess
+import sys
 import tempfile
 import threading
 import time
 import traceback
+import urllib.error
+import urllib.request
 import webbrowser
+import zipfile
 from ctypes import wintypes
 from pathlib import Path
 from typing import Any
@@ -30,11 +35,17 @@ REALVNC_EXE = r"C:\Program Files\RealVNC\VNC Viewer\vncviewer.exe"
 PORT = 5900
 
 APP_NAME = "VNC-Menu"
-APP_VERSION = "1.3"
+APP_VERSION = "1.4"
 APP_AUTHOR = 'Gabriel "GMErebos" Mariense'
 GITHUB_PROFILE_URL = "https://github.com/gabrielmariense"
 GITHUB_URL = "https://github.com/gabrielmariense/VNC-Menu"
 LICENSE_URL = "https://github.com/gabrielmariense/VNC-Menu/blob/main/LICENSE"
+GITHUB_RELEASES_URL = f"{GITHUB_URL}/releases"
+GITHUB_LATEST_RELEASE_API = "https://api.github.com/repos/gabrielmariense/VNC-Menu/releases/latest"
+UPDATE_CHECK_INTERVAL_SECONDS = 24 * 60 * 60
+UPDATER_SCRIPT_NAME = "VNC-Menu-Updater.pyw"
+UPDATER_EXE_NAME = "VNC-Menu-Updater.exe"
+UPDATE_DOWNLOAD_DIR = Path(tempfile.gettempdir()) / "VNC-Menu-Update"
 
 VIEWER_ULTRAVNC = "ultravnc"
 VIEWER_REALVNC = "realvnc"
@@ -49,13 +60,14 @@ AUTH_TIMEOUT = 12
 AUTH_TITLE_RE = r".*(UltraVNC|VNC).*(Auth|Authentication).*"
 
 SCRIPT_DIR = Path(__file__).resolve().parent
-DATA_DIR = SCRIPT_DIR / "_internal" if (SCRIPT_DIR / "_internal").exists() else SCRIPT_DIR
-DATA_DIR.mkdir(exist_ok=True)
+LEGACY_DATA_DIR = SCRIPT_DIR / "_internal" if (SCRIPT_DIR / "_internal").exists() else SCRIPT_DIR
+DATA_DIR = SCRIPT_DIR / "data"
+DATA_DIR.mkdir(parents=True, exist_ok=True)
 
 SHARED_HOSTS_JSON = DATA_DIR / "hosts.json"
 TEMPLATE_VNC = DATA_DIR / "template.vnc"
 REALVNC_DIR = DATA_DIR / "realvnc"
-REALVNC_DIR.mkdir(exist_ok=True)
+REALVNC_DIR.mkdir(parents=True, exist_ok=True)
 
 USER_DATA_DIR = Path.home() / "Documents" / "VNC-Menu"
 USER_DATA_DIR.mkdir(parents=True, exist_ok=True)
@@ -63,6 +75,7 @@ USER_DATA_DIR.mkdir(parents=True, exist_ok=True)
 USER_HOSTS_JSON = USER_DATA_DIR / "hosts.json"
 CREDS_JSON = USER_DATA_DIR / "creds.json"
 SETTINGS_JSON = USER_DATA_DIR / "settings.json"
+UPDATE_RESULT_JSON = USER_DATA_DIR / "update-result.json"
 
 # Fallback for Windows environments where Documents\VNC-Menu\settings.json
 # is blocked by ACLs, OneDrive, antivirus, or a stale read-only file.
@@ -102,6 +115,42 @@ DEFAULT_HOSTS = {
     ]
 }
 
+def initialize_mutable_data():
+    """Migrate environment-specific files out of _internal on first run."""
+    DATA_DIR.mkdir(parents=True, exist_ok=True)
+    REALVNC_DIR.mkdir(parents=True, exist_ok=True)
+
+    if not SHARED_HOSTS_JSON.exists():
+        legacy_hosts = LEGACY_DATA_DIR / "hosts.json"
+        if legacy_hosts.exists() and legacy_hosts != SHARED_HOSTS_JSON:
+            shutil.copy2(legacy_hosts, SHARED_HOSTS_JSON)
+        else:
+            SHARED_HOSTS_JSON.write_text(
+                json.dumps(DEFAULT_HOSTS, ensure_ascii=False, indent=2),
+                encoding="utf-8",
+            )
+
+    if not TEMPLATE_VNC.exists():
+        legacy_template = LEGACY_DATA_DIR / "template.vnc"
+        if legacy_template.exists() and legacy_template != TEMPLATE_VNC:
+            shutil.copy2(legacy_template, TEMPLATE_VNC)
+
+    legacy_realvnc = LEGACY_DATA_DIR / "realvnc"
+    if legacy_realvnc.exists() and legacy_realvnc != REALVNC_DIR:
+        for source in legacy_realvnc.rglob("*"):
+            if not source.is_file():
+                continue
+            relative = source.relative_to(legacy_realvnc)
+            destination = REALVNC_DIR / relative
+            if destination.exists():
+                continue
+            destination.parent.mkdir(parents=True, exist_ok=True)
+            shutil.copy2(source, destination)
+
+
+initialize_mutable_data()
+
+
 DEFAULT_SETTINGS = {
     "dark_mode": True,
     "hosts_source": "",
@@ -114,6 +163,9 @@ DEFAULT_SETTINGS = {
     "ultravnc_exe": ULTRAVNC_EXE,
     "realvnc_exe": REALVNC_EXE,
     "login_mode": LOGIN_MODE_AUTO,
+    "check_updates_on_startup": True,
+    "last_update_check": 0,
+    "skipped_update_version": "",
 }
 
 HOSTS_SOURCE_SHARED = "padrao"
@@ -1258,6 +1310,173 @@ def shared_hosts_edit_warning(parent):
     return result["value"]
 
 # =========================
+# Atualizações
+# =========================
+def parse_version(value: str) -> tuple[int, ...]:
+    parts = re.findall(r"\d+", str(value or "").strip().lower().removeprefix("v"))
+    return tuple(int(part) for part in parts) if parts else (0,)
+
+
+def normalize_release_version(value: str) -> str:
+    value = str(value or "").strip()
+    return value[1:] if value.lower().startswith("v") else value
+
+
+def github_request_json(url: str, timeout: int = 15) -> dict:
+    request = urllib.request.Request(
+        url,
+        headers={
+            "Accept": "application/vnd.github+json",
+            "User-Agent": f"{APP_NAME}/{APP_VERSION}",
+            "X-GitHub-Api-Version": "2022-11-28",
+        },
+    )
+    with urllib.request.urlopen(request, timeout=timeout) as response:
+        data = json.loads(response.read().decode("utf-8"))
+    if not isinstance(data, dict):
+        raise RuntimeError("Resposta inválida recebida do GitHub.")
+    return data
+
+
+def fetch_latest_release() -> dict:
+    return github_request_json(GITHUB_LATEST_RELEASE_API)
+
+
+def find_release_zip_asset(release: dict) -> dict:
+    assets = [item for item in release.get("assets", []) if isinstance(item, dict)]
+    zip_assets = [
+        item for item in assets
+        if str(item.get("name") or "").lower().endswith(".zip")
+    ]
+    if not zip_assets:
+        raise RuntimeError(
+            "A release mais recente não possui um arquivo ZIP de atualização."
+        )
+
+    latest = normalize_release_version(release.get("tag_name", ""))
+    preferred_names = {
+        f"vnc-menu-v{latest}.zip".lower(),
+        f"vnc-menu-{latest}.zip".lower(),
+        f"vnc-menu-v{latest}-win64.zip".lower(),
+    }
+
+    for asset in zip_assets:
+        if str(asset.get("name") or "").lower() in preferred_names:
+            return asset
+
+    for asset in zip_assets:
+        if "vnc-menu" in str(asset.get("name") or "").lower():
+            return asset
+
+    return zip_assets[0]
+
+
+def download_url_bytes(url: str, timeout: int = 30) -> bytes:
+    request = urllib.request.Request(
+        url,
+        headers={"User-Agent": f"{APP_NAME}/{APP_VERSION}"},
+    )
+    with urllib.request.urlopen(request, timeout=timeout) as response:
+        return response.read()
+
+
+def get_release_asset_checksum(release: dict, asset: dict) -> str:
+    digest = str(asset.get("digest") or "").strip().lower()
+    if digest.startswith("sha256:"):
+        candidate = digest.split(":", 1)[1].strip()
+        if re.fullmatch(r"[0-9a-f]{64}", candidate):
+            return candidate
+
+    assets = [item for item in release.get("assets", []) if isinstance(item, dict)]
+    asset_name = str(asset.get("name") or "")
+    checksum_names = {
+        f"{asset_name}.sha256".lower(),
+        f"{Path(asset_name).stem}.sha256".lower(),
+        "sha256sums.txt",
+        "checksums.txt",
+    }
+
+    checksum_asset = None
+    for item in assets:
+        if str(item.get("name") or "").lower() in checksum_names:
+            checksum_asset = item
+            break
+
+    if checksum_asset is None:
+        raise RuntimeError(
+            "A release não possui digest SHA-256 nem arquivo .sha256. "
+            "A atualização foi bloqueada por segurança."
+        )
+
+    checksum_url = str(checksum_asset.get("browser_download_url") or "").strip()
+    if not checksum_url:
+        raise RuntimeError("URL do arquivo de checksum não encontrada.")
+
+    checksum_text = download_url_bytes(checksum_url).decode("utf-8", errors="replace")
+
+    for line in checksum_text.splitlines():
+        if asset_name.lower() not in line.lower():
+            continue
+        match = re.search(r"\b[0-9a-fA-F]{64}\b", line)
+        if match:
+            return match.group(0).lower()
+
+    match = re.search(r"\b[0-9a-fA-F]{64}\b", checksum_text)
+    if not match:
+        raise RuntimeError("Checksum SHA-256 inválido na release.")
+    return match.group(0).lower()
+
+
+
+def calculate_sha256(path: Path) -> str:
+    digest = hashlib.sha256()
+    with Path(path).open("rb") as file:
+        for chunk in iter(lambda: file.read(1024 * 1024), b""):
+            digest.update(chunk)
+    return digest.hexdigest()
+
+
+def get_pythonw_executable() -> str:
+    executable = Path(sys.executable)
+    if executable.name.lower() == "python.exe":
+        pythonw = executable.with_name("pythonw.exe")
+        if pythonw.exists():
+            return str(pythonw)
+    return str(executable)
+
+
+def get_updater_launch_command(work_dir: Path) -> list[str]:
+    """Run a temporary updater copy so the installed updater can be replaced."""
+    work_dir = Path(work_dir)
+    work_dir.mkdir(parents=True, exist_ok=True)
+
+    if getattr(sys, "frozen", False):
+        updater = SCRIPT_DIR / UPDATER_EXE_NAME
+        if not updater.exists():
+            raise FileNotFoundError(
+                f"Atualizador não encontrado:\n{updater}"
+            )
+        temporary_updater = work_dir / UPDATER_EXE_NAME
+        shutil.copy2(updater, temporary_updater)
+        return [str(temporary_updater)]
+
+    updater = SCRIPT_DIR / UPDATER_SCRIPT_NAME
+    if not updater.exists():
+        raise FileNotFoundError(
+            f"Atualizador não encontrado:\n{updater}"
+        )
+    temporary_updater = work_dir / UPDATER_SCRIPT_NAME
+    shutil.copy2(updater, temporary_updater)
+    return [get_pythonw_executable(), str(temporary_updater)]
+
+
+def current_main_entry_name() -> str:
+    if getattr(sys, "frozen", False):
+        return Path(sys.executable).name
+    return Path(__file__).name
+
+
+# =========================
 # Conexões e operações remotas
 # =========================
 def auto_enter_uvnc_credentials(timeout=AUTH_TIMEOUT) -> bool:
@@ -1389,7 +1608,7 @@ def launch_vnc(
 
         if not TEMPLATE_VNC.exists():
             audit_log("CONNECTION_ERROR", f"viewer=UltraVNC; host={host}; reason=template_not_found; path={TEMPLATE_VNC}")
-            show_error(parent, "Erro", "template.vnc não encontrado.\nVerifique se ele está na pasta _internal.")
+            show_error(parent, "Erro", "template.vnc não encontrado.\nVerifique se ele está na pasta data.")
             return
 
         # This is the launch behavior from the old working Tkinter version:
@@ -2447,6 +2666,223 @@ class ViewerPathsWindow(ctk.CTkToplevel):
 
 
 # =========================
+# Janelas de atualização
+# =========================
+class UpdateCheckProgressWindow(ctk.CTkToplevel):
+    def __init__(self, parent):
+        super().__init__(parent)
+        self.title("Verificando atualizações")
+        self.resizable(False, False)
+        self.configure(fg_color=THEME["bg"])
+
+        box = ctk.CTkFrame(self, fg_color=THEME["surface"], corner_radius=18)
+        box.pack(fill="both", expand=True, padx=18, pady=18)
+
+        ctk.CTkLabel(
+            box,
+            text="Verificando atualizações",
+            font=FONT_SUBTITLE,
+            text_color=THEME["text"],
+        ).pack(anchor="w", padx=18, pady=(18, 8))
+
+        ctk.CTkLabel(
+            box,
+            text="Consultando a release mais recente no GitHub...",
+            font=FONT_NORMAL,
+            text_color=THEME["muted"],
+        ).pack(anchor="w", padx=18, pady=(0, 14))
+
+        self.progress = ctk.CTkProgressBar(box, mode="indeterminate")
+        self.progress.pack(fill="x", padx=18, pady=(0, 18))
+        self.progress.start()
+
+        center_window(self, 460, 175)
+        self.transient(parent)
+        self.grab_set()
+
+    def close(self):
+        try:
+            self.progress.stop()
+        except Exception:
+            pass
+        try:
+            self.grab_release()
+        except Exception:
+            pass
+        self.destroy()
+
+
+class UpdateDownloadWindow(ctk.CTkToplevel):
+    def __init__(self, parent, version: str):
+        super().__init__(parent)
+        self.title("Atualizando VNC-Menu")
+        self.resizable(False, False)
+        self.configure(fg_color=THEME["bg"])
+
+        box = ctk.CTkFrame(self, fg_color=THEME["surface"], corner_radius=18)
+        box.pack(fill="both", expand=True, padx=18, pady=18)
+
+        ctk.CTkLabel(
+            box,
+            text=f"Baixando VNC-Menu {version}",
+            font=FONT_SUBTITLE,
+            text_color=THEME["text"],
+        ).pack(anchor="w", padx=18, pady=(18, 8))
+
+        self.status_label = ctk.CTkLabel(
+            box,
+            text="Preparando download...",
+            font=FONT_NORMAL,
+            text_color=THEME["muted"],
+        )
+        self.status_label.pack(anchor="w", padx=18, pady=(0, 14))
+
+        self.progress = ctk.CTkProgressBar(box)
+        self.progress.set(0)
+        self.progress.pack(fill="x", padx=18, pady=(0, 18))
+
+        center_window(self, 500, 190)
+        self.transient(parent)
+        self.grab_set()
+        self.protocol("WM_DELETE_WINDOW", lambda: None)
+
+    def update_progress(self, current: int, total: int):
+        if total > 0:
+            fraction = min(max(current / total, 0), 1)
+            self.progress.set(fraction)
+            self.status_label.configure(
+                text=f"Baixando... {fraction * 100:.0f}%"
+            )
+        else:
+            self.status_label.configure(
+                text=f"Baixando... {current / (1024 * 1024):.1f} MB"
+            )
+
+    def set_status(self, text: str):
+        self.status_label.configure(text=text)
+
+    def close(self):
+        try:
+            self.grab_release()
+        except Exception:
+            pass
+        self.destroy()
+
+
+class UpdateAvailableWindow(ctk.CTkToplevel):
+    def __init__(self, parent, release: dict):
+        super().__init__(parent)
+        self.parent = parent
+        self.release = release
+        self.latest_version = normalize_release_version(release.get("tag_name", ""))
+
+        self.title("Atualização disponível")
+        self.geometry("680x510")
+        self.minsize(620, 460)
+        self.configure(fg_color=THEME["bg"])
+
+        outer = ctk.CTkFrame(self, fg_color=THEME["surface"], corner_radius=18)
+        outer.pack(fill="both", expand=True, padx=18, pady=18)
+
+        ctk.CTkLabel(
+            outer,
+            text="Nova atualização disponível",
+            font=FONT_SUBTITLE,
+            text_color=THEME["text"],
+        ).pack(anchor="w", padx=20, pady=(18, 6))
+
+        ctk.CTkLabel(
+            outer,
+            text=f"Instalada: {APP_VERSION}    Nova: {self.latest_version}",
+            font=FONT_BOLD,
+            text_color=THEME["accent_hover"],
+        ).pack(anchor="w", padx=20, pady=(0, 12))
+
+        notes = str(release.get("body") or "Nenhuma nota de versão informada.").strip()
+        notes_box = ctk.CTkTextbox(
+            outer,
+            height=280,
+            font=("Segoe UI", 12),
+            fg_color=THEME["bg"],
+            text_color=THEME["text"],
+            corner_radius=12,
+            wrap="word",
+        )
+        notes_box.pack(fill="both", expand=True, padx=20, pady=(0, 14))
+        notes_box.insert("1.0", notes)
+        notes_box.configure(state="disabled")
+
+        buttons = ctk.CTkFrame(outer, fg_color="transparent")
+        buttons.pack(fill="x", padx=20, pady=(0, 18))
+
+        ctk.CTkButton(
+            buttons,
+            text="Atualizar agora",
+            font=FONT_BOLD,
+            width=145,
+            command=self.start_update,
+            fg_color=THEME["accent"],
+            hover_color=THEME["accent_hover"],
+            text_color=THEME["button_text"],
+        ).pack(side="left")
+
+        ctk.CTkButton(
+            buttons,
+            text="Ver no GitHub",
+            font=FONT_BOLD,
+            width=125,
+            command=self.open_release,
+            fg_color=THEME["surface_3"],
+            hover_color=THEME["accent_soft"],
+            text_color=THEME["secondary_button_text"],
+        ).pack(side="left", padx=(8, 0))
+
+        ctk.CTkButton(
+            buttons,
+            text="Ignorar versão",
+            font=FONT_BOLD,
+            width=130,
+            command=self.skip_version,
+            fg_color=THEME["surface_3"],
+            hover_color=THEME["accent_soft"],
+            text_color=THEME["secondary_button_text"],
+        ).pack(side="right", padx=(8, 0))
+
+        ctk.CTkButton(
+            buttons,
+            text="Agora não",
+            font=FONT_BOLD,
+            width=105,
+            command=self.destroy,
+            fg_color=THEME["surface_3"],
+            hover_color=THEME["accent_soft"],
+            text_color=THEME["secondary_button_text"],
+        ).pack(side="right")
+
+        remember_window_geometry(self, "window_update_available", 680, 510)
+        self.transient(parent)
+        self.grab_set()
+
+    def start_update(self):
+        try:
+            self.grab_release()
+        except Exception:
+            pass
+        self.destroy()
+        self.parent.after(80, lambda: self.parent.download_and_install_update(self.release))
+
+    def open_release(self):
+        url = str(self.release.get("html_url") or GITHUB_RELEASES_URL)
+        webbrowser.open_new_tab(url)
+
+    def skip_version(self):
+        self.parent.settings["skipped_update_version"] = self.latest_version
+        save_settings(self.parent.settings)
+        audit_log("UPDATE_VERSION_SKIPPED", f"version={self.latest_version}")
+        self.destroy()
+
+
+# =========================
 # Janela Sobre
 # =========================
 class AboutWindow(ctk.CTkToplevel):
@@ -2569,6 +3005,18 @@ class AboutWindow(ctk.CTkToplevel):
         ctk.CTkButton(
             buttons,
             font=FONT_BOLD,
+            text="Verificar atualizações",
+            width=170,
+            height=38,
+            command=self.check_updates,
+            fg_color=THEME["accent"],
+            hover_color=THEME["accent_hover"],
+            text_color=THEME["button_text"],
+        ).pack(side="left")
+
+        ctk.CTkButton(
+            buttons,
+            font=FONT_BOLD,
             text="Pasta de logs",
             width=145,
             height=38,
@@ -2576,7 +3024,7 @@ class AboutWindow(ctk.CTkToplevel):
             fg_color=THEME["surface_3"],
             hover_color=THEME["accent_soft"],
             text_color=THEME["secondary_button_text"],
-        ).pack(side="left")
+        ).pack(side="left", padx=(8, 0))
 
         ctk.CTkButton(
             buttons,
@@ -2604,6 +3052,14 @@ class AboutWindow(ctk.CTkToplevel):
         self.transient(parent)
         self.grab_set()
         self.focus_force()
+
+    def check_updates(self):
+        try:
+            self.grab_release()
+        except Exception:
+            pass
+        self.destroy()
+        self.parent.after(80, lambda: self.parent.check_for_updates(manual=True))
 
     def open_url(self, url: str):
         try:
@@ -2653,7 +3109,7 @@ class SettingsWindow(ctk.CTkToplevel):
         super().__init__(parent)
         self.parent = parent
         self.title("Configurações")
-        self.geometry("420x540")
+        self.geometry("420x600")
         self.resizable(False, False)
         self.configure(fg_color=THEME["bg"])
 
@@ -2663,6 +3119,12 @@ class SettingsWindow(ctk.CTkToplevel):
         ctk.CTkLabel(box, text="Configurações", font=FONT_SUBTITLE, text_color=THEME["text"]).pack(anchor="w", padx=18, pady=(18, 8))
         ctk.CTkLabel(box, text="Acesse as opções principais do VNC-Menu.", font=FONT_NORMAL, text_color=THEME["muted"]).pack(anchor="w", padx=18, pady=(0, 18))
 
+        update_check_text = (
+            "Verificação automática: Ativada"
+            if bool(parent.settings.get("check_updates_on_startup", True))
+            else "Verificação automática: Desativada"
+        )
+
         actions = [
             ("Credenciais", parent.open_creds),
             ("Hosts VNC", parent.open_config),
@@ -2670,6 +3132,7 @@ class SettingsWindow(ctk.CTkToplevel):
             ("Caminhos dos Viewers", parent.open_viewer_paths),
             ("Colunas dos Hosts", parent.open_host_columns_config),
             ("Alternar modo escuro", parent.toggle_dark_mode),
+            (update_check_text, parent.toggle_update_checks),
             ("Sobre o VNC-Menu", parent.open_about),
         ]
         for text, cmd in actions:
@@ -2694,7 +3157,7 @@ class SettingsWindow(ctk.CTkToplevel):
             text_color=THEME["button_text"],
             height=40,
         ).pack(fill="x", padx=18, pady=(8, 18))
-        remember_window_geometry(self, "window_settings", 420, 540)
+        remember_window_geometry(self, "window_settings_v2", 420, 600)
         self.transient(parent)
         self.grab_set()
 
@@ -2734,6 +3197,7 @@ class App(ctk.CTk):
         initial_width, initial_height = self.get_saved_main_window_size()
         self.geometry(f"{initial_width}x{initial_height}")
         self._main_geometry_save_after = None
+        self._update_check_running = False
 
         self.dark_mode = bool(self.settings.get("dark_mode", True))
         apply_color_theme(self.dark_mode)
@@ -2775,6 +3239,8 @@ class App(ctk.CTk):
 
         self.bind("<Configure>", self.schedule_main_window_size_save)
         self.protocol("WM_DELETE_WINDOW", self.on_main_close)
+        self.after(1200, self.show_pending_update_result)
+        self.after(2500, self.maybe_check_for_updates_on_startup)
 
     def get_saved_main_window_size(self):
         geometry = get_window_geometries(self.settings).get("main")
@@ -3037,11 +3503,11 @@ class App(ctk.CTk):
         if mode == "connect":
             self.btn_connect.configure(fg_color=THEME["accent"], hover_color=THEME["accent_hover"], text_color=THEME["button_text"])
             self.btn_restart.configure(fg_color=THEME["surface_3"], hover_color=THEME["accent_soft"], text_color=THEME["secondary_button_text"])
-            self.mode_label.configure(text="Modo atual: CONECTAR.")
+            self.mode_label.configure(text="Modo atual: CONECTAR")
         else:
             self.btn_connect.configure(fg_color=THEME["surface_3"], hover_color=THEME["accent_soft"], text_color=THEME["secondary_button_text"])
             self.btn_restart.configure(fg_color=THEME["warning"], hover_color=THEME["warning_hover"], text_color=THEME["button_text"])
-            self.mode_label.configure(text="Modo atual: REINICIAR.")
+            self.mode_label.configure(text="Modo atual: REINICIAR")
 
     def toggle_dark_mode(self):
         self.dark_mode = not self.dark_mode
@@ -3276,6 +3742,13 @@ class App(ctk.CTk):
             close_menu()
             self.open_host_admin_share(host)
 
+        # Show the configured hostname/IP as the first line so support can
+        # quickly confirm the target without opening the hosts configuration.
+        menu.add_command(
+            label=f"Host/IP: {host}",
+            state="disabled",
+        )
+        menu.add_separator()
         menu.add_command(label="Copiar IP", command=copy_ip)
         menu.add_command(label="Abrir pasta", command=open_folder)
 
@@ -3338,6 +3811,245 @@ class App(ctk.CTk):
 
     def update_window_title(self):
         self.title(f"VNC-Menu [{hosts_source_display_name(self.hosts_source)}]")
+
+    def show_pending_update_result(self):
+        if not UPDATE_RESULT_JSON.exists():
+            return
+        try:
+            result = json.loads(UPDATE_RESULT_JSON.read_text(encoding="utf-8"))
+        except Exception:
+            result = {}
+        try:
+            UPDATE_RESULT_JSON.unlink(missing_ok=True)
+        except Exception:
+            pass
+
+        status = str(result.get("status") or "")
+        version = str(result.get("version") or "")
+        message = str(result.get("message") or "")
+
+        if status == "success":
+            show_info(
+                self,
+                "Atualização concluída",
+                f"O VNC-Menu foi atualizado para a versão {version or APP_VERSION}.",
+            )
+        elif status == "error":
+            show_error(
+                self,
+                "Falha na atualização",
+                message or "A atualização falhou e a versão anterior foi restaurada.",
+            )
+
+    def toggle_update_checks(self):
+        enabled = not bool(self.settings.get("check_updates_on_startup", True))
+        self.settings["check_updates_on_startup"] = enabled
+        save_settings(self.settings)
+        audit_log("UPDATE_STARTUP_CHECK_CHANGED", f"enabled={enabled}")
+        show_info(
+            self,
+            "Atualizações",
+            "A verificação automática foi ativada."
+            if enabled
+            else "A verificação automática foi desativada.",
+        )
+
+    def maybe_check_for_updates_on_startup(self):
+        if not bool(self.settings.get("check_updates_on_startup", True)):
+            return
+
+        try:
+            last_check = float(self.settings.get("last_update_check", 0) or 0)
+        except Exception:
+            last_check = 0
+
+        if time.time() - last_check < UPDATE_CHECK_INTERVAL_SECONDS:
+            return
+
+        self.check_for_updates(manual=False)
+
+    def check_for_updates(self, manual: bool = True):
+        if self._update_check_running:
+            if manual:
+                show_info(self, "Atualizações", "Uma verificação já está em andamento.")
+            return
+
+        self._update_check_running = True
+        progress = UpdateCheckProgressWindow(self) if manual else None
+        audit_log("UPDATE_CHECK_STARTED", f"manual={manual}")
+
+        def worker():
+            try:
+                release = fetch_latest_release()
+                error = None
+            except urllib.error.HTTPError as exc:
+                if exc.code == 404:
+                    error = RuntimeError("Nenhuma release publicada foi encontrada no GitHub.")
+                elif exc.code == 403:
+                    error = RuntimeError(
+                        "O GitHub recusou a consulta, possivelmente por limite temporário de requisições."
+                    )
+                else:
+                    error = RuntimeError(f"GitHub respondeu com HTTP {exc.code}.")
+                release = None
+            except Exception as exc:
+                release = None
+                error = exc
+
+            def finish():
+                self._update_check_running = False
+                if progress is not None:
+                    try:
+                        progress.close()
+                    except Exception:
+                        pass
+
+                if error is not None:
+                    audit_log("UPDATE_CHECK_ERROR", f"error={error}")
+                    if manual:
+                        show_error(self, "Atualizações", f"Falha ao verificar atualizações:\n{error}")
+                    return
+
+                # Pylance cannot infer that release is non-None only because
+                # error is None. Keep an explicit runtime/type guard here.
+                if not isinstance(release, dict):
+                    audit_log(
+                        "UPDATE_CHECK_ERROR",
+                        "error=GitHub release response is missing or invalid",
+                    )
+                    if manual:
+                        show_error(
+                            self,
+                            "Atualizações",
+                            "O GitHub retornou uma resposta de release inválida.",
+                        )
+                    return
+
+                self.settings["last_update_check"] = time.time()
+                save_settings(self.settings)
+
+                latest_version = normalize_release_version(release.get("tag_name", ""))
+                audit_log(
+                    "UPDATE_CHECK_COMPLETED",
+                    f"current={APP_VERSION}; latest={latest_version}",
+                )
+
+                if parse_version(latest_version) <= parse_version(APP_VERSION):
+                    if manual:
+                        show_info(
+                            self,
+                            "Atualizações",
+                            f"O VNC-Menu já está atualizado.\n\nVersão instalada: {APP_VERSION}",
+                        )
+                    return
+
+                skipped = str(self.settings.get("skipped_update_version") or "")
+                if not manual and skipped == latest_version:
+                    return
+
+                UpdateAvailableWindow(self, release)
+
+            self.after(0, finish)
+
+        threading.Thread(target=worker, daemon=True).start()
+
+    def download_and_install_update(self, release: dict):
+        latest_version = normalize_release_version(release.get("tag_name", ""))
+        download_window = UpdateDownloadWindow(self, latest_version)
+
+        def worker():
+            try:
+                asset = find_release_zip_asset(release)
+                asset_url = str(asset.get("browser_download_url") or "").strip()
+                asset_name = str(asset.get("name") or f"VNC-Menu-v{latest_version}.zip")
+                if not asset_url:
+                    raise RuntimeError("URL do arquivo de atualização não encontrada.")
+
+                expected_sha256 = get_release_asset_checksum(release, asset)
+                version_dir = UPDATE_DOWNLOAD_DIR / safe_filename(latest_version)
+                if version_dir.exists():
+                    shutil.rmtree(version_dir, ignore_errors=True)
+                version_dir.mkdir(parents=True, exist_ok=True)
+                archive_path = version_dir / asset_name
+
+                request = urllib.request.Request(
+                    asset_url,
+                    headers={"User-Agent": f"{APP_NAME}/{APP_VERSION}"},
+                )
+                with urllib.request.urlopen(request, timeout=60) as response:
+                    try:
+                        total = int(response.headers.get("Content-Length") or 0)
+                    except Exception:
+                        total = 0
+                    downloaded = 0
+                    with archive_path.open("wb") as file:
+                        while True:
+                            chunk = response.read(1024 * 256)
+                            if not chunk:
+                                break
+                            file.write(chunk)
+                            downloaded += len(chunk)
+                            self.after(
+                                0,
+                                lambda current=downloaded, size=total: download_window.update_progress(current, size),
+                            )
+
+                self.after(0, lambda: download_window.set_status("Verificando integridade..."))
+                actual_sha256 = calculate_sha256(archive_path)
+                if actual_sha256.lower() != expected_sha256.lower():
+                    raise RuntimeError(
+                        "A verificação SHA-256 falhou. Nenhum arquivo foi alterado."
+                    )
+
+                with zipfile.ZipFile(archive_path, "r") as archive:
+                    if archive.testzip() is not None:
+                        raise RuntimeError("O arquivo ZIP da atualização está corrompido.")
+
+                command = get_updater_launch_command(version_dir)
+                command.extend([
+                    "--pid", str(os.getpid()),
+                    "--archive", str(archive_path),
+                    "--install-dir", str(SCRIPT_DIR),
+                    "--main-entry", current_main_entry_name(),
+                    "--version", latest_version,
+                ])
+
+                creationflags = 0
+                creationflags |= getattr(subprocess, "DETACHED_PROCESS", 0)
+                creationflags |= getattr(subprocess, "CREATE_NEW_PROCESS_GROUP", 0)
+                creationflags |= getattr(subprocess, "CREATE_NO_WINDOW", 0)
+
+                subprocess.Popen(
+                    command,
+                    cwd=str(SCRIPT_DIR),
+                    close_fds=True,
+                    creationflags=creationflags,
+                    stdout=subprocess.DEVNULL,
+                    stderr=subprocess.DEVNULL,
+                )
+
+                audit_log(
+                    "UPDATE_INSTALLER_STARTED",
+                    f"version={latest_version}; archive={archive_path}; install_dir={SCRIPT_DIR}",
+                )
+                self.after(0, lambda: download_window.set_status("Reiniciando para instalar..."))
+                self.after(600, self.destroy)
+                return
+
+            except Exception as exc:
+                log_exception(exc)
+                audit_log("UPDATE_DOWNLOAD_ERROR", f"version={latest_version}; error={exc}")
+
+                def show_failure():
+                    try:
+                        download_window.close()
+                    except Exception:
+                        pass
+                    show_error(self, "Atualizações", f"Falha ao preparar a atualização:\n{exc}")
+
+                self.after(0, show_failure)
+
+        threading.Thread(target=worker, daemon=True).start()
 
     def open_settings(self):
         SettingsWindow(self)
