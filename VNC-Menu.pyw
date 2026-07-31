@@ -35,7 +35,7 @@ REALVNC_EXE = r"C:\Program Files\RealVNC\VNC Viewer\vncviewer.exe"
 PORT = 5900
 
 APP_NAME = "VNC-Menu"
-APP_VERSION = "1.4.2"
+APP_VERSION = "1.4.3"
 APP_AUTHOR = 'Gabriel "GMErebos" Mariense'
 GITHUB_PROFILE_URL = "https://github.com/gabrielmariense"
 GITHUB_URL = "https://github.com/gabrielmariense/VNC-Menu"
@@ -55,6 +55,10 @@ DEFAULT_VIEWER = VIEWER_ULTRAVNC
 LOGIN_MODE_AUTO = "auto"
 LOGIN_MODE_MANUAL = "manual"
 LOGIN_MODE_OPTIONS = {LOGIN_MODE_AUTO, LOGIN_MODE_MANUAL}
+
+COLOR_SCHEME_PURPLE = "purple"
+COLOR_SCHEME_BLUE = "blue"
+COLOR_SCHEME_OPTIONS = {COLOR_SCHEME_PURPLE, COLOR_SCHEME_BLUE}
 
 AUTH_TIMEOUT = 12
 AUTH_TITLE_RE = r".*(UltraVNC|VNC).*(Auth|Authentication).*"
@@ -153,6 +157,7 @@ initialize_mutable_data()
 
 DEFAULT_SETTINGS = {
     "dark_mode": True,
+    "color_scheme": COLOR_SCHEME_BLUE,
     "hosts_source": "",
     "hosts_file": "",
     "selected_unit": "Geral",
@@ -181,7 +186,7 @@ ctk.set_appearance_mode("Dark")
 ctk.set_default_color_theme("blue")
 ctk.set_widget_scaling(1.0)
 
-DARK_THEME = {
+DARK_PURPLE_THEME = {
     "bg": "#21182d",
     "surface": "#2b2039",
     "surface_2": "#38294a",
@@ -200,7 +205,7 @@ DARK_THEME = {
     "warning_hover": "#d39458",
 }
 
-LIGHT_THEME = {
+LIGHT_PURPLE_THEME = {
     "bg": "#dcb9c5",
     "surface": "#fff4f6",
     "surface_2": "#f1dce4",
@@ -219,13 +224,76 @@ LIGHT_THEME = {
     "warning_hover": "#8c5226",
 }
 
-THEME = DARK_THEME.copy()
+# Original blue palettes from the earlier VNC-Menu interface.
+DARK_BLUE_THEME = {
+    "bg": "#07111f",
+    "surface": "#0b1726",
+    "surface_2": "#10243a",
+    "surface_3": "#1b3554",
+    "border": "#2a4a66",
+    "accent": "#2f81f7",
+    "accent_hover": "#58a6ff",
+    "accent_soft": "#1b4d7a",
+    "text": "#f8fbff",
+    "muted": "#a9bed5",
+    "button_text": "#ffffff",
+    "secondary_button_text": "#eaf3ff",
+    "danger": "#9b2c2c",
+    "danger_hover": "#b83a3a",
+    "warning": "#b7791f",
+    "warning_hover": "#d69e2e",
+}
+
+LIGHT_BLUE_THEME = {
+    "bg": "#c9d8e8",
+    "surface": "#f4f8fc",
+    "surface_2": "#e3eef8",
+    "surface_3": "#4e6e8e",
+    "border": "#9ab0c7",
+    "accent": "#2563eb",
+    "accent_hover": "#1d4ed8",
+    "accent_soft": "#b9d4f0",
+    "text": "#0f1b2a",
+    "muted": "#40546a",
+    "button_text": "#ffffff",
+    "secondary_button_text": "#ffffff",
+    "danger": "#b42318",
+    "danger_hover": "#d92d20",
+    "warning": "#b7791f",
+    "warning_hover": "#945c12",
+}
+
+# Compatibility aliases for code that still refers to the original names.
+DARK_THEME = DARK_PURPLE_THEME
+LIGHT_THEME = LIGHT_PURPLE_THEME
+THEME = DARK_BLUE_THEME.copy()
 
 
-def apply_color_theme(dark_mode: bool):
-    """Switch the custom color tokens used by all customtkinter widgets."""
+def normalize_color_scheme(value) -> str:
+    value = str(value or "").strip().lower()
+    if value not in COLOR_SCHEME_OPTIONS:
+        return COLOR_SCHEME_BLUE
+    return value
+
+
+def color_scheme_display_name(value) -> str:
+    return "Azul" if normalize_color_scheme(value) == COLOR_SCHEME_BLUE else "Roxo"
+
+
+def apply_color_theme(
+    dark_mode: bool,
+    color_scheme: str = COLOR_SCHEME_BLUE,
+):
+    """Apply the selected blue or purple palette in dark or light mode."""
+    color_scheme = normalize_color_scheme(color_scheme)
+
+    if color_scheme == COLOR_SCHEME_PURPLE:
+        palette = DARK_PURPLE_THEME if dark_mode else LIGHT_PURPLE_THEME
+    else:
+        palette = DARK_BLUE_THEME if dark_mode else LIGHT_BLUE_THEME
+
     THEME.clear()
-    THEME.update(DARK_THEME if dark_mode else LIGHT_THEME)
+    THEME.update(palette)
     ctk.set_appearance_mode("Dark" if dark_mode else "Light")
 
 FONT_TITLE = ("Segoe UI", 24, "bold")
@@ -3136,7 +3204,7 @@ class SettingsWindow(ctk.CTkToplevel):
         super().__init__(parent)
         self.parent = parent
         self.title("Configurações")
-        self.geometry("420x600")
+        self.geometry("420x650")
         self.resizable(False, False)
         self.configure(fg_color=THEME["bg"])
 
@@ -3151,6 +3219,10 @@ class SettingsWindow(ctk.CTkToplevel):
             if bool(parent.settings.get("check_updates_on_startup", True))
             else "Verificação automática: Desativada"
         )
+        color_scheme_text = (
+            f"Cor do tema: "
+            f"{color_scheme_display_name(parent.settings.get('color_scheme'))}"
+        )
 
         actions = [
             ("Credenciais", parent.open_creds),
@@ -3159,6 +3231,7 @@ class SettingsWindow(ctk.CTkToplevel):
             ("Caminhos dos Viewers", parent.open_viewer_paths),
             ("Colunas dos Hosts", parent.open_host_columns_config),
             ("Alternar modo escuro", parent.toggle_dark_mode),
+            (color_scheme_text, parent.toggle_color_scheme),
             (update_check_text, parent.toggle_update_checks),
             ("Sobre o VNC-Menu", parent.open_about),
         ]
@@ -3184,13 +3257,13 @@ class SettingsWindow(ctk.CTkToplevel):
             text_color=THEME["button_text"],
             height=40,
         ).pack(fill="x", padx=18, pady=(8, 18))
-        remember_window_geometry(self, "window_settings_v2", 420, 600)
+        remember_window_geometry(self, "window_settings_v3", 420, 650)
         self.transient(parent)
         self.grab_set()
 
     def run_and_close(self, command):
         try:
-            save_window_geometry(self, "window_settings")
+            save_window_geometry(self, "window_settings_v3")
             self.grab_release()
 
             # Hide the window without withdrawing or destroying it.
@@ -3227,7 +3300,12 @@ class App(ctk.CTk):
         self._update_check_running = False
 
         self.dark_mode = bool(self.settings.get("dark_mode", True))
-        apply_color_theme(self.dark_mode)
+        self.color_scheme = normalize_color_scheme(
+            self.settings.get("color_scheme", COLOR_SCHEME_BLUE)
+        )
+        self.settings["color_scheme"] = self.color_scheme
+        save_settings(self.settings)
+        apply_color_theme(self.dark_mode, self.color_scheme)
         self.configure(fg_color=THEME["bg"])
 
         self.hosts_source = ensure_hosts_source_selected(self, self.settings)
@@ -3546,8 +3624,23 @@ class App(ctk.CTk):
         # command was triggered from a modal settings window.
         self.after(80, self.apply_theme_repaint)
 
+    def toggle_color_scheme(self):
+        current = normalize_color_scheme(self.color_scheme)
+        self.color_scheme = (
+            COLOR_SCHEME_PURPLE
+            if current == COLOR_SCHEME_BLUE
+            else COLOR_SCHEME_BLUE
+        )
+        self.settings["color_scheme"] = self.color_scheme
+        save_settings(self.settings)
+        audit_log(
+            "COLOR_SCHEME_CHANGED",
+            f"scheme={self.color_scheme}; dark_mode={self.dark_mode}",
+        )
+        self.after(80, self.apply_theme_repaint)
+
     def apply_theme_repaint(self):
-        apply_color_theme(self.dark_mode)
+        apply_color_theme(self.dark_mode, self.color_scheme)
         self.configure(fg_color=THEME["bg"])
 
         current_mode = self.mode.get()
