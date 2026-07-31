@@ -35,7 +35,7 @@ REALVNC_EXE = r"C:\Program Files\RealVNC\VNC Viewer\vncviewer.exe"
 PORT = 5900
 
 APP_NAME = "VNC-Menu"
-APP_VERSION = "1.4"
+APP_VERSION = "1.4.2"
 APP_AUTHOR = 'Gabriel "GMErebos" Mariense'
 GITHUB_PROFILE_URL = "https://github.com/gabrielmariense"
 GITHUB_URL = "https://github.com/gabrielmariense/VNC-Menu"
@@ -1059,16 +1059,34 @@ def _write_settings_file(path: Path, settings: dict) -> bool:
         return False
 
 
-def load_settings():
-    # Prefer the fallback if it exists, because it means the primary Documents
-    # settings path was not writable on a previous run.
-    fallback_settings = _read_settings_file(FALLBACK_SETTINGS_JSON)
-    if fallback_settings is not None:
-        return fallback_settings
+def _settings_file_mtime(path: Path) -> float:
+    try:
+        return path.stat().st_mtime
+    except OSError:
+        return 0.0
 
+
+def load_settings():
+    """
+    Load the newest valid settings file.
+
+    An old fallback file in AppData must not permanently override a newer
+    settings.json in Documents, otherwise the previously selected host list
+    can appear to reset when the application starts.
+    """
     primary_settings = _read_settings_file(SETTINGS_JSON)
+    fallback_settings = _read_settings_file(FALLBACK_SETTINGS_JSON)
+
+    if primary_settings is not None and fallback_settings is not None:
+        if _settings_file_mtime(FALLBACK_SETTINGS_JSON) > _settings_file_mtime(SETTINGS_JSON):
+            return fallback_settings
+        return primary_settings
+
     if primary_settings is not None:
         return primary_settings
+
+    if fallback_settings is not None:
+        return fallback_settings
 
     settings = DEFAULT_SETTINGS.copy()
     if not _write_settings_file(SETTINGS_JSON, settings):
@@ -1077,10 +1095,19 @@ def load_settings():
 
 
 def save_settings(settings):
-    # Try the original Documents location first. If Windows denies it, save to
-    # AppData instead so the app keeps working and settings still persist.
+    """
+    Save to Documents when possible and use AppData only as a real fallback.
+
+    When the primary save succeeds, remove a stale fallback file so future
+    startups cannot load outdated values such as hosts_source.
+    """
     if _write_settings_file(SETTINGS_JSON, settings):
+        try:
+            FALLBACK_SETTINGS_JSON.unlink(missing_ok=True)
+        except OSError:
+            pass
         return True
+
     return _write_settings_file(FALLBACK_SETTINGS_JSON, settings)
 
 
