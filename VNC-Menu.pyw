@@ -35,7 +35,7 @@ REALVNC_EXE = r"C:\Program Files\RealVNC\VNC Viewer\vncviewer.exe"
 PORT = 5900
 
 APP_NAME = "VNC-Menu"
-APP_VERSION = "1.4.4"
+APP_VERSION = "1.4.5"
 APP_AUTHOR = 'Gabriel "GMErebos" Mariense'
 GITHUB_PROFILE_URL = "https://github.com/gabrielmariense"
 GITHUB_URL = "https://github.com/gabrielmariense/VNC-Menu"
@@ -4026,6 +4026,45 @@ class App(ctk.CTk):
                 f"Falha ao abrir:\n{unc_path}\n\n{e}",
             )
 
+    def open_host_startup_folder(self, host):
+        host = str(host or "").strip().lstrip("\\\\")
+        if not host:
+            return
+
+        unc_path = (
+            rf"\\{host}\c$\ProgramData\Microsoft\Windows"
+            rf"\Start Menu\Programs\Startup"
+        )
+
+        try:
+            result = ctypes.windll.shell32.ShellExecuteW(
+                None,
+                "open",
+                unc_path,
+                None,
+                None,
+                1,
+            )
+
+            if result <= 32:
+                raise OSError(f"ShellExecuteW falhou com código {result}")
+
+            audit_log(
+                "HOST_STARTUP_FOLDER_OPENED",
+                f"host={host}; path={unc_path}",
+            )
+        except Exception as e:
+            log_exception(e)
+            audit_log(
+                "HOST_STARTUP_FOLDER_ERROR",
+                f"host={host}; path={unc_path}; error={e}",
+            )
+            show_error(
+                self,
+                "Abrir Menu Iniciar",
+                f"Falha ao abrir:\n{unc_path}\n\n{e}",
+            )
+
     def show_host_context_menu(self, event, host):
         host = str(host or "").strip()
         if not host:
@@ -4060,19 +4099,21 @@ class App(ctk.CTk):
             close_menu()
             self.copy_host_to_clipboard(host)
 
-        def open_folder():
+        def open_cShare():
             close_menu()
             self.open_host_admin_share(host)
 
+        def open_startup_folder():
+            close_menu()
+            self.open_host_startup_folder(host)
+
         # Show the configured hostname/IP as the first line so support can
         # quickly confirm the target without opening the hosts configuration.
-        menu.add_command(
-            label=f"Host/IP: {host}",
-            state="disabled",
-        )
+        menu.add_command(label=f"Host/IP: {host}",state="disabled",)
         menu.add_separator()
         menu.add_command(label="Copiar IP", command=copy_ip)
-        menu.add_command(label="Abrir pasta", command=open_folder)
+        menu.add_command(label="Abrir c$", command=open_cShare)
+        menu.add_command(label="Abrir Menu Iniciar",command=open_startup_folder,)
 
         # post() leaves the menu active until the user selects an item or clicks
         # elsewhere. Do not destroy it in a finally block.
