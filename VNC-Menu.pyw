@@ -42,7 +42,6 @@ GITHUB_URL = "https://github.com/gabrielmariense/VNC-Menu"
 LICENSE_URL = "https://github.com/gabrielmariense/VNC-Menu/blob/main/LICENSE"
 GITHUB_RELEASES_URL = f"{GITHUB_URL}/releases"
 GITHUB_LATEST_RELEASE_API = "https://api.github.com/repos/gabrielmariense/VNC-Menu/releases/latest"
-UPDATE_CHECK_INTERVAL_SECONDS = 24 * 60 * 60
 UPDATER_SCRIPT_NAME = "VNC-Menu-Updater.pyw"
 UPDATER_EXE_NAME = "VNC-Menu-Updater.exe"
 UPDATE_DOWNLOAD_DIR = Path(tempfile.gettempdir()) / "VNC-Menu-Update"
@@ -4219,14 +4218,6 @@ class App(ctk.CTk):
 
     def maybe_check_for_updates_on_startup(self):
         if not bool(self.settings.get("check_updates_on_startup", True)):
-            return
-
-        try:
-            last_check = float(self.settings.get("last_update_check", 0) or 0)
-        except Exception:
-            last_check = 0
-
-        if time.time() - last_check < UPDATE_CHECK_INTERVAL_SECONDS:
             return
 
         self.check_for_updates(manual=False)
