@@ -46,6 +46,7 @@ UPDATER_SCRIPT_NAME = "VNC-Menu-Updater.pyw"
 UPDATER_EXE_NAME = "VNC-Menu-Updater.exe"
 UPDATE_DOWNLOAD_DIR = Path(tempfile.gettempdir()) / "VNC-Menu-Update"
 PSEXEC_DOWNLOAD_URL = "https://learn.microsoft.com/sysinternals/downloads/psexec"
+PSEXEC_DOWNLOAD_URL = "https://learn.microsoft.com/sysinternals/downloads/psexec"
 PSEXEC_TIMEOUT_SECONDS = 35
 HOST_PING_TIMEOUT_MS = 1000
 HOST_PING_PROCESS_TIMEOUT_SECONDS = 4
@@ -1268,6 +1269,7 @@ def _read_settings_file(path: Path) -> dict | None:
         if isinstance(data, dict):
             merged = DEFAULT_SETTINGS.copy()
             merged.update({key: data[key] for key in DEFAULT_SETTINGS if key in data})
+            merged.update({key: data[key] for key in DEFAULT_SETTINGS if key in data})
             return merged
     except Exception as e:
         log_exception(e)
@@ -2066,10 +2068,14 @@ $neededServers = @(
             (([string]$_.Server -replace '^\\+', '')).Trim()
         } |
         Where-Object { -not [string]::IsNullOrWhiteSpace([string]$_) } |
+            (([string]$_.Server -replace '^\\+', '')).Trim()
+        } |
+        Where-Object { -not [string]::IsNullOrWhiteSpace([string]$_) } |
         Sort-Object -Unique
 )
 
 foreach ($server in $neededServers) {
+    $serverKey = (($server -split '\.')[0]).ToLowerInvariant()
     $serverKey = (($server -split '\.')[0]).ToLowerInvariant()
     $serverPorts = @{}
     @(Get-PrinterPort -ComputerName $server -ErrorAction SilentlyContinue) |
@@ -2106,6 +2112,7 @@ foreach ($server in $neededServers) {
             (([string]$item.Server -replace '^\\+', '') -split '\.')[0]
         ).ToLowerInvariant()
 
+        if ($itemServerKey -ne $serverKey) {
         if ($itemServerKey -ne $serverKey) {
             continue
         }
