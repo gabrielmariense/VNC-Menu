@@ -35,16 +35,21 @@ REALVNC_EXE = r"C:\Program Files\RealVNC\VNC Viewer\vncviewer.exe"
 PORT = 5900
 
 APP_NAME = "VNC-Menu"
-APP_VERSION = "1.4.5"
+APP_VERSION = "1.5"
 APP_AUTHOR = 'Gabriel "GMErebos" Mariense'
 GITHUB_PROFILE_URL = "https://github.com/gabrielmariense"
 GITHUB_URL = "https://github.com/gabrielmariense/VNC-Menu"
 LICENSE_URL = "https://github.com/gabrielmariense/VNC-Menu/blob/main/LICENSE"
 GITHUB_RELEASES_URL = f"{GITHUB_URL}/releases"
 GITHUB_LATEST_RELEASE_API = "https://api.github.com/repos/gabrielmariense/VNC-Menu/releases/latest"
+UPDATE_CHECK_INTERVAL_SECONDS = 24 * 60 * 60
 UPDATER_SCRIPT_NAME = "VNC-Menu-Updater.pyw"
 UPDATER_EXE_NAME = "VNC-Menu-Updater.exe"
 UPDATE_DOWNLOAD_DIR = Path(tempfile.gettempdir()) / "VNC-Menu-Update"
+PSEXEC_TIMEOUT_SECONDS = 35
+HOST_PING_TIMEOUT_MS = 1000
+HOST_PING_PROCESS_TIMEOUT_SECONDS = 4
+PRINT_SERVERS = ("srv1315", "srv-01-022")
 
 VIEWER_ULTRAVNC = "ultravnc"
 VIEWER_REALVNC = "realvnc"
@@ -63,14 +68,11 @@ AUTH_TIMEOUT = 12
 AUTH_TITLE_RE = r".*(UltraVNC|VNC).*(Auth|Authentication).*"
 
 SCRIPT_DIR = Path(__file__).resolve().parent
-LEGACY_DATA_DIR = SCRIPT_DIR / "_internal" if (SCRIPT_DIR / "_internal").exists() else SCRIPT_DIR
 DATA_DIR = SCRIPT_DIR / "data"
-DATA_DIR.mkdir(parents=True, exist_ok=True)
 
 SHARED_HOSTS_JSON = DATA_DIR / "hosts.json"
 TEMPLATE_VNC = DATA_DIR / "template.vnc"
 REALVNC_DIR = DATA_DIR / "realvnc"
-REALVNC_DIR.mkdir(parents=True, exist_ok=True)
 
 USER_DATA_DIR = Path.home() / "Documents" / "VNC-Menu"
 USER_DATA_DIR.mkdir(parents=True, exist_ok=True)
@@ -118,40 +120,18 @@ DEFAULT_HOSTS = {
     ]
 }
 
-def initialize_mutable_data():
-    """Migrate environment-specific files out of _internal on first run."""
+def initialize_data_files():
     DATA_DIR.mkdir(parents=True, exist_ok=True)
     REALVNC_DIR.mkdir(parents=True, exist_ok=True)
 
     if not SHARED_HOSTS_JSON.exists():
-        legacy_hosts = LEGACY_DATA_DIR / "hosts.json"
-        if legacy_hosts.exists() and legacy_hosts != SHARED_HOSTS_JSON:
-            shutil.copy2(legacy_hosts, SHARED_HOSTS_JSON)
-        else:
-            SHARED_HOSTS_JSON.write_text(
-                json.dumps(DEFAULT_HOSTS, ensure_ascii=False, indent=2),
-                encoding="utf-8",
-            )
-
-    if not TEMPLATE_VNC.exists():
-        legacy_template = LEGACY_DATA_DIR / "template.vnc"
-        if legacy_template.exists() and legacy_template != TEMPLATE_VNC:
-            shutil.copy2(legacy_template, TEMPLATE_VNC)
-
-    legacy_realvnc = LEGACY_DATA_DIR / "realvnc"
-    if legacy_realvnc.exists() and legacy_realvnc != REALVNC_DIR:
-        for source in legacy_realvnc.rglob("*"):
-            if not source.is_file():
-                continue
-            relative = source.relative_to(legacy_realvnc)
-            destination = REALVNC_DIR / relative
-            if destination.exists():
-                continue
-            destination.parent.mkdir(parents=True, exist_ok=True)
-            shutil.copy2(source, destination)
+        SHARED_HOSTS_JSON.write_text(
+            json.dumps(DEFAULT_HOSTS, ensure_ascii=False, indent=2),
+            encoding="utf-8",
+        )
 
 
-initialize_mutable_data()
+initialize_data_files()
 
 
 DEFAULT_SETTINGS = {
@@ -166,6 +146,7 @@ DEFAULT_SETTINGS = {
     "window_geometries": {},
     "ultravnc_exe": ULTRAVNC_EXE,
     "realvnc_exe": REALVNC_EXE,
+    "psexec_exe": "",
     "login_mode": LOGIN_MODE_AUTO,
     "check_updates_on_startup": True,
     "last_update_check": 0,
@@ -262,9 +243,6 @@ LIGHT_BLUE_THEME = {
     "warning_hover": "#945c12",
 }
 
-# Compatibility aliases for code that still refers to the original names.
-DARK_THEME = DARK_PURPLE_THEME
-LIGHT_THEME = LIGHT_PURPLE_THEME
 THEME = DARK_BLUE_THEME.copy()
 
 
@@ -492,6 +470,29 @@ def show_warning(parent, title: str, message: str):
     messagebox.showwarning(title, message, parent=parent)
 
 
+def reset_scrollable_frame_position(frame) -> None:
+    """Reset a CTkScrollableFrame after its contents have been rebuilt."""
+
+    def reset_after_layout():
+        try:
+            frame.update_idletasks()
+            canvas = getattr(frame, "_parent_canvas", None)
+            if canvas is None or not canvas.winfo_exists():
+                return
+
+            scroll_region = canvas.bbox("all")
+            if scroll_region:
+                canvas.configure(scrollregion=scroll_region)
+            canvas.yview_moveto(0.0)
+        except Exception:
+            pass
+
+    try:
+        frame.after_idle(reset_after_layout)
+    except Exception:
+        pass
+
+
 def modal_window(win, parent=None):
     if parent:
         win.transient(parent)
@@ -670,6 +671,51 @@ def ask_text(parent: Any, title: str, label: str, initial: str = "") -> str | No
     remember_window_geometry(win, "dialog_host_details", 460, 235)
     modal_window(win, parent)
     return result["value"]
+
+
+def find_psexec(configured_path=None) -> Path | None:
+    for executable in ("PsExec64.exe", "PsExec.exe", "psexec64", "psexec"):
+        resolved = shutil.which(executable)
+        if resolved:
+            return Path(resolved)
+
+    configured_path = str(configured_path or "").strip().strip('"')
+    if configured_path:
+        candidate = Path(configured_path).expanduser()
+        if candidate.is_file() and candidate.suffix.casefold() == ".exe":
+            return candidate
+
+    return None
+
+
+def select_psexec_executable(parent, settings) -> Path | None:
+    while True:
+        selected = filedialog.askopenfilename(
+            parent=parent,
+            title="Selecionar PsExec",
+            filetypes=(
+                ("PsExec", "PsExec*.exe"),
+                ("Executáveis", "*.exe"),
+                ("Todos os arquivos", "*.*"),
+            ),
+        )
+
+        if not selected:
+            audit_log("PSEXEC_SELECTION_CANCELLED")
+            return None
+
+        candidate = Path(selected)
+        if candidate.is_file() and candidate.suffix.casefold() == ".exe":
+            settings["psexec_exe"] = str(candidate)
+            save_settings(settings)
+            audit_log("PSEXEC_SELECTED", f"path={candidate}")
+            return candidate
+
+        show_error(
+            parent,
+            "PsExec inválido",
+            "Selecione um arquivo executável válido do PsExec.",
+        )
 
 
 def ask_host_details(parent: Any, title: str, initial: dict[str, str] | None = None) -> dict[str, str] | None:
@@ -1002,7 +1048,6 @@ def normalize_hosts_data(data):
     if not isinstance(data, dict):
         return DEFAULT_HOSTS.copy()
 
-    # Novo formato: units > sectors > hosts
     if isinstance(data.get("units"), list):
         units = []
         for i, unit in enumerate(data.get("units", [])):
@@ -1015,26 +1060,6 @@ def normalize_hosts_data(data):
             units.append({"name": name or f"Unidade {i + 1}", "sectors": sectors})
         if units:
             return {"units": units}
-
-    # Compatibilidade com formato antigo baseado em groups.
-    if isinstance(data.get("groups"), list):
-        sectors = []
-        for group in data.get("groups", []):
-            if not isinstance(group, dict):
-                continue
-            sectors.append({
-                "name": str(group.get("name") or "Geral"),
-                "hosts": sanitize_host_list(group.get("hosts", [])),
-            })
-        return {"units": [{"name": "Geral", "sectors": sectors or [{"name": "Geral", "hosts": []}]}]}
-
-    # Compatibilidade com formato plano {"Nome": "host"}.
-    hosts = []
-    for name, host in data.items():
-        if isinstance(host, str):
-            hosts.append({"name": str(name), "host": host, "viewer": DEFAULT_VIEWER})
-    if hosts:
-        return {"units": [{"name": "Geral", "sectors": [{"name": "Geral", "hosts": hosts}]}]}
 
     return DEFAULT_HOSTS.copy()
 
@@ -1621,6 +1646,23 @@ def auto_enter_uvnc_credentials(timeout=AUTH_TIMEOUT) -> bool:
         return False
 
 
+def start_uvnc_credential_autofill() -> None:
+    """Wait for the UltraVNC authentication dialog without blocking Tkinter."""
+
+    def worker():
+        try:
+            auto_enter_uvnc_credentials()
+        except Exception as exc:
+            log_exception(exc)
+            audit_log("VNC_AUTO_LOGIN_ERROR", f"error={exc}")
+
+    threading.Thread(
+        target=worker,
+        name="VNC-Credential-Autofill",
+        daemon=True,
+    ).start()
+
+
 def launch_vnc(
     host: str,
     viewer: str = DEFAULT_VIEWER,
@@ -1720,7 +1762,7 @@ def launch_vnc(
         audit_log("CONNECTION_STARTED", f"viewer=UltraVNC; name={target_name}; host={host}; template={TEMPLATE_VNC}")
 
         if automatic_login:
-            auto_enter_uvnc_credentials()
+            start_uvnc_credential_autofill()
 
     except Exception as e:
         audit_log("CONNECTION_ERROR", f"viewer={viewer_display_name(viewer)}; host={host}; error={e}")
@@ -1736,6 +1778,349 @@ def restart_host(host: str):
         log_exception(e)
         audit_log("RESTART_ERROR", f"host={host}; error={e}")
         raise
+
+
+def host_responds_to_ping(host: str) -> bool:
+    host = str(host or "").strip().lstrip("\\")
+    if not host:
+        return False
+
+    try:
+        completed = subprocess.run(
+            ["ping", "-n", "1", "-w", str(HOST_PING_TIMEOUT_MS), host],
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+            timeout=HOST_PING_PROCESS_TIMEOUT_SECONDS,
+            creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
+        )
+        return completed.returncode == 0
+    except (OSError, subprocess.TimeoutExpired) as exc:
+        audit_log("HOST_PING_ERROR", f"host={host}; error={exc}")
+        return False
+
+
+def query_remote_printers(host: str, psexec_path: Path) -> str:
+    host = str(host or "").strip().lstrip("\\")
+    if not host:
+        raise ValueError("Hostname ou IP não informado.")
+
+    collector = r'''
+$ErrorActionPreference = 'SilentlyContinue'
+$ProgressPreference = 'SilentlyContinue'
+$startMarker = '__VNC_MENU_PRINTERS_BEGIN__'
+$endMarker = '__VNC_MENU_PRINTERS_END__'
+$results = New-Object System.Collections.Generic.List[object]
+
+function Get-PortAddress {
+    param($Port)
+
+    if ($null -eq $Port) {
+        return ''
+    }
+
+    $address = [string]$Port.PrinterHostAddress
+    if (-not [string]::IsNullOrWhiteSpace($address)) {
+        return $address.Trim()
+    }
+
+    $portName = [string]$Port.Name
+    $match = [regex]::Match(
+        $portName,
+        '(?<!\d)(?:\d{1,3}\.){3}\d{1,3}(?!\d)'
+    )
+    if ($match.Success) {
+        return $match.Value
+    }
+
+    return ''
+}
+
+function Add-PrinterResult {
+    param(
+        [string]$Name,
+        [string]$IP,
+        [string]$Server,
+        [string]$Queue,
+        [string]$Source
+    )
+
+    if ([string]::IsNullOrWhiteSpace($Name)) {
+        return
+    }
+
+    $results.Add([pscustomobject]@{
+        Name = $Name.Trim()
+        IP = ([string]$IP).Trim()
+        Server = ([string]$Server).Trim()
+        Queue = ([string]$Queue).Trim()
+        Source = $Source
+    })
+}
+
+$ports = @{}
+@(Get-PrinterPort -ErrorAction SilentlyContinue) | ForEach-Object {
+    $ports[[string]$_.Name] = $_
+}
+
+@(Get-Printer -ErrorAction SilentlyContinue) | ForEach-Object {
+    $printer = $_
+    $name = [string]$printer.Name
+    $server = ''
+    $queue = ''
+
+    $connectionName = [string]$printer.ConnectionName
+    if ($connectionName -match '^\\\\([^\\]+)\\(.+)$') {
+        $server = $Matches[1]
+        $queue = $Matches[2]
+    }
+    elseif ($name -match '^\\\\([^\\]+)\\(.+)$') {
+        $server = $Matches[1]
+        $queue = $Matches[2]
+    }
+
+    $port = $ports[[string]$printer.PortName]
+    $ip = Get-PortAddress $port
+
+    Add-PrinterResult $name $ip $server $queue 'Machine'
+}
+
+$createdHkuDrive = $false
+if (-not (Get-PSDrive -Name HKU -ErrorAction SilentlyContinue)) {
+    New-PSDrive `
+        -Name HKU `
+        -PSProvider Registry `
+        -Root HKEY_USERS `
+        -ErrorAction SilentlyContinue | Out-Null
+    $createdHkuDrive = $true
+}
+
+@(Get-ChildItem 'HKU:\' -ErrorAction SilentlyContinue) |
+    Where-Object {
+        $_.PSChildName -match '^S-1-5-21-(?:\d+-){3}\d+$'
+    } |
+    ForEach-Object {
+        $sid = $_.PSChildName
+        $connectionsPath = "HKU:\$sid\Printers\Connections"
+
+        @(Get-ChildItem $connectionsPath -ErrorAction SilentlyContinue) |
+            ForEach-Object {
+                $rawName = [string]$_.PSChildName
+                $cleanName = $rawName -replace '^,,', ''
+                $parts = @($cleanName -split ',')
+
+                if ($parts.Count -lt 2) {
+                    return
+                }
+
+                $server = [string]$parts[0]
+                $queue = [string]($parts[1..($parts.Count - 1)] -join ',')
+                $displayName = "\\$server\$queue"
+
+                Add-PrinterResult $displayName '' $server $queue "User:$sid"
+            }
+    }
+
+if ($createdHkuDrive) {
+    Remove-PSDrive -Name HKU -ErrorAction SilentlyContinue
+}
+
+$allowedServers = @(__PRINT_SERVERS__)
+$allowedServerLookup = @{}
+foreach ($allowedServer in $allowedServers) {
+    $allowedServerLookup[$allowedServer.ToLowerInvariant()] = $allowedServer
+}
+
+$neededServers = @(
+    $results |
+        Where-Object {
+            [string]::IsNullOrWhiteSpace([string]$_.IP) -and
+            -not [string]::IsNullOrWhiteSpace([string]$_.Server)
+        } |
+        ForEach-Object {
+            $serverKey = (
+                (([string]$_.Server -replace '^\\+', '') -split '\.')[0]
+            ).ToLowerInvariant()
+
+            if ($allowedServerLookup.ContainsKey($serverKey)) {
+                $allowedServerLookup[$serverKey]
+            }
+        } |
+        Sort-Object -Unique
+)
+
+foreach ($server in $neededServers) {
+    $serverPorts = @{}
+    @(Get-PrinterPort -ComputerName $server -ErrorAction SilentlyContinue) |
+        ForEach-Object {
+            $serverPorts[[string]$_.Name] = $_
+        }
+
+    $queueAddresses = @{}
+    @(Get-Printer -ComputerName $server -ErrorAction SilentlyContinue) |
+        ForEach-Object {
+            $remotePrinter = $_
+            $remotePort = $serverPorts[[string]$remotePrinter.PortName]
+            $remoteIP = Get-PortAddress $remotePort
+
+            if (-not [string]::IsNullOrWhiteSpace($remoteIP)) {
+                @(
+                    [string]$remotePrinter.Name,
+                    [string]$remotePrinter.ShareName
+                ) | ForEach-Object {
+                    $queueKey = ([string]$_).Trim().ToLowerInvariant()
+                    if (-not [string]::IsNullOrWhiteSpace($queueKey)) {
+                        $queueAddresses[$queueKey] = $remoteIP
+                    }
+                }
+            }
+        }
+
+    foreach ($item in $results) {
+        if (-not [string]::IsNullOrWhiteSpace([string]$item.IP)) {
+            continue
+        }
+
+        $itemServerKey = (
+            (([string]$item.Server -replace '^\\+', '') -split '\.')[0]
+        ).ToLowerInvariant()
+
+        if ($itemServerKey -ne $server.ToLowerInvariant()) {
+            continue
+        }
+
+        $itemQueueKey = ([string]$item.Queue).Trim().ToLowerInvariant()
+        if ($queueAddresses.ContainsKey($itemQueueKey)) {
+            $item.IP = $queueAddresses[$itemQueueKey]
+        }
+    }
+}
+
+$uniqueResults = @(
+    $results |
+        Sort-Object Name, IP, Server, Queue -Unique
+)
+
+$json = ConvertTo-Json -InputObject @($uniqueResults) -Compress -Depth 4
+$payload = [Convert]::ToBase64String(
+    [Text.Encoding]::UTF8.GetBytes($json)
+)
+
+Write-Output $startMarker
+Write-Output $payload
+Write-Output $endMarker
+'''
+
+    collector = collector.replace(
+        "__PRINT_SERVERS__",
+        ", ".join(f"'{server}'" for server in PRINT_SERVERS),
+    )
+
+    encoded_command = base64.b64encode(
+        collector.encode("utf-16-le")
+    ).decode("ascii")
+
+    command = [
+        str(psexec_path),
+        rf"\\{host}",
+        "-s",
+        "-h",
+        "-accepteula",
+        "-nobanner",
+        "-n",
+        "5",
+        "powershell.exe",
+        "-NoLogo",
+        "-NoProfile",
+        "-NonInteractive",
+        "-ExecutionPolicy",
+        "Bypass",
+        "-EncodedCommand",
+        encoded_command,
+    ]
+
+    try:
+        completed = subprocess.run(
+            command,
+            capture_output=True,
+            timeout=PSEXEC_TIMEOUT_SECONDS,
+            creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
+        )
+    except subprocess.TimeoutExpired as exc:
+        raise RuntimeError(
+            f"A consulta excedeu {PSEXEC_TIMEOUT_SECONDS} segundos. "
+            "O computador pode estar offline ou inacessível."
+        ) from exc
+
+    stdout = (completed.stdout or b"").decode("utf-8", errors="replace")
+    stderr = (completed.stderr or b"").decode("utf-8", errors="replace")
+    combined_output = f"{stdout}\n{stderr}"
+
+    start_marker = "__VNC_MENU_PRINTERS_BEGIN__"
+    end_marker = "__VNC_MENU_PRINTERS_END__"
+    match = re.search(
+        re.escape(start_marker) + r"\s*([A-Za-z0-9+/=\r\n]+?)\s*" + re.escape(end_marker),
+        combined_output,
+    )
+
+    if not match:
+        details = (stderr or stdout).strip()
+        if len(details) > 900:
+            details = details[-900:]
+        raise RuntimeError(
+            "O PsExec não retornou um resultado válido."
+            + (f"\n\n{details}" if details else "")
+        )
+
+    try:
+        payload = re.sub(r"\s+", "", match.group(1))
+        decoded_json = base64.b64decode(payload).decode("utf-8-sig")
+        raw_rows = json.loads(decoded_json)
+    except Exception as exc:
+        raise RuntimeError("Falha ao interpretar o resultado das impressoras.") from exc
+
+    if isinstance(raw_rows, dict):
+        raw_rows = [raw_rows]
+    if not isinstance(raw_rows, list):
+        raw_rows = []
+
+    rows = []
+    seen = set()
+    for item in raw_rows:
+        if not isinstance(item, dict):
+            continue
+
+        name = str(item.get("Name") or "").strip()
+        ip = str(item.get("IP") or "").strip()
+
+        if not ip:
+            ip = "NÃO IDENTIFICADO"
+        if not name:
+            continue
+
+        key = (name.casefold(), ip.casefold())
+        if key in seen:
+            continue
+        seen.add(key)
+        rows.append((name, ip))
+
+    rows.sort(key=lambda row: (row[0].casefold(), row[1].casefold()))
+    return format_printers_output(rows)
+
+
+def format_printers_output(rows) -> str:
+    if not rows:
+        return "Nenhuma impressora encontrada."
+
+    name_width = max(len("NOME"), *(len(name) for name, _ip in rows))
+    lines = [
+        f"{'NOME':<{name_width}}  IP",
+        "-" * (name_width + 23),
+    ]
+
+    for name, ip in rows:
+        lines.append(f"{name:<{name_width}}  {ip}")
+
+    return "\n".join(lines)
 
 
 def query_all_logged_users(hosts):
@@ -1911,6 +2296,70 @@ class QwinstaProgressWindow(ctk.CTkToplevel):
         ctk.CTkLabel(
             box,
             text="Aguarde. A janela de resultado abrirá automaticamente.",
+            font=FONT_SMALL,
+            text_color=THEME["muted"],
+        ).pack(anchor="w", padx=18, pady=(0, 18))
+
+        center_window(self, 430, 190)
+        self.transient(parent)
+        self.lift()
+        self.focus()
+
+        try:
+            self.attributes("-topmost", True)
+            self.after(250, lambda: self.attributes("-topmost", False))
+        except Exception:
+            pass
+
+    def close(self):
+        try:
+            self.progress.stop()
+        except Exception:
+            pass
+        self.destroy()
+
+
+class PrinterProgressWindow(ctk.CTkToplevel):
+    def __init__(self, parent, host: str):
+        super().__init__(parent)
+        self.title("Consultando impressoras")
+        self.geometry("430x190")
+        self.resizable(False, False)
+        self.configure(fg_color=THEME["bg"])
+
+        box = ctk.CTkFrame(
+            self,
+            fg_color=THEME["surface"],
+            corner_radius=18,
+        )
+        box.pack(fill="both", expand=True, padx=18, pady=18)
+
+        ctk.CTkLabel(
+            box,
+            text="Consultando impressoras",
+            font=FONT_SUBTITLE,
+            text_color=THEME["text"],
+        ).pack(anchor="w", padx=18, pady=(18, 8))
+
+        ctk.CTkLabel(
+            box,
+            text=f"Verificando impressoras locais e de rede em: {host}",
+            font=FONT_NORMAL,
+            text_color=THEME["muted"],
+            wraplength=360,
+            justify="left",
+        ).pack(anchor="w", padx=18, pady=(0, 14))
+
+        self.progress = ctk.CTkProgressBar(
+            box,
+            mode="indeterminate",
+        )
+        self.progress.pack(fill="x", padx=18, pady=(0, 14))
+        self.progress.start()
+
+        ctk.CTkLabel(
+            box,
+            text="Aguarde. O resultado abrirá automaticamente.",
             font=FONT_SMALL,
             text_color=THEME["muted"],
         ).pack(anchor="w", padx=18, pady=(0, 18))
@@ -3639,14 +4088,8 @@ class App(ctk.CTk):
         top.grid(row=0, column=0, sticky="ew", padx=22, pady=(22, 16))
         top.grid_columnconfigure(0, weight=1)
 
-        title_box = ctk.CTkFrame(top, fg_color="transparent")
-        title_box.grid(row=0, column=0, sticky="w")
-        ctk.CTkLabel(title_box, text="Acesso remoto", font=FONT_SUBTITLE, text_color=THEME["text"]).pack(anchor="w")
-        self.context_label = ctk.CTkLabel(title_box, text="", font=FONT_NORMAL, text_color=THEME["muted"])
-        self.context_label.pack(anchor="w", pady=(2, 0))
-
         actions = ctk.CTkFrame(top, fg_color="transparent")
-        actions.grid(row=0, column=1, sticky="e")
+        actions.grid(row=0, column=0, sticky="e")
 
         self.btn_connect = ctk.CTkButton(
             actions,
@@ -3683,7 +4126,20 @@ class App(ctk.CTk):
             hover_color=THEME["accent_soft"],
             text_color=THEME["secondary_button_text"],
         )
-        self.btn_users.pack(side="left")
+        self.btn_users.pack(side="left", padx=(0, 8))
+
+        self.btn_printers = ctk.CTkButton(
+            actions,
+            font=FONT_BOLD,
+            text="Impressoras",
+            width=110,
+            height=38,
+            command=self.show_remote_printers,
+            fg_color=THEME["surface_3"],
+            hover_color=THEME["accent_soft"],
+            text_color=THEME["secondary_button_text"],
+        )
+        self.btn_printers.pack(side="left")
 
         hint = ctk.CTkFrame(self.main, fg_color=THEME["surface_2"], corner_radius=16)
         hint.grid(row=1, column=0, sticky="ew", padx=22, pady=(0, 16))
@@ -3856,11 +4312,17 @@ class App(ctk.CTk):
         self.refresh_all()
         self.set_mode(current_mode)
 
-    def refresh_all(self):
+    def refresh_all(self, reset_scroll=False):
         self.refresh_unit_menu()
         self.refresh_sectors()
         self.render_hosts()
         self.update_window_title()
+        if reset_scroll:
+            self.reset_main_scroll_positions()
+
+    def reset_main_scroll_positions(self):
+        reset_scrollable_frame_position(self.sector_frame)
+        reset_scrollable_frame_position(self.host_grid)
 
     def refresh_unit_menu(self):
         self.unit_names = get_unit_names(self.hosts_data) or ["Geral"]
@@ -3905,7 +4367,6 @@ class App(ctk.CTk):
             child.destroy()
 
         hosts = get_sector_hosts(self.hosts_data, self.selected_unit.get(), self.selected_sector.get())
-        self.context_label.configure(text=f"{self.selected_unit.get()} > {self.selected_sector.get()}")
         self.count_label.configure(text=f"{len(hosts)} host(s) encontrado(s)")
         self.source_label.configure(text=f"Lista: {hosts_source_display_name(self.hosts_source)}")
 
@@ -3951,7 +4412,7 @@ class App(ctk.CTk):
                 card.pack(fill="both", expand=True)
                 card.bind(
                     "<Button-3>",
-                    lambda event, h=item.get("host"): self.show_host_context_menu(event, h),
+                    lambda event, h=item.get("host"), n=item.get("name"): self.show_host_context_menu(event, h, n),
                     add="+",
                 )
 
@@ -3968,12 +4429,14 @@ class App(ctk.CTk):
         self.save_main_selection()
         self.refresh_sectors()
         self.render_hosts()
+        self.reset_main_scroll_positions()
 
     def set_sector(self, sector_name):
         self.selected_sector.set(sector_name)
         self.save_main_selection()
         self.refresh_sectors()
         self.render_hosts()
+        reset_scrollable_frame_position(self.host_grid)
 
     def save_main_selection(self):
         self.settings["selected_unit"] = self.selected_unit.get()
@@ -4064,8 +4527,9 @@ class App(ctk.CTk):
                 f"Falha ao abrir:\n{unc_path}\n\n{e}",
             )
 
-    def show_host_context_menu(self, event, host):
+    def show_host_context_menu(self, event, host, display_name=None):
         host = str(host or "").strip()
+        display_name = str(display_name or "").strip()
         if not host:
             return
 
@@ -4098,7 +4562,7 @@ class App(ctk.CTk):
             close_menu()
             self.copy_host_to_clipboard(host)
 
-        def open_cShare():
+        def open_c_share():
             close_menu()
             self.open_host_admin_share(host)
 
@@ -4106,13 +4570,24 @@ class App(ctk.CTk):
             close_menu()
             self.open_host_startup_folder(host)
 
+        def open_printers():
+            close_menu()
+            self.show_remote_printers(host, display_name)
+
         # Show the configured hostname/IP as the first line so support can
         # quickly confirm the target without opening the hosts configuration.
-        menu.add_command(label=f"Host/IP: {host}",state="disabled",)
+        menu.add_command(
+            label=f"Host/IP: {host}",
+            state="disabled",
+        )
         menu.add_separator()
         menu.add_command(label="Copiar IP", command=copy_ip)
-        menu.add_command(label="Abrir c$", command=open_cShare)
-        menu.add_command(label="Abrir Menu Iniciar",command=open_startup_folder,)
+        menu.add_command(label="Abrir c$", command=open_c_share)
+        menu.add_command(
+            label="Abrir Menu Iniciar",
+            command=open_startup_folder,
+        )
+        menu.add_command(label="Impressoras", command=open_printers)
 
         # post() leaves the menu active until the user selects an item or clicks
         # elsewhere. Do not destroy it in a finally block.
@@ -4169,7 +4644,7 @@ class App(ctk.CTk):
         self.hosts_source = normalize_hosts_source(self.settings.get("hosts_source")) or HOSTS_SOURCE_SHARED
         self.hosts_path = get_hosts_path_for_source(self.hosts_source)
         self.hosts_data = load_hosts_data(self.hosts_path)
-        self.refresh_all()
+        self.refresh_all(reset_scroll=True)
 
     def update_window_title(self):
         self.title(f"VNC-Menu [{hosts_source_display_name(self.hosts_source)}]")
@@ -4218,6 +4693,14 @@ class App(ctk.CTk):
 
     def maybe_check_for_updates_on_startup(self):
         if not bool(self.settings.get("check_updates_on_startup", True)):
+            return
+
+        try:
+            last_check = float(self.settings.get("last_update_check", 0) or 0)
+        except Exception:
+            last_check = 0
+
+        if time.time() - last_check < UPDATE_CHECK_INTERVAL_SECONDS:
             return
 
         self.check_for_updates(manual=False)
@@ -4466,7 +4949,7 @@ class App(ctk.CTk):
 
     def on_hosts_saved(self, hosts_data):
         self.hosts_data = hosts_data
-        self.refresh_all()
+        self.refresh_all(reset_scroll=True)
 
     def show_qwinsta_users(self):
         unit_name = self.selected_unit.get()
@@ -4506,6 +4989,102 @@ class App(ctk.CTk):
                     return
 
                 show_text_window(self, f"Usuários logados - {label}", result)
+
+            self.after(0, finish)
+
+        threading.Thread(target=worker, daemon=True).start()
+
+    def show_remote_printers(
+        self,
+        host: str | None = None,
+        display_name: str | None = None,
+    ):
+        if str(self.btn_printers.cget("state")) == "disabled":
+            return
+
+        if host is None:
+            display_name = None
+            host = ask_text(
+                self,
+                "Consultar impressoras",
+                "Digite o hostname ou IP do computador:",
+            )
+        if not host:
+            return
+
+        host = str(host).strip().lstrip("\\")
+        display_name = str(display_name or "").strip()
+        psexec_path = find_psexec(self.settings.get("psexec_exe"))
+        if psexec_path is None:
+            audit_log("PSEXEC_NOT_FOUND_IN_PATH")
+            psexec_path = select_psexec_executable(self, self.settings)
+        if psexec_path is None:
+            return
+
+        audit_log(
+            "PRINTERS_QUERY",
+            f"name={display_name or '-'}; host={host}; psexec={psexec_path}",
+        )
+        progress = PrinterProgressWindow(self, host)
+        self.btn_printers.configure(state="disabled", text="Consultando...")
+
+        def worker():
+            status = "ok"
+            result = ""
+            error = None
+
+            try:
+                if not host_responds_to_ping(host):
+                    status = "offline"
+                    audit_log("PRINTERS_HOST_OFFLINE", f"host={host}")
+                else:
+                    result = query_remote_printers(host, psexec_path)
+            except Exception as exc:
+                log_exception(exc)
+                audit_log("PRINTERS_QUERY_ERROR", f"host={host}; error={exc}")
+                status = "error"
+                error = exc
+
+            def finish():
+                try:
+                    if progress.winfo_exists():
+                        progress.close()
+                except Exception:
+                    pass
+
+                self.btn_printers.configure(
+                    state="normal",
+                    text="Impressoras",
+                )
+
+                if status == "offline":
+                    show_error(
+                        self,
+                        "Erro",
+                        "Erro: O computador está desligado ou offline.",
+                    )
+                    return
+
+                if error:
+                    show_error(
+                        self,
+                        "Consultar impressoras",
+                        f"Falha ao consultar impressoras em {host}:\n\n"
+                        f"{error}\n\nLog: {ERROR_LOG}",
+                    )
+                    return
+
+                audit_log("PRINTERS_QUERY_OK", f"host={host}")
+                result_target = (
+                    f"{display_name} ({host})"
+                    if display_name
+                    else host
+                )
+                show_text_window(
+                    self,
+                    f"Impressoras - {result_target}",
+                    result,
+                )
 
             self.after(0, finish)
 
