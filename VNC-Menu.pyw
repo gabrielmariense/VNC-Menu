@@ -35,7 +35,7 @@ REALVNC_EXE = r"C:\Program Files\RealVNC\VNC Viewer\vncviewer.exe"
 PORT = 5900
 
 APP_NAME = "VNC-Menu"
-APP_VERSION = "1.5.3"
+APP_VERSION = "1.5.4"
 APP_AUTHOR = 'Gabriel "GMErebos" Mariense'
 GITHUB_PROFILE_URL = "https://github.com/gabrielmariense"
 GITHUB_URL = "https://github.com/gabrielmariense/VNC-Menu"
@@ -1936,211 +1936,46 @@ def query_remote_printers(host: str, psexec_path: Path) -> str:
     if not host:
         raise ValueError("Hostname ou IP não informado.")
 
-    collector = r'''
-$ErrorActionPreference = 'SilentlyContinue'
-$ProgressPreference = 'SilentlyContinue'
-$startMarker = '__VNC_MENU_PRINTERS_BEGIN__'
-$endMarker = '__VNC_MENU_PRINTERS_END__'
-$results = New-Object System.Collections.Generic.List[object]
-
-function Get-PortAddress {
-    param($Port)
-
-    if ($null -eq $Port) {
-        return ''
-    }
-
-    $address = [string]$Port.PrinterHostAddress
-    if (-not [string]::IsNullOrWhiteSpace($address)) {
-        return $address.Trim()
-    }
-
-    $portName = [string]$Port.Name
-    $match = [regex]::Match(
-        $portName,
-        '(?<!\d)(?:\d{1,3}\.){3}\d{1,3}(?!\d)'
-    )
-    if ($match.Success) {
-        return $match.Value
-    }
-
-    return ''
+    collector = r'''$ErrorActionPreference='SilentlyContinue'
+$m1='__VNC_MENU_PRINTERS_BEGIN__';$m2='__VNC_MENU_PRINTERS_END__';$r=@();$ports=@{}
+function Get-IP($value){
+ $value=[string]$value
+ if([string]::IsNullOrWhiteSpace($value)){return ''}
+ if($value-match'(?<!\d)(?:\d{1,3}\.){3}\d{1,3}(?!\d)'){return $Matches[0]}
+ try{return ([Net.Dns]::GetHostAddresses($value)|Where-Object{$_.AddressFamily-eq'InterNetwork'}|Select-Object -First 1).IPAddressToString}catch{return ''}
 }
-
-function Add-PrinterResult {
-    param(
-        [string]$Name,
-        [string]$IP,
-        [string]$Server,
-        [string]$Queue,
-        [string]$Source
-    )
-
-    if ([string]::IsNullOrWhiteSpace($Name)) {
-        return
-    }
-
-    $results.Add([pscustomobject]@{
-        Name = $Name.Trim()
-        IP = ([string]$IP).Trim()
-        Server = ([string]$Server).Trim()
-        Queue = ([string]$Queue).Trim()
-        Source = $Source
-    })
+function Get-Address($port){
+ if(!$port){return ''};$name=[string]$port.Name
+ if($name-match'(?i)^USB'){return 'USB'}
+ $ip=Get-IP $port.PrinterHostAddress;if(!$ip){$ip=Get-IP $name};return $ip
 }
-
-$ports = @{}
-@(Get-PrinterPort -ErrorAction SilentlyContinue) | ForEach-Object {
-    $ports[[string]$_.Name] = $_
+function Get-SharedAddress($server,$queue){
+ if(!$server-or!$queue){return ''}
+ $printer=Get-Printer -ComputerName $server -Name $queue
+ if(!$printer){return ''}
+ return (Get-Address (Get-PrinterPort -ComputerName $server -Name ([string]$printer.PortName)))
 }
-
-@(Get-Printer -ErrorAction SilentlyContinue) | ForEach-Object {
-    $printer = $_
-    $name = [string]$printer.Name
-    $server = ''
-    $queue = ''
-
-    $connectionName = [string]$printer.ConnectionName
-    if ($connectionName -match '^\\\\([^\\]+)\\(.+)$') {
-        $server = $Matches[1]
-        $queue = $Matches[2]
-    }
-    elseif ($name -match '^\\\\([^\\]+)\\(.+)$') {
-        $server = $Matches[1]
-        $queue = $Matches[2]
-    }
-
-    $port = $ports[[string]$printer.PortName]
-    $ip = Get-PortAddress $port
-
-    Add-PrinterResult $name $ip $server $queue 'Machine'
+Get-PrinterPort|ForEach-Object{$ports[$_.Name]=$_}
+Get-Printer|ForEach-Object{
+ $name=[string]$_.Name;$port=$ports[[string]$_.PortName];$address=Get-Address $port;$connection=[string]$_.ConnectionName
+ if(!$address-and$connection-match'^\\\\([^\\]+)\\(.+)$'){$address=Get-SharedAddress $Matches[1] $Matches[2]}
+ if(!$address-and$name-match'^\\\\([^\\]+)\\(.+)$'){$address=Get-SharedAddress $Matches[1] $Matches[2]}
+ if(!$address){$address='NÃO IDENTIFICADO'}
+ if($name){$r+=[pscustomobject]@{Name=$name;IP=$address}}
 }
-
-$createdHkuDrive = $false
-if (-not (Get-PSDrive -Name HKU -ErrorAction SilentlyContinue)) {
-    New-PSDrive `
-        -Name HKU `
-        -PSProvider Registry `
-        -Root HKEY_USERS `
-        -ErrorAction SilentlyContinue | Out-Null
-    $createdHkuDrive = $true
+if(!(Get-PSDrive HKU -ErrorAction SilentlyContinue)){New-PSDrive HKU Registry HKEY_USERS|Out-Null;$newHku=$true}
+Get-ChildItem HKU:\|Where-Object{$_.PSChildName-match'^S-1-5-21-(?:\d+-){3}\d+$'}|ForEach-Object{
+ Get-ChildItem "HKU:\$($_.PSChildName)\Printers\Connections"|ForEach-Object{
+  $parts=@(($_.PSChildName-replace'^,,','')-split',')
+  if($parts.Count-ge2){$server=[string]$parts[0];$queue=[string]($parts[1..($parts.Count-1)]-join',');$address=Get-SharedAddress $server $queue;if(!$address){$address='NÃO IDENTIFICADO'};$r+=[pscustomobject]@{Name="\\$server\$queue";IP=$address}}
+ }
 }
+if($newHku){Remove-PSDrive HKU}
+$json=ConvertTo-Json -InputObject @($r|Sort-Object Name,IP -Unique)-Compress
+$payload=[Convert]::ToBase64String([Text.Encoding]::UTF8.GetBytes($json))
+$m1;$payload;$m2'''
 
-@(Get-ChildItem 'HKU:\' -ErrorAction SilentlyContinue) |
-    Where-Object {
-        $_.PSChildName -match '^S-1-5-21-(?:\d+-){3}\d+$'
-    } |
-    ForEach-Object {
-        $sid = $_.PSChildName
-        $connectionsPath = "HKU:\$sid\Printers\Connections"
-
-        @(Get-ChildItem $connectionsPath -ErrorAction SilentlyContinue) |
-            ForEach-Object {
-                $rawName = [string]$_.PSChildName
-                $cleanName = $rawName -replace '^,,', ''
-                $parts = @($cleanName -split ',')
-
-                if ($parts.Count -lt 2) {
-                    return
-                }
-
-                $server = [string]$parts[0]
-                $queue = [string]($parts[1..($parts.Count - 1)] -join ',')
-                $displayName = "\\$server\$queue"
-
-                Add-PrinterResult $displayName '' $server $queue "User:$sid"
-            }
-    }
-
-if ($createdHkuDrive) {
-    Remove-PSDrive -Name HKU -ErrorAction SilentlyContinue
-}
-
-$neededServers = @()
-
-foreach ($printerItem in $results) {
-    if (-not [string]::IsNullOrWhiteSpace([string]$printerItem.IP)) {
-        continue
-    }
-
-    $serverName = [string]$printerItem.Server
-    $serverName = ($serverName -replace '^\\+', '').Trim()
-
-    if ([string]::IsNullOrWhiteSpace($serverName)) {
-        continue
-    }
-
-    if ($neededServers -notcontains $serverName) {
-        $neededServers += $serverName
-    }
-}
-
-foreach ($server in $neededServers) {
-    $serverKey = (($server -split '\.')[0]).ToLowerInvariant()
-    $serverPorts = @{}
-    @(Get-PrinterPort -ComputerName $server -ErrorAction SilentlyContinue) |
-        ForEach-Object {
-            $serverPorts[[string]$_.Name] = $_
-        }
-
-    $queueAddresses = @{}
-    @(Get-Printer -ComputerName $server -ErrorAction SilentlyContinue) |
-        ForEach-Object {
-            $remotePrinter = $_
-            $remotePort = $serverPorts[[string]$remotePrinter.PortName]
-            $remoteIP = Get-PortAddress $remotePort
-
-            if (-not [string]::IsNullOrWhiteSpace($remoteIP)) {
-                @(
-                    [string]$remotePrinter.Name,
-                    [string]$remotePrinter.ShareName
-                ) | ForEach-Object {
-                    $queueKey = ([string]$_).Trim().ToLowerInvariant()
-                    if (-not [string]::IsNullOrWhiteSpace($queueKey)) {
-                        $queueAddresses[$queueKey] = $remoteIP
-                    }
-                }
-            }
-        }
-
-    foreach ($item in $results) {
-        if (-not [string]::IsNullOrWhiteSpace([string]$item.IP)) {
-            continue
-        }
-
-        $itemServerKey = (
-            (([string]$item.Server -replace '^\\+', '') -split '\.')[0]
-        ).ToLowerInvariant()
-
-        if ($itemServerKey -ne $serverKey) {
-            continue
-        }
-
-        $itemQueueKey = ([string]$item.Queue).Trim().ToLowerInvariant()
-        if ($queueAddresses.ContainsKey($itemQueueKey)) {
-            $item.IP = $queueAddresses[$itemQueueKey]
-        }
-    }
-}
-
-$uniqueResults = @(
-    $results |
-        Sort-Object Name, IP, Server, Queue -Unique
-)
-
-$json = ConvertTo-Json -InputObject @($uniqueResults) -Compress -Depth 4
-$payload = [Convert]::ToBase64String(
-    [Text.Encoding]::UTF8.GetBytes($json)
-)
-
-Write-Output $startMarker
-Write-Output $payload
-Write-Output $endMarker
-'''
-
-    encoded_command = base64.b64encode(
-        collector.encode("utf-16-le")
-    ).decode("ascii")
+    encoded_command = base64.b64encode(collector.encode("utf-16-le")).decode("ascii")
 
     command = [
         str(psexec_path),
