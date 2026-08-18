@@ -35,7 +35,7 @@ REALVNC_EXE = r"C:\Program Files\RealVNC\VNC Viewer\vncviewer.exe"
 PORT = 5900
 
 APP_NAME = "VNC-Menu"
-APP_VERSION = "1.5.2"
+APP_VERSION = "1.5.3"
 APP_AUTHOR = 'Gabriel "GMErebos" Mariense'
 GITHUB_PROFILE_URL = "https://github.com/gabrielmariense"
 GITHUB_URL = "https://github.com/gabrielmariense/VNC-Menu"
