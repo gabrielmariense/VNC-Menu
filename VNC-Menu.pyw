@@ -35,14 +35,13 @@ REALVNC_EXE = r"C:\Program Files\RealVNC\VNC Viewer\vncviewer.exe"
 PORT = 5900
 
 APP_NAME = "VNC-Menu"
-APP_VERSION = "1.5.1"
+APP_VERSION = "1.5.2"
 APP_AUTHOR = 'Gabriel "GMErebos" Mariense'
 GITHUB_PROFILE_URL = "https://github.com/gabrielmariense"
 GITHUB_URL = "https://github.com/gabrielmariense/VNC-Menu"
 LICENSE_URL = "https://github.com/gabrielmariense/VNC-Menu/blob/main/LICENSE"
 GITHUB_RELEASES_URL = f"{GITHUB_URL}/releases"
 GITHUB_LATEST_RELEASE_API = "https://api.github.com/repos/gabrielmariense/VNC-Menu/releases/latest"
-UPDATE_CHECK_INTERVAL_SECONDS = 24 * 60 * 60
 UPDATER_SCRIPT_NAME = "VNC-Menu-Updater.pyw"
 UPDATER_EXE_NAME = "VNC-Menu-Updater.exe"
 UPDATE_DOWNLOAD_DIR = Path(tempfile.gettempdir()) / "VNC-Menu-Update"
@@ -50,7 +49,6 @@ PSEXEC_DOWNLOAD_URL = "https://learn.microsoft.com/sysinternals/downloads/psexec
 PSEXEC_TIMEOUT_SECONDS = 35
 HOST_PING_TIMEOUT_MS = 1000
 HOST_PING_PROCESS_TIMEOUT_SECONDS = 4
-PRINT_SERVERS = ("srv1315", "srv-01-022")
 
 VIEWER_ULTRAVNC = "ultravnc"
 VIEWER_REALVNC = "realvnc"
@@ -74,6 +72,7 @@ DATA_DIR = SCRIPT_DIR / "data"
 SHARED_HOSTS_JSON = DATA_DIR / "hosts.json"
 TEMPLATE_VNC = DATA_DIR / "template.vnc"
 REALVNC_DIR = DATA_DIR / "realvnc"
+PSEXEC_CONFIG_JSON = DATA_DIR / "psexec.json"
 
 USER_DATA_DIR = Path.home() / "Documents" / "VNC-Menu"
 USER_DATA_DIR.mkdir(parents=True, exist_ok=True)
@@ -147,10 +146,8 @@ DEFAULT_SETTINGS = {
     "window_geometries": {},
     "ultravnc_exe": ULTRAVNC_EXE,
     "realvnc_exe": REALVNC_EXE,
-    "psexec_exe": "",
     "login_mode": LOGIN_MODE_AUTO,
     "check_updates_on_startup": True,
-    "last_update_check": 0,
     "skipped_update_version": "",
 }
 
@@ -674,12 +671,35 @@ def ask_text(parent: Any, title: str, label: str, initial: str = "") -> str | No
     return result["value"]
 
 
-def find_psexec(configured_path=None) -> Path | None:
+def load_psexec_path() -> str:
+    try:
+        if not PSEXEC_CONFIG_JSON.exists():
+            return ""
+
+        data = json.loads(PSEXEC_CONFIG_JSON.read_text(encoding="utf-8"))
+        if not isinstance(data, dict):
+            return ""
+        return str(data.get("psexec_exe") or "").strip()
+    except Exception as exc:
+        log_exception(exc)
+        return ""
+
+
+def save_psexec_path(path: Path) -> bool:
+    try:
+        return bool(save_json({"psexec_exe": str(path)}, PSEXEC_CONFIG_JSON))
+    except Exception as exc:
+        log_exception(exc)
+        return False
+
+
+def find_psexec() -> Path | None:
     for executable in ("PsExec64.exe", "PsExec.exe", "psexec64", "psexec"):
         resolved = shutil.which(executable)
         if resolved:
             return Path(resolved)
 
+    configured_path = load_psexec_path()
     configured_path = str(configured_path or "").strip().strip('"')
     if configured_path:
         candidate = Path(configured_path).expanduser()
@@ -689,7 +709,7 @@ def find_psexec(configured_path=None) -> Path | None:
     return None
 
 
-def select_psexec_executable(parent, settings) -> Path | None:
+def select_psexec_executable(parent) -> Path | None:
     while True:
         selected = filedialog.askopenfilename(
             parent=parent,
@@ -707,8 +727,13 @@ def select_psexec_executable(parent, settings) -> Path | None:
 
         candidate = Path(selected)
         if candidate.is_file() and candidate.suffix.casefold() == ".exe":
-            settings["psexec_exe"] = str(candidate)
-            save_settings(settings)
+            if not save_psexec_path(candidate):
+                show_error(
+                    parent,
+                    "Erro ao salvar PsExec",
+                    "Não foi possível salvar a configuração na pasta data.",
+                )
+                return None
             audit_log("PSEXEC_SELECTED", f"path={candidate}")
             return candidate
 
@@ -719,7 +744,7 @@ def select_psexec_executable(parent, settings) -> Path | None:
         )
 
 
-def show_psexec_required_dialog(parent, settings) -> Path | None:
+def show_psexec_required_dialog(parent) -> Path | None:
     result: dict[str, Path | None] = {"value": None}
 
     win = ctk.CTkToplevel(parent)
@@ -776,7 +801,7 @@ def show_psexec_required_dialog(parent, settings) -> Path | None:
             )
 
     def select_executable():
-        selected = select_psexec_executable(win, settings)
+        selected = select_psexec_executable(win)
         if selected is None:
             return
         result["value"] = selected
@@ -1242,7 +1267,7 @@ def _read_settings_file(path: Path) -> dict | None:
         data = json.loads(path.read_text(encoding="utf-8"))
         if isinstance(data, dict):
             merged = DEFAULT_SETTINGS.copy()
-            merged.update(data)
+            merged.update({key: data[key] for key in DEFAULT_SETTINGS if key in data})
             return merged
     except Exception as e:
         log_exception(e)
@@ -2031,12 +2056,6 @@ if ($createdHkuDrive) {
     Remove-PSDrive -Name HKU -ErrorAction SilentlyContinue
 }
 
-$allowedServers = @(__PRINT_SERVERS__)
-$allowedServerLookup = @{}
-foreach ($allowedServer in $allowedServers) {
-    $allowedServerLookup[$allowedServer.ToLowerInvariant()] = $allowedServer
-}
-
 $neededServers = @(
     $results |
         Where-Object {
@@ -2044,18 +2063,14 @@ $neededServers = @(
             -not [string]::IsNullOrWhiteSpace([string]$_.Server)
         } |
         ForEach-Object {
-            $serverKey = (
-                (([string]$_.Server -replace '^\\+', '') -split '\.')[0]
-            ).ToLowerInvariant()
-
-            if ($allowedServerLookup.ContainsKey($serverKey)) {
-                $allowedServerLookup[$serverKey]
-            }
+            (([string]$_.Server -replace '^\\+', '')).Trim()
         } |
+        Where-Object { -not [string]::IsNullOrWhiteSpace([string]$_) } |
         Sort-Object -Unique
 )
 
 foreach ($server in $neededServers) {
+    $serverKey = (($server -split '\.')[0]).ToLowerInvariant()
     $serverPorts = @{}
     @(Get-PrinterPort -ComputerName $server -ErrorAction SilentlyContinue) |
         ForEach-Object {
@@ -2091,7 +2106,7 @@ foreach ($server in $neededServers) {
             (([string]$item.Server -replace '^\\+', '') -split '\.')[0]
         ).ToLowerInvariant()
 
-        if ($itemServerKey -ne $server.ToLowerInvariant()) {
+        if ($itemServerKey -ne $serverKey) {
             continue
         }
 
@@ -2116,11 +2131,6 @@ Write-Output $startMarker
 Write-Output $payload
 Write-Output $endMarker
 '''
-
-    collector = collector.replace(
-        "__PRINT_SERVERS__",
-        ", ".join(f"'{server}'" for server in PRINT_SERVERS),
-    )
 
     encoded_command = base64.b64encode(
         collector.encode("utf-16-le")
@@ -4802,14 +4812,6 @@ class App(ctk.CTk):
         if not bool(self.settings.get("check_updates_on_startup", True)):
             return
 
-        try:
-            last_check = float(self.settings.get("last_update_check", 0) or 0)
-        except Exception:
-            last_check = 0
-
-        if time.time() - last_check < UPDATE_CHECK_INTERVAL_SECONDS:
-            return
-
         self.check_for_updates(manual=False)
 
     def check_for_updates(self, manual: bool = True):
@@ -4868,9 +4870,6 @@ class App(ctk.CTk):
                             "O GitHub retornou uma resposta de release inválida.",
                         )
                     return
-
-                self.settings["last_update_check"] = time.time()
-                save_settings(self.settings)
 
                 latest_version = normalize_release_version(release.get("tag_name", ""))
                 audit_log(
@@ -5121,10 +5120,10 @@ class App(ctk.CTk):
 
         host = str(host).strip().lstrip("\\")
         display_name = str(display_name or "").strip()
-        psexec_path = find_psexec(self.settings.get("psexec_exe"))
+        psexec_path = find_psexec()
         if psexec_path is None:
             audit_log("PSEXEC_NOT_FOUND_IN_PATH")
-            psexec_path = show_psexec_required_dialog(self, self.settings)
+            psexec_path = show_psexec_required_dialog(self)
         if psexec_path is None:
             return
 
