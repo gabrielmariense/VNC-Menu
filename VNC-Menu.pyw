@@ -35,21 +35,20 @@ REALVNC_EXE = r"C:\Program Files\RealVNC\VNC Viewer\vncviewer.exe"
 PORT = 5900
 
 APP_NAME = "VNC-Menu"
-APP_VERSION = "1.5"
+APP_VERSION = "1.5.1"
 APP_AUTHOR = 'Gabriel "GMErebos" Mariense'
 GITHUB_PROFILE_URL = "https://github.com/gabrielmariense"
 GITHUB_URL = "https://github.com/gabrielmariense/VNC-Menu"
 LICENSE_URL = "https://github.com/gabrielmariense/VNC-Menu/blob/main/LICENSE"
 GITHUB_RELEASES_URL = f"{GITHUB_URL}/releases"
 GITHUB_LATEST_RELEASE_API = "https://api.github.com/repos/gabrielmariense/VNC-Menu/releases/latest"
-UPDATE_CHECK_INTERVAL_SECONDS = 24 * 60 * 60
 UPDATER_SCRIPT_NAME = "VNC-Menu-Updater.pyw"
 UPDATER_EXE_NAME = "VNC-Menu-Updater.exe"
 UPDATE_DOWNLOAD_DIR = Path(tempfile.gettempdir()) / "VNC-Menu-Update"
+PSEXEC_DOWNLOAD_URL = "https://learn.microsoft.com/sysinternals/downloads/psexec"
 PSEXEC_TIMEOUT_SECONDS = 35
 HOST_PING_TIMEOUT_MS = 1000
 HOST_PING_PROCESS_TIMEOUT_SECONDS = 4
-PRINT_SERVERS = ("srv1315", "srv-01-022")
 
 VIEWER_ULTRAVNC = "ultravnc"
 VIEWER_REALVNC = "realvnc"
@@ -149,7 +148,6 @@ DEFAULT_SETTINGS = {
     "psexec_exe": "",
     "login_mode": LOGIN_MODE_AUTO,
     "check_updates_on_startup": True,
-    "last_update_check": 0,
     "skipped_update_version": "",
 }
 
@@ -718,6 +716,112 @@ def select_psexec_executable(parent, settings) -> Path | None:
         )
 
 
+def show_psexec_required_dialog(parent, settings) -> Path | None:
+    result: dict[str, Path | None] = {"value": None}
+
+    win = ctk.CTkToplevel(parent)
+    win.title("PsExec não encontrado")
+    win.resizable(False, False)
+    win.configure(fg_color=THEME["bg"])
+
+    box = ctk.CTkFrame(win, fg_color=THEME["surface"], corner_radius=18)
+    box.pack(fill="both", expand=True, padx=18, pady=18)
+
+    ctk.CTkLabel(
+        box,
+        text="PsExec não encontrado",
+        font=FONT_SUBTITLE,
+        text_color=THEME["text"],
+    ).pack(anchor="w", padx=18, pady=(18, 8))
+
+    message = (
+        "O PsExec não foi encontrado no PATH do sistema e nenhum "
+        "executável configurado pôde ser utilizado.\n\n"
+        "Se o PsExec ainda não estiver neste computador, baixe-o no site "
+        "oficial da Microsoft. Se ele já estiver instalado ou extraído, "
+        "use o botão abaixo para selecionar PsExec.exe ou PsExec64.exe."
+    )
+    ctk.CTkLabel(
+        box,
+        text=message,
+        font=FONT_NORMAL,
+        text_color=THEME["muted"],
+        justify="left",
+        wraplength=590,
+    ).pack(anchor="w", padx=18, pady=(0, 20))
+
+    buttons = ctk.CTkFrame(box, fg_color="transparent")
+    buttons.pack(fill="x", padx=18, pady=(0, 18))
+
+    def cancel():
+        win.destroy()
+
+    def download_psexec():
+        try:
+            if not webbrowser.open_new_tab(PSEXEC_DOWNLOAD_URL):
+                raise RuntimeError("O Windows não encontrou um navegador disponível.")
+            audit_log(
+                "PSEXEC_DOWNLOAD_PAGE_OPENED",
+                f"url={PSEXEC_DOWNLOAD_URL}",
+            )
+        except Exception as exc:
+            log_exception(exc)
+            show_error(
+                win,
+                "Baixar PsExec",
+                f"Falha ao abrir a página de download:\n{exc}",
+            )
+
+    def select_executable():
+        selected = select_psexec_executable(win, settings)
+        if selected is None:
+            return
+        result["value"] = selected
+        win.destroy()
+
+    ctk.CTkButton(
+        buttons,
+        text="Cancelar",
+        width=95,
+        height=38,
+        command=cancel,
+        font=FONT_BOLD,
+        fg_color=THEME["surface_3"],
+        hover_color=THEME["accent_soft"],
+        text_color=THEME["secondary_button_text"],
+    ).pack(side="right", padx=(8, 0))
+
+    ctk.CTkButton(
+        buttons,
+        text="Selecionar executável",
+        width=175,
+        height=38,
+        command=select_executable,
+        font=FONT_BOLD,
+        fg_color=THEME["accent"],
+        hover_color=THEME["accent_hover"],
+        text_color=THEME["button_text"],
+    ).pack(side="right", padx=(8, 0))
+
+    ctk.CTkButton(
+        buttons,
+        text="Baixar PsExec",
+        width=130,
+        height=38,
+        command=download_psexec,
+        font=FONT_BOLD,
+        fg_color=THEME["surface_3"],
+        hover_color=THEME["accent_soft"],
+        text_color=THEME["secondary_button_text"],
+    ).pack(side="right")
+
+    win.protocol("WM_DELETE_WINDOW", cancel)
+    win.bind("<Escape>", lambda _event: cancel())
+    center_window(win, 680, 270)
+    modal_window(win, parent)
+    return result["value"]
+
+
 def ask_host_details(parent: Any, title: str, initial: dict[str, str] | None = None) -> dict[str, str] | None:
     initial = initial or {}
     result: dict[str, dict[str, str] | None] = {"value": None}
@@ -1135,7 +1239,7 @@ def _read_settings_file(path: Path) -> dict | None:
         data = json.loads(path.read_text(encoding="utf-8"))
         if isinstance(data, dict):
             merged = DEFAULT_SETTINGS.copy()
-            merged.update(data)
+            merged.update({key: data[key] for key in DEFAULT_SETTINGS if key in data})
             return merged
     except Exception as e:
         log_exception(e)
@@ -1924,12 +2028,6 @@ if ($createdHkuDrive) {
     Remove-PSDrive -Name HKU -ErrorAction SilentlyContinue
 }
 
-$allowedServers = @(__PRINT_SERVERS__)
-$allowedServerLookup = @{}
-foreach ($allowedServer in $allowedServers) {
-    $allowedServerLookup[$allowedServer.ToLowerInvariant()] = $allowedServer
-}
-
 $neededServers = @(
     $results |
         Where-Object {
@@ -1937,18 +2035,14 @@ $neededServers = @(
             -not [string]::IsNullOrWhiteSpace([string]$_.Server)
         } |
         ForEach-Object {
-            $serverKey = (
-                (([string]$_.Server -replace '^\\+', '') -split '\.')[0]
-            ).ToLowerInvariant()
-
-            if ($allowedServerLookup.ContainsKey($serverKey)) {
-                $allowedServerLookup[$serverKey]
-            }
+            (([string]$_.Server -replace '^\\+', '')).Trim()
         } |
+        Where-Object { -not [string]::IsNullOrWhiteSpace([string]$_) } |
         Sort-Object -Unique
 )
 
 foreach ($server in $neededServers) {
+    $serverKey = (($server -split '\.')[0]).ToLowerInvariant()
     $serverPorts = @{}
     @(Get-PrinterPort -ComputerName $server -ErrorAction SilentlyContinue) |
         ForEach-Object {
@@ -1984,7 +2078,7 @@ foreach ($server in $neededServers) {
             (([string]$item.Server -replace '^\\+', '') -split '\.')[0]
         ).ToLowerInvariant()
 
-        if ($itemServerKey -ne $server.ToLowerInvariant()) {
+        if ($itemServerKey -ne $serverKey) {
             continue
         }
 
@@ -2009,11 +2103,6 @@ Write-Output $startMarker
 Write-Output $payload
 Write-Output $endMarker
 '''
-
-    collector = collector.replace(
-        "__PRINT_SERVERS__",
-        ", ".join(f"'{server}'" for server in PRINT_SERVERS),
-    )
 
     encoded_command = base64.b64encode(
         collector.encode("utf-16-le")
@@ -4695,14 +4784,6 @@ class App(ctk.CTk):
         if not bool(self.settings.get("check_updates_on_startup", True)):
             return
 
-        try:
-            last_check = float(self.settings.get("last_update_check", 0) or 0)
-        except Exception:
-            last_check = 0
-
-        if time.time() - last_check < UPDATE_CHECK_INTERVAL_SECONDS:
-            return
-
         self.check_for_updates(manual=False)
 
     def check_for_updates(self, manual: bool = True):
@@ -4761,9 +4842,6 @@ class App(ctk.CTk):
                             "O GitHub retornou uma resposta de release inválida.",
                         )
                     return
-
-                self.settings["last_update_check"] = time.time()
-                save_settings(self.settings)
 
                 latest_version = normalize_release_version(release.get("tag_name", ""))
                 audit_log(
@@ -5017,7 +5095,7 @@ class App(ctk.CTk):
         psexec_path = find_psexec(self.settings.get("psexec_exe"))
         if psexec_path is None:
             audit_log("PSEXEC_NOT_FOUND_IN_PATH")
-            psexec_path = select_psexec_executable(self, self.settings)
+            psexec_path = show_psexec_required_dialog(self, self.settings)
         if psexec_path is None:
             return
 
