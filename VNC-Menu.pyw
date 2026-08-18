@@ -35,7 +35,7 @@ REALVNC_EXE = r"C:\Program Files\RealVNC\VNC Viewer\vncviewer.exe"
 PORT = 5900
 
 APP_NAME = "VNC-Menu"
-APP_VERSION = "1.5.4"
+APP_VERSION = "1.5.5"
 APP_AUTHOR = 'Gabriel "GMErebos" Mariense'
 GITHUB_PROFILE_URL = "https://github.com/gabrielmariense"
 GITHUB_URL = "https://github.com/gabrielmariense/VNC-Menu"
@@ -1973,7 +1973,7 @@ Get-ChildItem HKU:\|Where-Object{$_.PSChildName-match'^S-1-5-21-(?:\d+-){3}\d+$'
 if($newHku){Remove-PSDrive HKU}
 $json=ConvertTo-Json -InputObject @($r|Sort-Object Name,IP -Unique)-Compress
 $payload=[Convert]::ToBase64String([Text.Encoding]::UTF8.GetBytes($json))
-$m1;$payload;$m2'''
+[Console]::Out.WriteLine($m1+$payload+$m2)'''
 
     encoded_command = base64.b64encode(collector.encode("utf-16-le")).decode("ascii")
 
