@@ -35,7 +35,7 @@ REALVNC_EXE = r"C:\Program Files\RealVNC\VNC Viewer\vncviewer.exe"
 PORT = 5900
 
 APP_NAME = "VNC-Menu"
-APP_VERSION = "1.5.5"
+APP_VERSION = "1.6"
 APP_AUTHOR = 'Gabriel "GMErebos" Mariense'
 GITHUB_PROFILE_URL = "https://github.com/gabrielmariense"
 GITHUB_URL = "https://github.com/gabrielmariense/VNC-Menu"
@@ -72,7 +72,8 @@ DATA_DIR = SCRIPT_DIR / "data"
 SHARED_HOSTS_JSON = DATA_DIR / "hosts.json"
 TEMPLATE_VNC = DATA_DIR / "template.vnc"
 REALVNC_DIR = DATA_DIR / "realvnc"
-PSEXEC_CONFIG_JSON = DATA_DIR / "psexec.json"
+GLOBAL_PATHS_JSON = DATA_DIR / "paths.json"
+LEGACY_PSEXEC_CONFIG_JSON = DATA_DIR / "psexec.json"
 
 USER_DATA_DIR = Path.home() / "Documents" / "VNC-Menu"
 USER_DATA_DIR.mkdir(parents=True, exist_ok=True)
@@ -144,6 +145,7 @@ DEFAULT_SETTINGS = {
     "host_columns": 3,
     "main_window_size": "980x610",
     "window_geometries": {},
+    # Legacy per-user keys kept only for automatic migration to data\paths.json.
     "ultravnc_exe": ULTRAVNC_EXE,
     "realvnc_exe": REALVNC_EXE,
     "login_mode": LOGIN_MODE_AUTO,
@@ -321,6 +323,34 @@ def center_window(win, width: int | None = None, height: int | None = None):
     win.geometry(f"{w}x{h}+{x}+{y}")
 
 
+def fit_dialog_to_content(
+    win,
+    parent=None,
+    width: int = 560,
+    min_height: int = 170,
+):
+    """Size compact dialogs to their actual content and center them near the parent."""
+    win.update_idletasks()
+    req_height = max(win.winfo_reqheight(), min_height)
+    max_height = max(win.winfo_screenheight() - 120, min_height)
+    height = min(req_height, max_height)
+
+    if parent is not None:
+        try:
+            parent.update_idletasks()
+            if parent.winfo_exists() and parent.winfo_ismapped():
+                x = parent.winfo_rootx() + max((parent.winfo_width() - width) // 2, 0)
+                y = parent.winfo_rooty() + max((parent.winfo_height() - height) // 2, 0)
+                x = max(0, min(x, win.winfo_screenwidth() - width))
+                y = max(0, min(y, win.winfo_screenheight() - height))
+                win.geometry(f"{width}x{height}+{x}+{y}")
+                return
+        except Exception:
+            pass
+
+    center_window(win, width, height)
+
+
 _GEOMETRY_RE = re.compile(r"^\d+x\d+[+-]\d+[+-]\d+$")
 
 
@@ -492,11 +522,26 @@ def reset_scrollable_frame_position(frame) -> None:
 
 
 def modal_window(win, parent=None):
+    previous_grab = None
+    try:
+        previous_grab = win.grab_current()
+    except Exception:
+        pass
+
     if parent:
         win.transient(parent)
     win.grab_set()
     win.focus_force()
     win.wait_window()
+
+    # Restore a parent modal grab after closing a nested dialog.
+    if previous_grab is not None:
+        try:
+            if previous_grab.winfo_exists():
+                previous_grab.grab_set()
+                previous_grab.focus_force()
+        except Exception:
+            pass
 
 
 # =========================
@@ -512,8 +557,18 @@ def confirm_action(parent, title, message) -> bool:
     box = ctk.CTkFrame(win, fg_color=THEME["surface"], corner_radius=18)
     box.pack(fill="both", expand=True, padx=18, pady=18)
 
-    ctk.CTkLabel(box, text=title, font=FONT_SUBTITLE, text_color=THEME["text"]).pack(anchor="w", padx=18, pady=(18, 8))
-    ctk.CTkLabel(box, text=message, font=FONT_NORMAL, text_color=THEME["muted"], justify="left").pack(anchor="w", padx=18, pady=(0, 18))
+    ctk.CTkLabel(
+        box, text=title, font=FONT_SUBTITLE, text_color=THEME["text"]
+    ).pack(anchor="w", padx=18, pady=(18, 8))
+    ctk.CTkLabel(
+        box,
+        text=message,
+        font=FONT_NORMAL,
+        text_color=THEME["muted"],
+        justify="left",
+        anchor="w",
+        wraplength=500,
+    ).pack(fill="x", padx=18, pady=(0, 18))
 
     buttons = ctk.CTkFrame(box, fg_color="transparent")
     buttons.pack(fill="x", padx=18, pady=(0, 18))
@@ -525,61 +580,56 @@ def confirm_action(parent, title, message) -> bool:
     def no():
         win.destroy()
 
-    ctk.CTkButton(buttons, text_color=THEME["secondary_button_text"], font=FONT_BOLD, text="Cancelar", command=no, fg_color=THEME["surface_3"], hover_color=THEME["accent_soft"]).pack(side="right", padx=(8, 0))
-    ctk.CTkButton(buttons, text_color=THEME["button_text"], font=FONT_BOLD, text="Confirmar", command=yes, fg_color=THEME["accent"], hover_color=THEME["accent_hover"]).pack(side="right")
+    ctk.CTkButton(
+        buttons, text_color=THEME["secondary_button_text"], font=FONT_BOLD,
+        text="Cancelar", command=no, fg_color=THEME["surface_3"],
+        hover_color=THEME["accent_soft"], width=110, height=38,
+    ).pack(side="right", padx=(8, 0))
+    ctk.CTkButton(
+        buttons, text_color=THEME["button_text"], font=FONT_BOLD,
+        text="Confirmar", command=yes, fg_color=THEME["accent"],
+        hover_color=THEME["accent_hover"], width=110, height=38,
+    ).pack(side="right")
 
-    remember_window_geometry(win, f"dialog_text_{safe_filename(title)}", 420, 210)
+    win.protocol("WM_DELETE_WINDOW", no)
+    win.bind("<Escape>", lambda _event: no())
+    fit_dialog_to_content(win, parent, width=560, min_height=190)
     modal_window(win, parent)
     return result["value"]
-
 
 def confirm_empty_list_overwrite(parent) -> bool:
     result = {"value": False}
 
     win = ctk.CTkToplevel(parent)
-    win.title("Sobrescrever lista pessoal")
+    win.title("Criar lista vazia")
     win.resizable(False, False)
     win.configure(fg_color=THEME["bg"])
 
-    box = ctk.CTkFrame(
-        win,
-        fg_color=THEME["surface"],
-        corner_radius=18,
-    )
+    box = ctk.CTkFrame(win, fg_color=THEME["surface"], corner_radius=18)
     box.pack(fill="both", expand=True, padx=18, pady=18)
 
     ctk.CTkLabel(
-        box,
-        text="Sobrescrever lista pessoal?",
-        font=FONT_SUBTITLE,
-        text_color=THEME["text"],
+        box, text="Substituir sua lista pessoal?", font=FONT_SUBTITLE, text_color=THEME["text"]
     ).pack(anchor="w", padx=18, pady=(18, 8))
-
-    message = (
-        "Já existe uma lista pessoal salva neste computador.\n\n"
-        f"Arquivo:\n{USER_HOSTS_JSON}\n\n"
-        "Ao selecionar Vazia, essa lista será substituída por uma nova "
-        "lista limpa e todos os hosts personalizados atuais serão perdidos."
-    )
 
     ctk.CTkLabel(
         box,
-        text=message,
+        text=(
+            "Você já possui uma lista personalizada. Criar uma lista vazia vai "
+            "substituí-la e remover os hosts salvos nela.\n\n"
+            "A lista Padrão não será alterada."
+        ),
         font=FONT_NORMAL,
         text_color=THEME["muted"],
         justify="left",
         anchor="w",
-        wraplength=520,
+        wraplength=500,
     ).pack(fill="x", padx=18, pady=(0, 18))
 
-    buttons = ctk.CTkFrame(
-        box,
-        fg_color="transparent",
-    )
+    buttons = ctk.CTkFrame(box, fg_color="transparent")
     buttons.pack(fill="x", padx=18, pady=(0, 18))
 
     def cancel():
-        result["value"] = False
         win.destroy()
 
     def confirm():
@@ -587,41 +637,22 @@ def confirm_empty_list_overwrite(parent) -> bool:
         win.destroy()
 
     ctk.CTkButton(
-        buttons,
-        font=FONT_BOLD,
-        text="Cancelar",
-        width=120,
-        height=38,
-        command=cancel,
-        fg_color=THEME["surface_3"],
-        hover_color=THEME["accent_soft"],
+        buttons, text="Cancelar", width=110, height=38, command=cancel, font=FONT_BOLD,
+        fg_color=THEME["surface_3"], hover_color=THEME["accent_soft"],
         text_color=THEME["secondary_button_text"],
     ).pack(side="right", padx=(8, 0))
 
     ctk.CTkButton(
-        buttons,
-        font=FONT_BOLD,
-        text="Sobrescrever",
-        width=135,
-        height=38,
-        command=confirm,
-        fg_color=THEME["danger"],
-        hover_color=THEME["danger_hover"],
+        buttons, text="Criar vazia", width=125, height=38, command=confirm, font=FONT_BOLD,
+        fg_color=THEME["danger"], hover_color=THEME["danger_hover"],
         text_color=THEME["button_text"],
     ).pack(side="right")
 
     win.protocol("WM_DELETE_WINDOW", cancel)
     win.bind("<Escape>", lambda _event: cancel())
-
-    remember_window_geometry(
-        win,
-        "dialog_empty_hosts_overwrite_v2",
-        600,
-        330,
-    )
+    fit_dialog_to_content(win, parent, width=570, min_height=220)
     modal_window(win, parent)
     return result["value"]
-
 
 def ask_text(parent: Any, title: str, label: str, initial: str = "") -> str | None:
     result: dict[str, str | None] = {"value": None}
@@ -666,17 +697,17 @@ def ask_text(parent: Any, title: str, label: str, initial: str = "") -> str | No
     win.bind("<Return>", ok)
     win.bind("<Escape>", lambda _e: cancel())
 
-    remember_window_geometry(win, "dialog_host_details", 460, 235)
+    remember_window_geometry(win, "dialog_text_input_v2", 460, 235)
     modal_window(win, parent)
     return result["value"]
 
 
-def load_psexec_path() -> str:
+def _load_legacy_psexec_path() -> str:
+    """Read the pre-1.5.6 PsExec path file, if it exists."""
     try:
-        if not PSEXEC_CONFIG_JSON.exists():
+        if not LEGACY_PSEXEC_CONFIG_JSON.exists():
             return ""
-
-        data = json.loads(PSEXEC_CONFIG_JSON.read_text(encoding="utf-8"))
+        data = json.loads(LEGACY_PSEXEC_CONFIG_JSON.read_text(encoding="utf-8"))
         if not isinstance(data, dict):
             return ""
         return str(data.get("psexec_exe") or "").strip()
@@ -685,26 +716,91 @@ def load_psexec_path() -> str:
         return ""
 
 
-def save_psexec_path(path: Path) -> bool:
+def _normalize_global_paths(data: dict | None, legacy_settings: dict | None = None) -> dict:
+    data = data if isinstance(data, dict) else {}
+    legacy_settings = legacy_settings if isinstance(legacy_settings, dict) else {}
+
+    # An explicit empty PsExec value means "use PATH", so preserve it when
+    # paths.json already contains the key instead of falling back to psexec.json.
+    psexec_value = (
+        data.get("psexec_exe")
+        if "psexec_exe" in data
+        else _load_legacy_psexec_path()
+    )
+
+    return {
+        "ultravnc_exe": str(
+            data.get("ultravnc_exe")
+            or legacy_settings.get("ultravnc_exe")
+            or ULTRAVNC_EXE
+        ).strip(),
+        "realvnc_exe": str(
+            data.get("realvnc_exe")
+            or legacy_settings.get("realvnc_exe")
+            or REALVNC_EXE
+        ).strip(),
+        "psexec_exe": str(psexec_value or "").strip(),
+    }
+
+
+def load_global_paths(legacy_settings: dict | None = None) -> dict:
+    """Load machine-wide executable paths shared by all users of this install."""
     try:
-        return bool(save_json({"psexec_exe": str(path)}, PSEXEC_CONFIG_JSON))
+        if GLOBAL_PATHS_JSON.exists():
+            data = json.loads(GLOBAL_PATHS_JSON.read_text(encoding="utf-8"))
+            return _normalize_global_paths(data)
+    except Exception as exc:
+        log_exception(exc)
+
+    # First run of 1.5.6: migrate the current user's old viewer paths and
+    # the legacy psexec.json into one global paths.json file.
+    if legacy_settings is None:
+        try:
+            legacy_settings = load_settings()
+        except Exception:
+            legacy_settings = {}
+
+    paths = _normalize_global_paths({}, legacy_settings)
+    try:
+        save_json(paths, GLOBAL_PATHS_JSON)
+    except Exception as exc:
+        # Reading still works with defaults/legacy values even if this folder
+        # is temporarily not writable. The settings UI will report save errors.
+        log_exception(exc)
+    return paths
+
+
+def save_global_paths(paths: dict) -> bool:
+    try:
+        normalized = _normalize_global_paths(paths)
+        return bool(save_json(normalized, GLOBAL_PATHS_JSON))
     except Exception as exc:
         log_exception(exc)
         return False
 
 
-def find_psexec() -> Path | None:
-    for executable in ("PsExec64.exe", "PsExec.exe", "psexec64", "psexec"):
-        resolved = shutil.which(executable)
-        if resolved:
-            return Path(resolved)
+def load_psexec_path() -> str:
+    return str(load_global_paths().get("psexec_exe") or "").strip()
 
-    configured_path = load_psexec_path()
-    configured_path = str(configured_path or "").strip().strip('"')
+
+def save_psexec_path(path: Path | str | None) -> bool:
+    paths = load_global_paths()
+    paths["psexec_exe"] = str(path or "").strip()
+    return save_global_paths(paths)
+
+
+def find_psexec() -> Path | None:
+    # A configured global path takes priority over PATH.
+    configured_path = load_psexec_path().strip().strip('"')
     if configured_path:
         candidate = Path(configured_path).expanduser()
         if candidate.is_file() and candidate.suffix.casefold() == ".exe":
             return candidate
+
+    for executable in ("PsExec64.exe", "PsExec.exe", "psexec64", "psexec"):
+        resolved = shutil.which(executable)
+        if resolved:
+            return Path(resolved)
 
     return None
 
@@ -730,18 +826,14 @@ def select_psexec_executable(parent) -> Path | None:
             if not save_psexec_path(candidate):
                 show_error(
                     parent,
-                    "Erro ao salvar PsExec",
-                    "Não foi possível salvar a configuração na pasta data.",
+                    "PsExec",
+                    "Não foi possível salvar o caminho global.",
                 )
                 return None
             audit_log("PSEXEC_SELECTED", f"path={candidate}")
             return candidate
 
-        show_error(
-            parent,
-            "PsExec inválido",
-            "Selecione um arquivo executável válido do PsExec.",
-        )
+        show_error(parent, "PsExec", "Selecione PsExec.exe ou PsExec64.exe.")
 
 
 def show_psexec_required_dialog(parent) -> Path | None:
@@ -762,21 +854,19 @@ def show_psexec_required_dialog(parent) -> Path | None:
         text_color=THEME["text"],
     ).pack(anchor="w", padx=18, pady=(18, 8))
 
-    message = (
-        "O PsExec não foi encontrado no PATH do sistema e nenhum "
-        "executável configurado pôde ser utilizado.\n\n"
-        "Se o PsExec ainda não estiver neste computador, baixe-o no site "
-        "oficial da Microsoft. Se ele já estiver instalado ou extraído, "
-        "use o botão abaixo para selecionar PsExec.exe ou PsExec64.exe."
-    )
     ctk.CTkLabel(
         box,
-        text=message,
+        text=(
+            "O PsExec é necessário para consultar impressoras em computadores remotos. "
+            "Selecione PsExec.exe ou PsExec64.exe neste computador.\n\n"
+            "Se ele ainda não estiver instalado, abra a página oficial da Microsoft para baixar."
+        ),
         font=FONT_NORMAL,
         text_color=THEME["muted"],
         justify="left",
-        wraplength=590,
-    ).pack(anchor="w", padx=18, pady=(0, 20))
+        anchor="w",
+        wraplength=540,
+    ).pack(fill="x", padx=18, pady=(0, 20))
 
     buttons = ctk.CTkFrame(box, fg_color="transparent")
     buttons.pack(fill="x", padx=18, pady=(0, 18))
@@ -788,17 +878,10 @@ def show_psexec_required_dialog(parent) -> Path | None:
         try:
             if not webbrowser.open_new_tab(PSEXEC_DOWNLOAD_URL):
                 raise RuntimeError("O Windows não encontrou um navegador disponível.")
-            audit_log(
-                "PSEXEC_DOWNLOAD_PAGE_OPENED",
-                f"url={PSEXEC_DOWNLOAD_URL}",
-            )
+            audit_log("PSEXEC_DOWNLOAD_PAGE_OPENED", f"url={PSEXEC_DOWNLOAD_URL}")
         except Exception as exc:
             log_exception(exc)
-            show_error(
-                win,
-                "Baixar PsExec",
-                f"Falha ao abrir a página de download:\n{exc}",
-            )
+            show_error(win, "PsExec", f"Não foi possível abrir a página:\n{exc}")
 
     def select_executable():
         selected = select_psexec_executable(win)
@@ -808,47 +891,28 @@ def show_psexec_required_dialog(parent) -> Path | None:
         win.destroy()
 
     ctk.CTkButton(
-        buttons,
-        text="Cancelar",
-        width=95,
-        height=38,
-        command=cancel,
-        font=FONT_BOLD,
-        fg_color=THEME["surface_3"],
-        hover_color=THEME["accent_soft"],
-        text_color=THEME["secondary_button_text"],
+        buttons, text="Cancelar", width=100, height=38, command=cancel,
+        font=FONT_BOLD, fg_color=THEME["surface_3"],
+        hover_color=THEME["accent_soft"], text_color=THEME["secondary_button_text"],
     ).pack(side="right", padx=(8, 0))
 
     ctk.CTkButton(
-        buttons,
-        text="Selecionar executável",
-        width=175,
-        height=38,
-        command=select_executable,
-        font=FONT_BOLD,
-        fg_color=THEME["accent"],
-        hover_color=THEME["accent_hover"],
-        text_color=THEME["button_text"],
+        buttons, text="Selecionar arquivo", width=145, height=38, command=select_executable,
+        font=FONT_BOLD, fg_color=THEME["accent"],
+        hover_color=THEME["accent_hover"], text_color=THEME["button_text"],
     ).pack(side="right", padx=(8, 0))
 
     ctk.CTkButton(
-        buttons,
-        text="Baixar PsExec",
-        width=130,
-        height=38,
-        command=download_psexec,
-        font=FONT_BOLD,
-        fg_color=THEME["surface_3"],
-        hover_color=THEME["accent_soft"],
-        text_color=THEME["secondary_button_text"],
+        buttons, text="Abrir download", width=135, height=38, command=download_psexec,
+        font=FONT_BOLD, fg_color=THEME["surface_3"],
+        hover_color=THEME["accent_soft"], text_color=THEME["secondary_button_text"],
     ).pack(side="right")
 
     win.protocol("WM_DELETE_WINDOW", cancel)
     win.bind("<Escape>", lambda _event: cancel())
-    center_window(win, 680, 270)
+    fit_dialog_to_content(win, parent, width=620, min_height=245)
     modal_window(win, parent)
     return result["value"]
-
 
 def ask_host_details(parent: Any, title: str, initial: dict[str, str] | None = None) -> dict[str, str] | None:
     initial = initial or {}
@@ -928,7 +992,7 @@ def ask_host_details(parent: Any, title: str, initial: dict[str, str] | None = N
     win.bind("<Return>", ok)
     win.bind("<Escape>", lambda _e: cancel())
 
-    remember_window_geometry(win, "dialog_custom_connection", 450, 410)
+    remember_window_geometry(win, "dialog_host_details_v2", 450, 410)
     name_entry.focus_set()
     modal_window(win, parent)
     return result["value"]
@@ -995,7 +1059,7 @@ def ask_custom_connection(parent: Any) -> tuple[str, str] | None:
     win.bind("<Return>", ok)
     win.bind("<Escape>", lambda _e: cancel())
 
-    remember_window_geometry(win, "dialog_realvnc_profile", 460, 310)
+    remember_window_geometry(win, "dialog_custom_connection_v2", 460, 310)
     modal_window(win, parent)
     return result["value"]
 
@@ -1010,13 +1074,19 @@ def show_realvnc_profile_dialog(parent, profile_path: Path, profile_name: str):
     box = ctk.CTkFrame(win, fg_color=THEME["surface"], corner_radius=18)
     box.pack(fill="both", expand=True, padx=18, pady=18)
 
-    ctk.CTkLabel(box, text="Perfil RealVNC não encontrado", font=FONT_SUBTITLE, text_color=THEME["text"]).pack(anchor="w", padx=18, pady=(18, 8))
+    ctk.CTkLabel(
+        box, text="Perfil RealVNC não encontrado", font=FONT_SUBTITLE, text_color=THEME["text"]
+    ).pack(anchor="w", padx=18, pady=(18, 8))
+
     text = (
-        "Crie ou copie o perfil esperado para este host.\n\n"
+        "Não encontrei o perfil RealVNC deste host.\n\n"
         f"Arquivo esperado:\n{profile_path}\n\n"
-        "Depois disso, tente conectar novamente."
+        "Você pode criar um arquivo vazio com o nome correto ou copiar o nome para configurar o perfil manualmente."
     )
-    ctk.CTkLabel(box, text=text, font=FONT_NORMAL, text_color=THEME["muted"], justify="left").pack(anchor="w", padx=18, pady=(0, 18))
+    ctk.CTkLabel(
+        box, text=text, font=FONT_NORMAL, text_color=THEME["muted"],
+        justify="left", anchor="w", wraplength=560,
+    ).pack(fill="x", padx=18, pady=(0, 18))
 
     buttons = ctk.CTkFrame(box, fg_color="transparent")
     buttons.pack(fill="x", padx=18, pady=(0, 18))
@@ -1041,11 +1111,23 @@ def show_realvnc_profile_dialog(parent, profile_path: Path, profile_name: str):
         except Exception as e:
             show_error(win, "RealVNC", f"Falha ao copiar nome:\n{e}")
 
-    ctk.CTkButton(buttons, text_color=THEME["secondary_button_text"], font=FONT_BOLD, text="Fechar", command=win.destroy, fg_color=THEME["surface_3"], hover_color=THEME["accent_soft"]).pack(side="right", padx=(8, 0))
-    ctk.CTkButton(buttons, text_color=THEME["secondary_button_text"], font=FONT_BOLD, text="Copiar nome", command=copy_name, fg_color=THEME["surface_3"], hover_color=THEME["accent_soft"]).pack(side="right", padx=(8, 0))
-    ctk.CTkButton(buttons, text_color=THEME["button_text"], font=FONT_BOLD, text="Criar arquivo", command=create_empty, fg_color=THEME["accent"], hover_color=THEME["accent_hover"]).pack(side="right")
+    ctk.CTkButton(
+        buttons, text_color=THEME["secondary_button_text"], font=FONT_BOLD,
+        text="Fechar", command=win.destroy, fg_color=THEME["surface_3"],
+        hover_color=THEME["accent_soft"], width=100, height=38,
+    ).pack(side="right", padx=(8, 0))
+    ctk.CTkButton(
+        buttons, text_color=THEME["secondary_button_text"], font=FONT_BOLD,
+        text="Copiar nome", command=copy_name, fg_color=THEME["surface_3"],
+        hover_color=THEME["accent_soft"], width=120, height=38,
+    ).pack(side="right", padx=(8, 0))
+    ctk.CTkButton(
+        buttons, text_color=THEME["button_text"], font=FONT_BOLD,
+        text="Criar arquivo", command=create_empty, fg_color=THEME["accent"],
+        hover_color=THEME["accent_hover"], width=120, height=38,
+    ).pack(side="right")
 
-    remember_window_geometry(win, "dialog_hosts_source_select", 620, 335)
+    fit_dialog_to_content(win, parent, width=640, min_height=285)
     modal_window(win, parent)
     return result["value"]
 
@@ -1341,11 +1423,11 @@ def _settings_path_value(settings: dict, key: str, default_path: str) -> str:
 
 
 def get_ultravnc_exe() -> str:
-    return _settings_path_value(load_settings(), "ultravnc_exe", ULTRAVNC_EXE)
+    return str(load_global_paths().get("ultravnc_exe") or ULTRAVNC_EXE).strip()
 
 
 def get_realvnc_exe() -> str:
-    return _settings_path_value(load_settings(), "realvnc_exe", REALVNC_EXE)
+    return str(load_global_paths().get("realvnc_exe") or REALVNC_EXE).strip()
 
 
 def resolve_existing_exe(configured_path: str, default_path: str) -> str | None:
@@ -1449,7 +1531,7 @@ def set_hosts_source(settings, source: str, overwrite_user_file=True):
 def choose_hosts_source_dialog(parent, required=False) -> str | None:
     result: dict[str, str | None] = {"value": None}
     win = ctk.CTkToplevel(parent)
-    win.title("Selecionar lista de hosts")
+    win.title("Escolher lista de hosts")
     win.resizable(False, False)
     win.protocol("WM_DELETE_WINDOW", lambda: None if required else win.destroy())
     win.configure(fg_color=THEME["bg"])
@@ -1457,22 +1539,22 @@ def choose_hosts_source_dialog(parent, required=False) -> str | None:
     box = ctk.CTkFrame(win, fg_color=THEME["surface"], corner_radius=18)
     box.pack(fill="both", expand=True, padx=18, pady=18)
 
-    ctk.CTkLabel(box, text="Lista de hosts", font=FONT_SUBTITLE, text_color=THEME["text"]).pack(anchor="w", padx=18, pady=(18, 8))
-    msg = (
-        "Escolha como esta instalação deve carregar os hosts.\n\n"
-        "Padrão: lista compartilhada da pasta do aplicativo.\n"
-        "Personalizada: lista própria em Documents\\VNC-Menu;\n"
-        "Vazia: lista pessoal limpa para este usuário."
-    )
-    ctk.CTkLabel(box, text=msg, font=FONT_NORMAL, text_color=THEME["muted"], justify="left").pack(anchor="w", padx=18, pady=(0, 16))
+    ctk.CTkLabel(
+        box, text="Escolher lista de hosts", font=FONT_SUBTITLE, text_color=THEME["text"]
+    ).pack(anchor="w", padx=18, pady=(18, 6))
 
-    buttons = ctk.CTkFrame(box, fg_color="transparent")
-    buttons.pack(fill="x", padx=18, pady=(0, 18))
+    intro = (
+        "Escolha de onde o VNC-Menu deve carregar os hosts neste usuário. "
+        "Você pode trocar essa opção depois em Configurações."
+    )
+    ctk.CTkLabel(
+        box, text=intro, font=FONT_NORMAL, text_color=THEME["muted"],
+        justify="left", anchor="w", wraplength=540,
+    ).pack(fill="x", padx=18, pady=(0, 14))
 
     def choose(value: str) -> None:
         if value == HOSTS_SOURCE_EMPTY and USER_HOSTS_JSON.exists():
             confirmed = confirm_empty_list_overwrite(win)
-
             if not confirmed:
                 audit_log(
                     "EMPTY_HOSTS_SOURCE_OVERWRITE_CANCELLED",
@@ -1488,16 +1570,70 @@ def choose_hosts_source_dialog(parent, required=False) -> str | None:
         result["value"] = value
         win.destroy()
 
-    ctk.CTkButton(buttons, text_color=THEME["button_text"], font=FONT_BOLD, text="Padrão", command=lambda: choose(HOSTS_SOURCE_SHARED), fg_color=THEME["accent"], hover_color=THEME["accent_hover"]).pack(side="left", padx=(0, 8))
-    ctk.CTkButton(buttons, text_color=THEME["secondary_button_text"], font=FONT_BOLD, text="Personalizada", command=lambda: choose(HOSTS_SOURCE_CUSTOM), fg_color=THEME["surface_3"], hover_color=THEME["accent_soft"]).pack(side="left", padx=(0, 8))
-    ctk.CTkButton(buttons, text_color=THEME["secondary_button_text"], font=FONT_BOLD, text="Vazia", command=lambda: choose(HOSTS_SOURCE_EMPTY), fg_color=THEME["surface_3"], hover_color=THEME["accent_soft"]).pack(side="left", padx=(0, 8))
-    if not required:
-        ctk.CTkButton(buttons, text_color=THEME["secondary_button_text"], font=FONT_BOLD, text="Cancelar", command=win.destroy, fg_color=THEME["surface_3"], hover_color=THEME["accent_soft"]).pack(side="right")
+    def option_row(title: str, description: str, button_text: str, value: str, primary: bool = False):
+        row = ctk.CTkFrame(box, fg_color=THEME["surface_2"], corner_radius=12)
+        row.pack(fill="x", padx=18, pady=(0, 8))
+        row.grid_columnconfigure(0, weight=1)
 
-    remember_window_geometry(win, "dialog_hosts_source_select", 620)
+        text_frame = ctk.CTkFrame(row, fg_color="transparent")
+        text_frame.grid(row=0, column=0, sticky="ew", padx=(14, 10), pady=11)
+        ctk.CTkLabel(
+            text_frame, text=title, font=FONT_BOLD, text_color=THEME["text"], anchor="w"
+        ).pack(anchor="w")
+        ctk.CTkLabel(
+            text_frame, text=description, font=FONT_SMALL, text_color=THEME["muted"],
+            justify="left", anchor="w", wraplength=350,
+        ).pack(anchor="w", pady=(2, 0))
+
+        ctk.CTkButton(
+            row,
+            text=button_text,
+            width=125,
+            height=36,
+            font=FONT_BOLD,
+            command=lambda: choose(value),
+            fg_color=THEME["accent"] if primary else THEME["surface_3"],
+            hover_color=THEME["accent_hover"] if primary else THEME["accent_soft"],
+            text_color=THEME["button_text"] if primary else THEME["secondary_button_text"],
+        ).grid(row=0, column=1, sticky="e", padx=(0, 12), pady=11)
+
+    option_row(
+        "Padrão",
+        "Lista compartilhada. Alterações nela podem aparecer para outros usuários.",
+        "Usar padrão",
+        HOSTS_SOURCE_SHARED,
+        primary=True,
+    )
+    option_row(
+        "Personalizada",
+        "Sua lista pessoal, salva somente para este usuário.",
+        "Usar pessoal",
+        HOSTS_SOURCE_CUSTOM,
+    )
+    option_row(
+        "Vazia",
+        "Cria uma lista pessoal sem hosts para você montar do zero.",
+        "Criar vazia",
+        HOSTS_SOURCE_EMPTY,
+    )
+
+    if not required:
+        footer = ctk.CTkFrame(box, fg_color="transparent")
+        footer.pack(fill="x", padx=18, pady=(4, 18))
+        ctk.CTkButton(
+            footer, text="Cancelar", width=110, height=38, command=win.destroy,
+            font=FONT_BOLD, fg_color=THEME["surface_3"],
+            hover_color=THEME["accent_soft"], text_color=THEME["secondary_button_text"],
+        ).pack(side="right")
+    else:
+        ctk.CTkLabel(
+            box, text="Escolha uma opção para continuar.", font=FONT_SMALL,
+            text_color=THEME["muted"],
+        ).pack(anchor="w", padx=18, pady=(4, 18))
+
+    fit_dialog_to_content(win, parent, width=640, min_height=360)
     modal_window(win, parent)
     return result["value"]
-
 
 def ensure_hosts_source_selected(parent, settings):
     source = normalize_hosts_source(settings.get("hosts_source"))
@@ -1520,21 +1656,26 @@ def shared_hosts_edit_warning(parent):
     box = ctk.CTkFrame(win, fg_color=THEME["surface"], corner_radius=18)
     box.pack(fill="both", expand=True, padx=18, pady=18)
 
-    ctk.CTkLabel(box, text="Lista compartilhada", font=FONT_SUBTITLE, text_color=THEME["text"]).pack(anchor="w", padx=18, pady=(18, 8))
+    ctk.CTkLabel(
+        box, text="Esta lista é compartilhada", font=FONT_SUBTITLE, text_color=THEME["text"]
+    ).pack(anchor="w", padx=18, pady=(18, 8))
+
     personal_exists = USER_HOSTS_JSON.exists()
     personal_action = (
-        "Usar personalizada: abre a lista pessoal já existente."
+        "Você também pode abrir sua lista pessoal e alterar somente a sua configuração."
         if personal_exists
-        else "Criar cópia: cria uma lista pessoal a partir da lista padrão."
+        else "Se preferir, crie uma cópia pessoal antes de editar."
     )
 
     msg = (
-        "A lista Padrão é compartilhada.\n"
-        "Qualquer alteração pode afetar outros usuários desta instalação.\n\n"
-        "Editar padrão: altera o arquivo compartilhado.\n"
+        "A lista Padrão é usada por outros usuários do VNC-Menu. "
+        "Qualquer alteração feita nela pode aparecer para todos que usam essa lista.\n\n"
         f"{personal_action}"
     )
-    ctk.CTkLabel(box, text=msg, font=FONT_NORMAL, text_color=THEME["muted"], justify="left").pack(anchor="w", padx=18, pady=(0, 16))
+    ctk.CTkLabel(
+        box, text=msg, font=FONT_NORMAL, text_color=THEME["muted"],
+        justify="left", anchor="w", wraplength=520,
+    ).pack(fill="x", padx=18, pady=(0, 18))
 
     buttons = ctk.CTkFrame(box, fg_color="transparent")
     buttons.pack(fill="x", padx=18, pady=(0, 18))
@@ -1543,8 +1684,14 @@ def shared_hosts_edit_warning(parent):
         result["value"] = value
         win.destroy()
 
-    ctk.CTkButton(buttons, text_color=THEME["secondary_button_text"], font=FONT_BOLD, text="Cancelar", command=lambda: choose("cancel"), fg_color=THEME["surface_3"], hover_color=THEME["accent_soft"]).pack(side="right", padx=(8, 0))
-    personal_button_text = "Usar personalizada" if personal_exists else "Criar cópia"
+    ctk.CTkButton(
+        buttons, text_color=THEME["secondary_button_text"], font=FONT_BOLD,
+        text="Cancelar", command=lambda: choose("cancel"),
+        fg_color=THEME["surface_3"], hover_color=THEME["accent_soft"],
+        width=110, height=38,
+    ).pack(side="right", padx=(8, 0))
+
+    personal_button_text = "Usar pessoal" if personal_exists else "Criar cópia"
     ctk.CTkButton(
         buttons,
         text_color=THEME["secondary_button_text"],
@@ -1553,12 +1700,22 @@ def shared_hosts_edit_warning(parent):
         command=lambda: choose("copy"),
         fg_color=THEME["surface_3"],
         hover_color=THEME["accent_soft"],
+        width=125, height=38,
     ).pack(side="right", padx=(8, 0))
-    ctk.CTkButton(buttons, text_color=THEME["button_text"], font=FONT_BOLD, text="Editar padrão", command=lambda: choose("continue"), fg_color=THEME["accent"], hover_color=THEME["accent_hover"]).pack(side="right")
 
-    remember_window_geometry(win, "dialog_shared_hosts_warning", 610)
+    ctk.CTkButton(
+        buttons, text_color=THEME["button_text"], font=FONT_BOLD,
+        text="Editar padrão", command=lambda: choose("continue"),
+        fg_color=THEME["accent"], hover_color=THEME["accent_hover"],
+        width=125, height=38,
+    ).pack(side="right")
+
+    win.protocol("WM_DELETE_WINDOW", lambda: choose("cancel"))
+    win.bind("<Escape>", lambda _event: choose("cancel"))
+    fit_dialog_to_content(win, parent, width=610, min_height=235)
     modal_window(win, parent)
     return result["value"]
+
 
 # =========================
 # Atualizações
@@ -1931,6 +2088,119 @@ def host_responds_to_ping(host: str) -> bool:
         return False
 
 
+class PsExecQueryError(RuntimeError):
+    """Structured PsExec failure for remote printer queries."""
+
+    def __init__(self, summary, hint, details="", returncode=None, category="unknown"):
+        super().__init__(summary)
+        self.summary = str(summary or "Falha ao executar o PsExec.")
+        self.hint = str(hint or "Verifique os detalhes técnicos e tente novamente.")
+        self.details = str(details or "")
+        self.returncode = returncode
+        self.category = str(category or "unknown")
+
+
+def _decode_process_output(data) -> str:
+    if not data:
+        return ""
+    if isinstance(data, str):
+        return data
+    encodings = ["utf-8"]
+    if os.name == "nt":
+        encodings.append("mbcs")
+    encodings.extend(["cp850", "cp1252"])
+    for encoding in encodings:
+        try:
+            return data.decode(encoding)
+        except (UnicodeDecodeError, LookupError):
+            continue
+    return data.decode("utf-8", errors="replace")
+
+
+def _diagnose_psexec_failure(output: str, returncode=None):
+    low = str(output or "").casefold()
+    checks = [
+        (("access is denied", "acesso negado", "error code 5", "erro 5"),
+         "Acesso negado pelo PsExec.",
+         "Confirme que sua conta possui administrador no computador remoto e acesso ao ADMIN$.",
+         "access_denied"),
+        (("logon failure", "falha de logon", "user name or password is incorrect"),
+         "Falha de autenticação no computador remoto.",
+         "Verifique as credenciais e se a conta pode executar tarefas administrativas remotamente.",
+         "logon_failure"),
+        (("network path was not found", "caminho da rede não foi encontrado", "error code 53", "erro 53"),
+         "O PsExec não conseguiu acessar o computador remoto.",
+         "Verifique o nome/IP, SMB, compartilhamento ADMIN$ e se a porta 445 está acessível.",
+         "network_path"),
+        (("network name cannot be found", "nome da rede não foi encontrado", "error code 67", "erro 67"),
+         "O compartilhamento administrativo não foi encontrado.",
+         "Confirme se o ADMIN$ está habilitado e acessível no computador remoto.",
+         "admin_share"),
+        (("rpc server is unavailable", "servidor rpc não está disponível", "servidor rpc não esta disponível"),
+         "O serviço RPC do computador remoto não respondeu.",
+         "Verifique conectividade, firewall e os serviços RPC do Windows no destino.",
+         "rpc_unavailable"),
+        (("could not start psexesvc", "failed to install psexesvc", "psexesvc service"),
+         "O serviço temporário do PsExec não iniciou.",
+         "Verifique permissões administrativas, antivírus/EDR e se a criação de serviços remotos está permitida.",
+         "psexesvc"),
+        (("error establishing communication", "erro ao estabelecer comunicação"),
+         "O PsExec perdeu a comunicação com o serviço remoto.",
+         "Tente novamente e verifique firewall, SMB e se algum antivírus/EDR bloqueou o PsExec.",
+         "communication"),
+        (("the system cannot find the file specified", "o sistema não pode encontrar o arquivo especificado"),
+         "Um arquivo necessário não foi encontrado no computador remoto.",
+         "Confira os detalhes técnicos. O PowerShell ou algum componente usado pela consulta pode estar indisponível.",
+         "remote_file_missing"),
+        (("the handle is invalid", "identificador é inválido", "identificador e invalido"),
+         "O PsExec retornou um identificador inválido.",
+         "Tente novamente. Se persistir, verifique bloqueios do PsExec por segurança/antivírus no destino.",
+         "invalid_handle"),
+    ]
+    for needles, summary, hint, category in checks:
+        if any(needle in low for needle in needles):
+            return summary, hint, category
+    if returncode not in (None, 0):
+        return (
+            f"O PsExec terminou com código {returncode}.",
+            "Abra os detalhes técnicos para ver a mensagem retornada pelo PsExec.",
+            "exit_code",
+        )
+    return (
+        "O PsExec não retornou o resultado esperado.",
+        "Abra os detalhes técnicos para identificar a mensagem retornada pelo computador remoto.",
+        "invalid_output",
+    )
+
+
+def _build_psexec_details(host, psexec_path, returncode, stdout="", stderr="") -> str:
+    code_text = "não disponível" if returncode is None else str(returncode)
+    stdout = str(stdout or "").strip() or "(vazio)"
+    stderr = str(stderr or "").strip() or "(vazio)"
+    return (
+        f"Host: {host}\n"
+        f"PsExec: {psexec_path}\n"
+        f"Código de saída: {code_text}\n\n"
+        f"STDOUT:\n{stdout}\n\n"
+        f"STDERR:\n{stderr}"
+    )
+
+
+def log_psexec_failure(host, psexec_path, error: PsExecQueryError):
+    try:
+        timestamp = time.strftime("%Y-%m-%d %H:%M:%S")
+        ERROR_LOG.parent.mkdir(parents=True, exist_ok=True)
+        with ERROR_LOG.open("a", encoding="utf-8") as handle:
+            handle.write(f"\n[{timestamp}] PSEXEC PRINTER QUERY ERROR\n")
+            handle.write(f"Category: {error.category}\n")
+            handle.write(f"Summary: {error.summary}\n")
+            handle.write(f"Hint: {error.hint}\n")
+            handle.write(error.details or _build_psexec_details(host, psexec_path, error.returncode))
+            handle.write("\n" + ("-" * 72) + "\n")
+    except Exception:
+        pass
+
+
 def query_remote_printers(host: str, psexec_path: Path) -> str:
     host = str(host or "").strip().lstrip("\\")
     if not host:
@@ -2003,14 +2273,43 @@ $payload=[Convert]::ToBase64String([Text.Encoding]::UTF8.GetBytes($json))
             timeout=PSEXEC_TIMEOUT_SECONDS,
             creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
         )
+    except FileNotFoundError as exc:
+        details = _build_psexec_details(host, psexec_path, None, stderr=str(exc))
+        raise PsExecQueryError(
+            "PsExec não foi encontrado.",
+            "Confira o caminho configurado em Configurações > PsExec.",
+            details,
+            category="local_not_found",
+        ) from exc
+    except PermissionError as exc:
+        details = _build_psexec_details(host, psexec_path, None, stderr=str(exc))
+        raise PsExecQueryError(
+            "O Windows bloqueou a execução do PsExec.",
+            "Verifique permissões do arquivo, antivírus/EDR e tente novamente.",
+            details,
+            category="local_permission",
+        ) from exc
     except subprocess.TimeoutExpired as exc:
-        raise RuntimeError(
-            f"A consulta excedeu {PSEXEC_TIMEOUT_SECONDS} segundos. "
-            "O computador pode estar offline ou inacessível."
+        stdout = _decode_process_output(exc.stdout)
+        stderr = _decode_process_output(exc.stderr)
+        details = _build_psexec_details(host, psexec_path, None, stdout, stderr)
+        raise PsExecQueryError(
+            f"A consulta excedeu {PSEXEC_TIMEOUT_SECONDS} segundos.",
+            "O host pode estar lento, o PsExec pode estar bloqueado ou a comunicação SMB pode ter travado.",
+            details,
+            category="timeout",
+        ) from exc
+    except OSError as exc:
+        details = _build_psexec_details(host, psexec_path, None, stderr=str(exc))
+        raise PsExecQueryError(
+            "Não foi possível iniciar o PsExec.",
+            "Confira o executável configurado e as permissões locais do arquivo.",
+            details,
+            category="local_launch",
         ) from exc
 
-    stdout = (completed.stdout or b"").decode("utf-8", errors="replace")
-    stderr = (completed.stderr or b"").decode("utf-8", errors="replace")
+    stdout = _decode_process_output(completed.stdout)
+    stderr = _decode_process_output(completed.stderr)
     combined_output = f"{stdout}\n{stderr}"
 
     start_marker = "__VNC_MENU_PRINTERS_BEGIN__"
@@ -2021,12 +2320,20 @@ $payload=[Convert]::ToBase64String([Text.Encoding]::UTF8.GetBytes($json))
     )
 
     if not match:
-        details = (stderr or stdout).strip()
-        if len(details) > 900:
-            details = details[-900:]
-        raise RuntimeError(
-            "O PsExec não retornou um resultado válido."
-            + (f"\n\n{details}" if details else "")
+        summary, hint, category = _diagnose_psexec_failure(combined_output, completed.returncode)
+        details = _build_psexec_details(
+            host,
+            psexec_path,
+            completed.returncode,
+            stdout,
+            stderr,
+        )
+        raise PsExecQueryError(
+            summary,
+            hint,
+            details,
+            returncode=completed.returncode,
+            category=category,
         )
 
     try:
@@ -2034,7 +2341,20 @@ $payload=[Convert]::ToBase64String([Text.Encoding]::UTF8.GetBytes($json))
         decoded_json = base64.b64decode(payload).decode("utf-8-sig")
         raw_rows = json.loads(decoded_json)
     except Exception as exc:
-        raise RuntimeError("Falha ao interpretar o resultado das impressoras.") from exc
+        details = _build_psexec_details(
+            host,
+            psexec_path,
+            completed.returncode,
+            stdout,
+            stderr,
+        )
+        raise PsExecQueryError(
+            "O resultado das impressoras chegou corrompido ou incompleto.",
+            "Tente novamente. Se persistir, abra os detalhes para verificar a saída do PsExec.",
+            details,
+            returncode=completed.returncode,
+            category="invalid_payload",
+        ) from exc
 
     if isinstance(raw_rows, dict):
         raw_rows = [raw_rows]
@@ -2153,20 +2473,34 @@ def format_users_output(rows):
 
     return "\n".join(lines)
 
-def show_text_window(parent, title, content):
-    lines = content.splitlines()
+def show_text_window(
+    parent,
+    title,
+    content,
+    *,
+    remember_geometry_key: str | None = "window_text_output",
+):
+    lines = str(content or "").splitlines() or [""]
     max_len = max((len(line) for line in lines), default=40)
     line_count = max(len(lines), 1)
 
-    # Auto-size the output window to avoid large empty areas for short reports.
-    width = min(max((max_len * 8) + 110, 460), 760)
-    height = min(max((line_count * 18) + 135, 300), 540)
-    textbox_height = max(height - 150, 150)
+    try:
+        screen_width = parent.winfo_screenwidth()
+        screen_height = parent.winfo_screenheight()
+    except Exception:
+        screen_width, screen_height = 1366, 768
+
+    max_width = max(520, min(1000, screen_width - 140))
+    max_height = max(360, min(760, screen_height - 140))
+    title_width = (len(str(title)) * 8) + 120
+    width = min(max((max_len * 8) + 110, title_width, 480), max_width)
+    height = min(max((line_count * 19) + 155, 285), max_height)
+    textbox_height = max(height - 155, 130)
 
     win = ctk.CTkToplevel(parent)
     win.title(title)
     win.geometry(f"{width}x{height}")
-    win.minsize(420, 260)
+    win.minsize(440, 260)
     win.configure(fg_color=THEME["bg"])
 
     outer = ctk.CTkFrame(win, fg_color=THEME["surface"], corner_radius=18)
@@ -2204,11 +2538,11 @@ def show_text_window(parent, title, content):
         text_color=THEME["secondary_button_text"],
     ).pack(anchor="e", padx=18, pady=(0, 18))
 
-    remember_window_geometry(win, "window_text_output", width, height)
+    if remember_geometry_key:
+        remember_window_geometry(win, remember_geometry_key, width, height)
+    else:
+        center_window(win, width, height)
 
-    # Keep the result window visible without making it modal.
-    # Do not use grab_set() here, because the user still needs normal access
-    # to the rest of Windows while this report is open.
     win.transient(parent)
     win.lift()
     win.focus()
@@ -2218,6 +2552,106 @@ def show_text_window(parent, title, content):
         win.after(250, lambda: win.attributes("-topmost", False))
     except Exception:
         pass
+
+
+def show_psexec_error_dialog(parent, host: str, error: PsExecQueryError):
+    win = ctk.CTkToplevel(parent)
+    win.title("Falha no PsExec")
+    win.resizable(False, False)
+    win.configure(fg_color=THEME["bg"])
+
+    box = ctk.CTkFrame(win, fg_color=THEME["surface"], corner_radius=18)
+    box.pack(fill="both", expand=True, padx=18, pady=18)
+
+    ctk.CTkLabel(
+        box,
+        text=error.summary,
+        font=FONT_SUBTITLE,
+        text_color=THEME["text"],
+        justify="left",
+        anchor="w",
+        wraplength=560,
+    ).pack(fill="x", padx=18, pady=(18, 8))
+
+    ctk.CTkLabel(
+        box,
+        text=error.hint,
+        font=FONT_NORMAL,
+        text_color=THEME["muted"],
+        justify="left",
+        anchor="w",
+        wraplength=560,
+    ).pack(fill="x", padx=18, pady=(0, 10))
+
+    code_text = "" if error.returncode is None else f"  •  Código: {error.returncode}"
+    ctk.CTkLabel(
+        box,
+        text=f"Host: {host}{code_text}",
+        font=FONT_SMALL,
+        text_color=THEME["muted"],
+        justify="left",
+        anchor="w",
+    ).pack(fill="x", padx=18, pady=(0, 12))
+
+    details_frame = ctk.CTkFrame(box, fg_color="transparent")
+    details_box = ctk.CTkTextbox(
+        details_frame,
+        width=560,
+        height=180,
+        font=("Consolas", 11),
+        fg_color=THEME["bg"],
+        text_color=THEME["text"],
+        corner_radius=10,
+        wrap="word",
+    )
+    details_box.pack(fill="both", expand=True)
+    details_box.insert("1.0", error.details or "Sem detalhes adicionais.")
+    details_box.configure(state="disabled")
+
+    buttons = ctk.CTkFrame(box, fg_color="transparent")
+    buttons.pack(fill="x", padx=18, pady=(0, 18))
+    details_visible = {"value": False}
+
+    def toggle_details():
+        if details_visible["value"]:
+            details_frame.pack_forget()
+            details_button.configure(text="Detalhes")
+            details_visible["value"] = False
+        else:
+            details_frame.pack(fill="both", expand=True, padx=18, pady=(0, 14), before=buttons)
+            details_button.configure(text="Ocultar detalhes")
+            details_visible["value"] = True
+        fit_dialog_to_content(win, parent, width=640, min_height=245)
+
+    details_button = ctk.CTkButton(
+        buttons,
+        text="Detalhes",
+        width=130,
+        height=38,
+        command=toggle_details,
+        font=FONT_BOLD,
+        fg_color=THEME["surface_3"],
+        hover_color=THEME["accent_soft"],
+        text_color=THEME["secondary_button_text"],
+    )
+    details_button.pack(side="left")
+
+    ctk.CTkButton(
+        buttons,
+        text="Fechar",
+        width=110,
+        height=38,
+        command=win.destroy,
+        font=FONT_BOLD,
+        fg_color=THEME["accent"],
+        hover_color=THEME["accent_hover"],
+        text_color=THEME["button_text"],
+    ).pack(side="right")
+
+    win.protocol("WM_DELETE_WINDOW", win.destroy)
+    win.bind("<Escape>", lambda _event: win.destroy())
+    fit_dialog_to_content(win, parent, width=640, min_height=245)
+    modal_window(win, parent)
 
 
 class QwinstaProgressWindow(ctk.CTkToplevel):
@@ -2348,7 +2782,7 @@ class CredsWindow(ctk.CTkToplevel):
     def __init__(self, parent):
         super().__init__(parent)
         self.parent = parent
-        self.title("Credenciais")
+        self.title("Credenciais UltraVNC")
         self.geometry("500x390")
         self.resizable(False, False)
         self.configure(fg_color=THEME["bg"])
@@ -2358,7 +2792,7 @@ class CredsWindow(ctk.CTkToplevel):
         box.pack(fill="both", expand=True, padx=18, pady=18)
 
         ctk.CTkLabel(box, text="Credenciais UltraVNC", font=FONT_SUBTITLE, text_color=THEME["text"]).pack(anchor="w", padx=18, pady=(18, 8))
-        ctk.CTkLabel(box, text="Salvas por usuário usando Windows DPAPI.", font=FONT_NORMAL, text_color=THEME["muted"]).pack(anchor="w", padx=18, pady=(0, 18))
+        ctk.CTkLabel(box, text="Salvas somente para o seu usuário do Windows.", font=FONT_NORMAL, text_color=THEME["muted"]).pack(anchor="w", padx=18, pady=(0, 18))
 
         ctk.CTkLabel(box, text="Usuário", font=FONT_NORMAL, text_color=THEME["muted"]).pack(anchor="w", padx=18, pady=(0, 6))
         self.user_entry = ctk.CTkEntry(
@@ -2541,7 +2975,7 @@ class SimpleListEditor(ctk.CTkToplevel):
         if not item or idx is None:
             return
         name = self.get_item_name(item)
-        if not confirm_action(self, "Remover", f"Remover:\n{name}?"):
+        if not confirm_action(self, "Remover item", f'Remover "{name}" da lista?'):
             return
         del self.items[idx]
         self.selected_index = min(idx, len(self.items) - 1) if self.items else None
@@ -2609,7 +3043,7 @@ class HostUnitsConfigWindow(ctk.CTkToplevel):
         self.selected_sector = tk.StringVar(value=(get_sector_names(self.data, self.selected_unit.get()) or ["Geral"])[0])
         self.selected_host_index: int | None = None
 
-        self.title("Configurar Hosts VNC")
+        self.title("Hosts e Setores")
         self.geometry("1060x660")
         self.minsize(950, 600)
         self.configure(fg_color=THEME["bg"])
@@ -2646,7 +3080,7 @@ class HostUnitsConfigWindow(ctk.CTkToplevel):
             should_close = confirm_action(
                 self,
                 "Alterações não salvas",
-                "Existem alterações não salvas.\n\nFechar sem salvar?"
+                "Há alterações que ainda não foram salvas.\n\nDeseja fechar sem salvar?"
             )
             if not should_close:
                 return
@@ -3000,7 +3434,7 @@ class HostUnitsConfigWindow(ctk.CTkToplevel):
         idx = self.selected_host_index
         if not item or idx is None:
             return
-        if not confirm_action(self, "Remover host", f"Remover:\n{item.get('name')}?"):
+        if not confirm_action(self, "Remover host", f'Remover "{item.get("name")}" deste setor?'):
             return
         hosts = self.current_hosts()
         removed = hosts.pop(idx)
@@ -3051,9 +3485,9 @@ class ViewerPathsWindow(ctk.CTkToplevel):
     def __init__(self, parent):
         super().__init__(parent)
         self.parent = parent
-        self.settings = parent.settings
-        self.title("Caminhos dos Viewers")
-        self.geometry("720x360")
+        self.paths = load_global_paths(parent.settings)
+        self.title("Viewers VNC")
+        self.geometry("720x390")
         self.resizable(False, False)
         self.configure(fg_color=THEME["bg"])
 
@@ -3061,16 +3495,18 @@ class ViewerPathsWindow(ctk.CTkToplevel):
         box.pack(fill="both", expand=True, padx=18, pady=18)
         box.grid_columnconfigure(0, weight=1)
 
-        ctk.CTkLabel(box, text="Caminhos dos Viewers", font=FONT_SUBTITLE, text_color=THEME["text"]).grid(row=0, column=0, columnspan=3, sticky="w", padx=18, pady=(18, 6))
+        ctk.CTkLabel(box, text="Viewers VNC", font=FONT_SUBTITLE, text_color=THEME["text"]).grid(
+            row=0, column=0, columnspan=3, sticky="w", padx=18, pady=(18, 6)
+        )
         ctk.CTkLabel(
             box,
-            text="Use esta tela se o UltraVNC ou RealVNC estiverem instalados fora do caminho padrão.",
+            text="Defina os executáveis usados neste computador. Vale para todos os usuários.",
             font=FONT_NORMAL,
             text_color=THEME["muted"],
         ).grid(row=1, column=0, columnspan=3, sticky="w", padx=18, pady=(0, 18))
 
-        self.ultravnc_var = tk.StringVar(value=str(self.settings.get("ultravnc_exe") or ULTRAVNC_EXE))
-        self.realvnc_var = tk.StringVar(value=str(self.settings.get("realvnc_exe") or REALVNC_EXE))
+        self.ultravnc_var = tk.StringVar(value=str(self.paths.get("ultravnc_exe") or ULTRAVNC_EXE))
+        self.realvnc_var = tk.StringVar(value=str(self.paths.get("realvnc_exe") or REALVNC_EXE))
 
         self._path_row(box, 2, "UltraVNC Viewer", self.ultravnc_var)
         self._path_row(box, 4, "RealVNC Viewer", self.realvnc_var)
@@ -3079,66 +3515,41 @@ class ViewerPathsWindow(ctk.CTkToplevel):
         buttons.grid(row=6, column=0, columnspan=3, sticky="ew", padx=18, pady=(18, 18))
 
         ctk.CTkButton(
-            buttons,
-            font=FONT_BOLD,
-            text="Restaurar padrão",
-            width=150,
-            height=40,
-            command=self.restore_defaults,
-            fg_color=THEME["surface_3"],
-            hover_color=THEME["accent_soft"],
-            text_color=THEME["secondary_button_text"],
+            buttons, font=FONT_BOLD, text="Usar padrões", width=135, height=40,
+            command=self.restore_defaults, fg_color=THEME["surface_3"],
+            hover_color=THEME["accent_soft"], text_color=THEME["secondary_button_text"],
         ).pack(side="left")
 
         ctk.CTkButton(
-            buttons,
-            font=FONT_BOLD,
-            text="Cancelar",
-            width=120,
-            height=40,
-            command=self.destroy,
-            fg_color=THEME["surface_3"],
-            hover_color=THEME["accent_soft"],
-            text_color=THEME["secondary_button_text"],
+            buttons, font=FONT_BOLD, text="Cancelar", width=110, height=40,
+            command=self.destroy, fg_color=THEME["surface_3"],
+            hover_color=THEME["accent_soft"], text_color=THEME["secondary_button_text"],
         ).pack(side="right", padx=(8, 0))
 
         ctk.CTkButton(
-            buttons,
-            font=FONT_BOLD,
-            text="Salvar",
-            width=120,
-            height=40,
-            command=self.save,
-            fg_color=THEME["accent"],
-            hover_color=THEME["accent_hover"],
-            text_color=THEME["button_text"],
+            buttons, font=FONT_BOLD, text="Salvar", width=110, height=40,
+            command=self.save, fg_color=THEME["accent"],
+            hover_color=THEME["accent_hover"], text_color=THEME["button_text"],
         ).pack(side="right")
 
-        remember_window_geometry(self, "window_viewer_paths", 720, 360)
+        remember_window_geometry(self, "window_viewer_paths_v3", 720, 390)
         self.transient(parent)
         self.grab_set()
 
     def _path_row(self, parent, row: int, label: str, variable: tk.StringVar):
-        ctk.CTkLabel(parent, text=label, font=FONT_SMALL_BOLD, text_color=THEME["muted"]).grid(row=row, column=0, columnspan=3, sticky="w", padx=18, pady=(0, 6))
+        ctk.CTkLabel(parent, text=label, font=FONT_SMALL_BOLD, text_color=THEME["muted"]).grid(
+            row=row, column=0, columnspan=3, sticky="w", padx=18, pady=(0, 6)
+        )
         entry = ctk.CTkEntry(
-            parent,
-            textvariable=variable,
-            height=38,
-            fg_color=THEME["surface_2"],
-            border_color=THEME["border"],
-            text_color=THEME["text"],
+            parent, textvariable=variable, height=38, fg_color=THEME["surface_2"],
+            border_color=THEME["border"], text_color=THEME["text"],
             placeholder_text_color=THEME["muted"],
         )
         entry.grid(row=row + 1, column=0, sticky="ew", padx=(18, 8), pady=(0, 12))
         ctk.CTkButton(
-            parent,
-            font=FONT_BOLD,
-            text="Selecionar",
-            width=110,
-            height=38,
+            parent, font=FONT_BOLD, text="Procurar...", width=110, height=38,
             command=lambda v=variable, l=label: self.browse(v, l),
-            fg_color=THEME["surface_3"],
-            hover_color=THEME["accent_soft"],
+            fg_color=THEME["surface_3"], hover_color=THEME["accent_soft"],
             text_color=THEME["secondary_button_text"],
         ).grid(row=row + 1, column=1, sticky="e", padx=(0, 8), pady=(0, 12))
 
@@ -3146,9 +3557,7 @@ class ViewerPathsWindow(ctk.CTkToplevel):
         current = variable.get().strip()
         initial_dir = str(Path(current).parent) if current and Path(current).parent.exists() else r"C:\Program Files"
         selected = filedialog.askopenfilename(
-            parent=self,
-            title=f"Selecionar {title}",
-            initialdir=initial_dir,
+            parent=self, title=f"Selecionar {title}", initialdir=initial_dir,
             filetypes=[("Executáveis", "*.exe"), ("Todos os arquivos", "*.*")],
         )
         if selected:
@@ -3159,10 +3568,106 @@ class ViewerPathsWindow(ctk.CTkToplevel):
         self.realvnc_var.set(REALVNC_EXE)
 
     def save(self):
-        self.settings["ultravnc_exe"] = self.ultravnc_var.get().strip() or ULTRAVNC_EXE
-        self.settings["realvnc_exe"] = self.realvnc_var.get().strip() or REALVNC_EXE
-        save_settings(self.settings)
-        audit_log("VIEWER_PATHS_UPDATED", f"ultravnc={self.settings['ultravnc_exe']}; realvnc={self.settings['realvnc_exe']}")
+        paths = load_global_paths(self.parent.settings)
+        paths["ultravnc_exe"] = self.ultravnc_var.get().strip() or ULTRAVNC_EXE
+        paths["realvnc_exe"] = self.realvnc_var.get().strip() or REALVNC_EXE
+        if not save_global_paths(paths):
+            show_error(self, "Viewers VNC", "Não foi possível salvar os caminhos globais.")
+            return
+        audit_log(
+            "VIEWER_PATHS_UPDATED",
+            f"ultravnc={paths['ultravnc_exe']}; realvnc={paths['realvnc_exe']}",
+        )
+        self.destroy()
+
+
+class PsExecPathWindow(ctk.CTkToplevel):
+    def __init__(self, parent):
+        super().__init__(parent)
+        self.parent = parent
+        self.title("PsExec")
+        self.geometry("680x270")
+        self.resizable(False, False)
+        self.configure(fg_color=THEME["bg"])
+
+        box = ctk.CTkFrame(self, fg_color=THEME["surface"], corner_radius=18)
+        box.pack(fill="both", expand=True, padx=18, pady=18)
+        box.grid_columnconfigure(0, weight=1)
+
+        ctk.CTkLabel(box, text="PsExec", font=FONT_SUBTITLE, text_color=THEME["text"]).grid(
+            row=0, column=0, columnspan=2, sticky="w", padx=18, pady=(18, 6)
+        )
+        ctk.CTkLabel(
+            box,
+            text="Defina o PsExec usado neste computador. Vale para todos os usuários.",
+            font=FONT_NORMAL, text_color=THEME["muted"],
+        ).grid(row=1, column=0, columnspan=2, sticky="w", padx=18, pady=(0, 6))
+        ctk.CTkLabel(
+            box,
+            text="Deixe vazio para procurar automaticamente no PATH.",
+            font=FONT_SMALL, text_color=THEME["muted"],
+        ).grid(row=2, column=0, columnspan=2, sticky="w", padx=18, pady=(0, 14))
+
+        self.path_var = tk.StringVar(value=load_psexec_path())
+        self.entry = ctk.CTkEntry(
+            box, textvariable=self.path_var, height=38, fg_color=THEME["surface_2"],
+            border_color=THEME["border"], text_color=THEME["text"],
+            placeholder_text="PsExec no PATH", placeholder_text_color=THEME["muted"],
+        )
+        self.entry.grid(row=3, column=0, sticky="ew", padx=(18, 8), pady=(0, 18))
+        ctk.CTkButton(
+            box, text="Procurar...", width=110, height=38, command=self.browse, font=FONT_BOLD,
+            fg_color=THEME["surface_3"], hover_color=THEME["accent_soft"],
+            text_color=THEME["secondary_button_text"],
+        ).grid(row=3, column=1, sticky="e", padx=(0, 18), pady=(0, 18))
+
+        buttons = ctk.CTkFrame(box, fg_color="transparent")
+        buttons.grid(row=4, column=0, columnspan=2, sticky="ew", padx=18, pady=(0, 18))
+
+        ctk.CTkButton(
+            buttons, text="Usar PATH", width=110, height=40, command=lambda: self.path_var.set(""),
+            font=FONT_BOLD, fg_color=THEME["surface_3"], hover_color=THEME["accent_soft"],
+            text_color=THEME["secondary_button_text"],
+        ).pack(side="left")
+        ctk.CTkButton(
+            buttons, text="Cancelar", width=110, height=40, command=self.destroy, font=FONT_BOLD,
+            fg_color=THEME["surface_3"], hover_color=THEME["accent_soft"],
+            text_color=THEME["secondary_button_text"],
+        ).pack(side="right", padx=(8, 0))
+        ctk.CTkButton(
+            buttons, text="Salvar", width=110, height=40, command=self.save, font=FONT_BOLD,
+            fg_color=THEME["accent"], hover_color=THEME["accent_hover"],
+            text_color=THEME["button_text"],
+        ).pack(side="right")
+
+        remember_window_geometry(self, "window_psexec_path", 680, 270)
+        self.transient(parent)
+        self.grab_set()
+        self.entry.focus_set()
+
+    def browse(self):
+        selected = filedialog.askopenfilename(
+            parent=self,
+            title="Selecionar PsExec",
+            filetypes=(("PsExec", "PsExec*.exe"), ("Executáveis", "*.exe"), ("Todos os arquivos", "*.*")),
+        )
+        if selected:
+            self.path_var.set(selected)
+
+    def save(self):
+        value = self.path_var.get().strip().strip('"')
+        if value:
+            candidate = Path(value).expanduser()
+            if not candidate.is_file() or candidate.suffix.casefold() != ".exe":
+                show_warning(self, "PsExec", "Selecione PsExec.exe ou PsExec64.exe.")
+                return
+            value = str(candidate)
+
+        if not save_psexec_path(value):
+            show_error(self, "PsExec", "Não foi possível salvar o caminho global.")
+            return
+
+        audit_log("PSEXEC_PATH_UPDATED", f"path={value or 'PATH'}")
         self.destroy()
 
 
@@ -3620,10 +4125,8 @@ class AboutWindow(ctk.CTkToplevel):
         ).pack(anchor="w", padx=22, pady=(2, 12))
 
         description = (
-            "Uma central de acesso remoto criada para transformar tarefas "
-            "repetitivas de suporte em um fluxo mais rápido, organizado e direto. "
-            "O VNC-Menu reúne conexões UltraVNC e RealVNC, gerenciamento de hosts "
-            "e ferramentas operacionais em uma única interface."
+            "Centraliza conexões UltraVNC e RealVNC, hosts e ferramentas de suporte "
+            "em uma única interface."
         )
 
         ctk.CTkLabel(
@@ -3708,7 +4211,7 @@ class AboutWindow(ctk.CTkToplevel):
         ctk.CTkButton(
             buttons,
             font=FONT_BOLD,
-            text="Verificar atualizações",
+            text="Buscar atualização",
             width=170,
             height=38,
             command=self.check_updates,
@@ -3812,71 +4315,171 @@ class SettingsWindow(ctk.CTkToplevel):
         super().__init__(parent)
         self.parent = parent
         self.title("Configurações")
-        self.geometry("420x650")
+        self.geometry("540x720")
         self.resizable(False, False)
         self.configure(fg_color=THEME["bg"])
+        self._theme_refresh_pending = False
+        self._build_content()
 
-        box = ctk.CTkFrame(self, fg_color=THEME["surface"], corner_radius=18)
-        box.pack(fill="both", expand=True, padx=18, pady=18)
-
-        ctk.CTkLabel(box, text="Configurações", font=FONT_SUBTITLE, text_color=THEME["text"]).pack(anchor="w", padx=18, pady=(18, 8))
-        ctk.CTkLabel(box, text="Acesse as opções principais do VNC-Menu.", font=FONT_NORMAL, text_color=THEME["muted"]).pack(anchor="w", padx=18, pady=(0, 18))
-
-        update_check_text = (
-            "Verificação automática: Ativada"
-            if bool(parent.settings.get("check_updates_on_startup", True))
-            else "Verificação automática: Desativada"
-        )
-        color_scheme_text = (
-            f"Cor do tema: "
-            f"{color_scheme_display_name(parent.settings.get('color_scheme'))}"
-        )
-
-        actions = [
-            ("Credenciais", parent.open_creds),
-            ("Hosts VNC", parent.open_config),
-            ("Lista de Hosts", parent.open_hosts_source_config),
-            ("Caminhos dos Viewers", parent.open_viewer_paths),
-            ("Colunas dos Hosts", parent.open_host_columns_config),
-            ("Alternar modo escuro", parent.toggle_dark_mode),
-            (color_scheme_text, parent.toggle_color_scheme),
-            (update_check_text, parent.toggle_update_checks),
-            ("Sobre o VNC-Menu", parent.open_about),
-        ]
-        for text, cmd in actions:
-            ctk.CTkButton(
-                box,
-                font=FONT_BOLD,
-                text=text,
-                command=lambda c=cmd: self.run_and_close(c),
-                height=40,
-                fg_color=THEME["surface_3"],
-                hover_color=THEME["accent_soft"],
-                text_color=THEME["text"],
-            ).pack(fill="x", padx=18, pady=(0, 10))
-
-        ctk.CTkButton(
-            box,
-            font=FONT_BOLD,
-            text="Fechar",
-            command=self.destroy,
-            fg_color=THEME["accent"],
-            hover_color=THEME["accent_hover"],
-            text_color=THEME["button_text"],
-            height=40,
-        ).pack(fill="x", padx=18, pady=(8, 18))
-        remember_window_geometry(self, "window_settings_v3", 420, 650)
+        remember_window_geometry(self, "window_settings_v4", 540, 720)
         self.transient(parent)
         self.grab_set()
 
+    def _build_content(self):
+        for child in self.winfo_children():
+            child.destroy()
+
+        self.configure(fg_color=THEME["bg"])
+        outer = ctk.CTkFrame(self, fg_color=THEME["surface"], corner_radius=18)
+        outer.pack(fill="both", expand=True, padx=18, pady=18)
+
+        ctk.CTkLabel(outer, text="Configurações", font=FONT_SUBTITLE, text_color=THEME["text"]).pack(
+            anchor="w", padx=18, pady=(16, 4)
+        )
+        ctk.CTkLabel(
+            outer, text="Ajuste o VNC-Menu.", font=FONT_NORMAL, text_color=THEME["muted"]
+        ).pack(anchor="w", padx=18, pady=(0, 12))
+
+        content = ctk.CTkScrollableFrame(
+            outer, fg_color="transparent", corner_radius=0,
+            scrollbar_button_color=THEME["surface_3"],
+            scrollbar_button_hover_color=THEME["accent_soft"],
+        )
+        content.pack(fill="both", expand=True, padx=12, pady=(0, 8))
+
+        config = self._section(content, "CONFIGURAÇÃO")
+        self._nav_button(config, "Credenciais UltraVNC", self.parent.open_creds)
+        self._nav_button(config, "Hosts e Setores", self.parent.open_config)
+        self._nav_button(config, "Selecionar Lista", self.parent.open_hosts_source_config)
+        self._nav_button(config, "Colunas da Tela", self.parent.open_host_columns_config, last=True)
+
+        paths = self._section(content, "CAMINHOS")
+        self._nav_button(paths, "Viewers VNC", self.parent.open_viewer_paths)
+        self._nav_button(paths, "PsExec", self.parent.open_psexec_path, last=True)
+
+        appearance = self._section(content, "APARÊNCIA")
+        self.dark_var = tk.BooleanVar(value=bool(self.parent.dark_mode))
+        self._switch_row(
+            appearance, "Modo escuro", self.dark_var, self.on_dark_mode_changed
+        )
+
+        color_row = ctk.CTkFrame(appearance, fg_color=THEME["surface_2"], corner_radius=10)
+        color_row.pack(fill="x", padx=10, pady=(0, 10))
+        ctk.CTkLabel(
+            color_row, text="Cor do tema", font=FONT_BOLD, text_color=THEME["text"]
+        ).pack(side="left", padx=12, pady=9)
+        self.color_var = tk.StringVar(value=color_scheme_display_name(self.parent.color_scheme))
+        ctk.CTkOptionMenu(
+            color_row, values=["Azul", "Roxo"], variable=self.color_var,
+            command=self.on_color_scheme_changed, width=105, height=30, font=FONT_BOLD,
+            fg_color=THEME["surface_3"], button_color=THEME["accent_soft"],
+            button_hover_color=THEME["accent_hover"], text_color=THEME["secondary_button_text"],
+            dropdown_fg_color=THEME["surface"], dropdown_hover_color=THEME["accent_soft"],
+            dropdown_text_color=THEME["text"],
+        ).pack(side="right", padx=10, pady=7)
+
+        system = self._section(content, "SISTEMA")
+        self.updates_var = tk.BooleanVar(
+            value=bool(self.parent.settings.get("check_updates_on_startup", True))
+        )
+        self._switch_row(
+            system, "Atualizações ao iniciar", self.updates_var, self.on_update_checks_changed, last=True
+        )
+
+        other = self._section(content, "OUTROS")
+        self._nav_button(other, "Sobre", self.parent.open_about, last=True)
+
+        ctk.CTkButton(
+            outer, font=FONT_BOLD, text="Fechar", command=self.destroy,
+            fg_color=THEME["accent"], hover_color=THEME["accent_hover"],
+            text_color=THEME["button_text"], height=40,
+        ).pack(fill="x", padx=18, pady=(4, 16))
+
+    def _section(self, parent, title: str):
+        section = ctk.CTkFrame(
+            parent, fg_color=THEME["surface_2"], corner_radius=14,
+            border_width=1, border_color=THEME["border"],
+        )
+        section.pack(fill="x", padx=2, pady=(0, 10))
+        ctk.CTkLabel(
+            section, text=title, font=FONT_SMALL_BOLD, text_color=THEME["muted"]
+        ).pack(anchor="w", padx=12, pady=(10, 7))
+        return section
+
+    def _nav_button(self, parent, text: str, command, last: bool = False):
+        ctk.CTkButton(
+            parent, font=FONT_BOLD, text=text, anchor="w",
+            command=lambda c=command: self.run_and_close(c), height=36,
+            fg_color=THEME["surface_3"], hover_color=THEME["accent_soft"],
+            text_color=THEME["secondary_button_text"],
+        ).pack(fill="x", padx=10, pady=(0, 10 if last else 6))
+
+    def _switch_row(self, parent, text: str, variable: tk.BooleanVar, command, last: bool = False):
+        row = ctk.CTkFrame(parent, fg_color=THEME["surface_2"], corner_radius=10)
+        row.pack(fill="x", padx=10, pady=(0, 10 if last else 6))
+        ctk.CTkLabel(
+            row, text=text, font=FONT_BOLD, text_color=THEME["text"]
+        ).pack(side="left", padx=12, pady=9)
+        ctk.CTkSwitch(
+            row, text="", width=44, variable=variable, onvalue=True, offvalue=False,
+            command=command, progress_color=THEME["accent"],
+            button_color=THEME["text"], button_hover_color=THEME["muted"],
+        ).pack(side="right", padx=12, pady=7)
+
+    def on_dark_mode_changed(self):
+        enabled = bool(self.dark_var.get())
+        if enabled == self.parent.dark_mode:
+            return
+        self.parent.dark_mode = enabled
+        self.parent.settings["dark_mode"] = enabled
+        save_settings(self.parent.settings)
+        audit_log("DARK_MODE_CHANGED", f"enabled={enabled}")
+        self._apply_theme_change_safely()
+
+    def on_color_scheme_changed(self, display_name: str):
+        scheme = COLOR_SCHEME_BLUE if display_name == "Azul" else COLOR_SCHEME_PURPLE
+        if scheme == self.parent.color_scheme:
+            return
+        self.parent.color_scheme = scheme
+        self.parent.settings["color_scheme"] = scheme
+        save_settings(self.parent.settings)
+        audit_log("COLOR_SCHEME_CHANGED", f"scheme={scheme}; dark_mode={self.parent.dark_mode}")
+        self._apply_theme_change_safely()
+
+    def on_update_checks_changed(self):
+        enabled = bool(self.updates_var.get())
+        self.parent.settings["check_updates_on_startup"] = enabled
+        save_settings(self.parent.settings)
+        audit_log("UPDATE_STARTUP_CHECK_CHANGED", f"enabled={enabled}")
+
+    def _apply_theme_change_safely(self):
+        """Apply theme changes only after the current widget callback has returned."""
+        if self._theme_refresh_pending:
+            return
+        self._theme_refresh_pending = True
+        self.after_idle(self._finish_theme_change)
+
+    def _finish_theme_change(self):
+        try:
+            save_window_geometry(self, "window_settings_v4")
+            self.grab_release()
+        except tk.TclError:
+            pass
+
+        try:
+            self.destroy()
+        except tk.TclError:
+            pass
+
+        # Repaint only after the settings widget tree has been destroyed.
+        # CustomTkinter updates every registered widget when appearance mode changes;
+        # doing that while the switch/option menu still exists can deadlock Tcl/Tk.
+        self.parent.after_idle(self.parent.apply_theme_repaint_and_reopen_settings)
+
     def run_and_close(self, command):
         try:
-            save_window_geometry(self, "window_settings_v3")
+            save_window_geometry(self, "window_settings_v4")
             self.grab_release()
-
-            # Hide the window without withdrawing or destroying it.
-            # CustomTkinter may still have pending focus and Windows title-bar
-            # callbacks while the appearance mode is being changed.
             self.attributes("-alpha", 0.0)
         except tk.TclError:
             pass
@@ -3902,6 +4505,7 @@ class App(ctk.CTk):
         self.minsize(900, 560)
 
         self.settings = load_settings()
+        load_global_paths(self.settings)
         initial_width, initial_height = self.get_saved_main_window_size()
         self.geometry(f"{initial_width}x{initial_height}")
         self._main_geometry_save_after = None
@@ -4255,20 +4859,34 @@ class App(ctk.CTk):
         self.after(80, self.apply_theme_repaint)
 
     def apply_theme_repaint(self):
-        apply_color_theme(self.dark_mode, self.color_scheme)
-        self.configure(fg_color=THEME["bg"])
-
         current_mode = self.mode.get()
+
+        # Remove the old widget tree before changing CustomTkinter's global
+        # appearance mode. This prevents the brief old-theme redraw and avoids
+        # callbacks touching widgets that are about to be destroyed.
         try:
             self.sidebar.destroy()
             self.main.destroy()
         except Exception:
             pass
 
+        apply_color_theme(self.dark_mode, self.color_scheme)
+        self.configure(fg_color=THEME["bg"])
+
         self.build_sidebar()
         self.build_main_panel()
         self.refresh_all()
         self.set_mode(current_mode)
+
+    def apply_theme_repaint_and_reopen_settings(self):
+        try:
+            self.apply_theme_repaint()
+        except Exception as exc:
+            log_exception(exc)
+            return
+
+        # Reopen after the main interface has finished rebuilding.
+        self.after(40, self.open_settings)
 
     def refresh_all(self, reset_scroll=False):
         self.refresh_unit_menu()
@@ -4564,7 +5182,7 @@ class App(ctk.CTk):
             )
             return
 
-        if confirm_action(self, "Confirmar reinício", f"Reiniciar:\n{name}?"):
+        if confirm_action(self, "Confirmar reinício", f'Reiniciar "{name}" agora?'):
             try:
                 restart_host(host)
             except Exception as e:
@@ -4592,7 +5210,7 @@ class App(ctk.CTk):
         target = ask_text(self, "Reiniciar host", "Digite o hostname ou IP:")
         if not target:
             return
-        if confirm_action(self, "Confirmar reinício", f"Reiniciar:\n{target}?"):
+        if confirm_action(self, "Confirmar reinício", f'Reiniciar "{target}" agora?'):
             try:
                 restart_host(target)
             except Exception as e:
@@ -4641,13 +5259,6 @@ class App(ctk.CTk):
         self.settings["check_updates_on_startup"] = enabled
         save_settings(self.settings)
         audit_log("UPDATE_STARTUP_CHECK_CHANGED", f"enabled={enabled}")
-        show_info(
-            self,
-            "Atualizações",
-            "A verificação automática foi ativada."
-            if enabled
-            else "A verificação automática foi desativada.",
-        )
 
     def maybe_check_for_updates_on_startup(self):
         if not bool(self.settings.get("check_updates_on_startup", True)):
@@ -4867,12 +5478,15 @@ class App(ctk.CTk):
     def open_viewer_paths(self):
         ViewerPathsWindow(self)
 
+    def open_psexec_path(self):
+        PsExecPathWindow(self)
+
     def open_host_columns_config(self):
         current = str(self.host_columns)
         value = ask_text(
             self,
-            "Colunas dos Hosts",
-            "Digite quantas colunas deseja mostrar na tela principal.\nValor permitido: 1 a 6.",
+            "Colunas da Tela",
+            "Quantas colunas de hosts? (1 a 6)",
             current,
         )
         if value is None:
@@ -4881,11 +5495,11 @@ class App(ctk.CTk):
         try:
             columns = int(value.strip())
         except Exception:
-            show_warning(self, "Colunas dos Hosts", "Digite um número válido entre 1 e 6.")
+            show_warning(self, "Colunas da Tela", "Digite um número de 1 a 6.")
             return
 
         if columns < 1 or columns > 6:
-            show_warning(self, "Colunas dos Hosts", "Use um valor entre 1 e 6.")
+            show_warning(self, "Colunas da Tela", "Digite um número de 1 a 6.")
             return
 
         self.host_columns = columns
@@ -4905,7 +5519,12 @@ class App(ctk.CTk):
         label = f"{unit_name} > {sector_name}"
 
         if not hosts:
-            show_text_window(self, "Usuários logados", f"Setor sem hosts ou inexistente: {label}")
+            show_text_window(
+                self,
+                "Usuários logados",
+                f"Setor sem hosts ou inexistente: {label}",
+                remember_geometry_key=None,
+            )
             return
 
         audit_log("USERS_QUERY", f"unidade={unit_name}; setor={sector_name}; hosts={len(hosts)}")
@@ -4935,7 +5554,12 @@ class App(ctk.CTk):
                     show_error(self, "Usuários logados", f"Falha ao consultar usuários:\n{error}\n\nLog: {ERROR_LOG}")
                     return
 
-                show_text_window(self, f"Usuários logados - {label}", result)
+                show_text_window(
+                    self,
+                    f"Usuários logados - {label}",
+                    result,
+                    remember_geometry_key=None,
+                )
 
             self.after(0, finish)
 
@@ -4986,6 +5610,14 @@ class App(ctk.CTk):
                     audit_log("PRINTERS_HOST_OFFLINE", f"host={host}")
                 else:
                     result = query_remote_printers(host, psexec_path)
+            except PsExecQueryError as exc:
+                log_psexec_failure(host, psexec_path, exc)
+                audit_log(
+                    "PRINTERS_PSEXEC_ERROR",
+                    f"host={host}; category={exc.category}; code={exc.returncode}; error={exc.summary}",
+                )
+                status = "error"
+                error = exc
             except Exception as exc:
                 log_exception(exc)
                 audit_log("PRINTERS_QUERY_ERROR", f"host={host}; error={exc}")
@@ -5008,17 +5640,20 @@ class App(ctk.CTk):
                     show_error(
                         self,
                         "Erro",
-                        "Erro: O computador está desligado ou offline.",
+                        "O computador está desligado ou não respondeu à rede.",
                     )
                     return
 
                 if error:
-                    show_error(
-                        self,
-                        "Consultar impressoras",
-                        f"Falha ao consultar impressoras em {host}:\n\n"
-                        f"{error}\n\nLog: {ERROR_LOG}",
-                    )
+                    if isinstance(error, PsExecQueryError):
+                        show_psexec_error_dialog(self, host, error)
+                    else:
+                        show_error(
+                            self,
+                            "Consultar impressoras",
+                            f"Falha ao consultar impressoras em {host}:\n\n"
+                            f"{error}\n\nLog: {ERROR_LOG}",
+                        )
                     return
 
                 audit_log("PRINTERS_QUERY_OK", f"host={host}")
@@ -5031,6 +5666,7 @@ class App(ctk.CTk):
                     self,
                     f"Impressoras - {result_target}",
                     result,
+                    remember_geometry_key=None,
                 )
 
             self.after(0, finish)
