@@ -6,6 +6,7 @@ import json
 import os
 import re
 import shutil
+import ssl
 import subprocess
 import sys
 import tempfile
@@ -35,7 +36,7 @@ REALVNC_EXE = r"C:\Program Files\RealVNC\VNC Viewer\vncviewer.exe"
 PORT = 5900
 
 APP_NAME = "VNC-Menu"
-APP_VERSION = "1.6"
+APP_VERSION = "1.6.1"
 APP_AUTHOR = 'Gabriel "GMErebos" Mariense'
 GITHUB_PROFILE_URL = "https://github.com/gabrielmariense"
 GITHUB_URL = "https://github.com/gabrielmariense/VNC-Menu"
@@ -1720,6 +1721,24 @@ def shared_hosts_edit_warning(parent):
 # =========================
 # Atualizações
 # =========================
+def create_https_context() -> ssl.SSLContext:
+    """Create a verified HTTPS context compatible with corporate Windows PKI.
+
+    Python 3.13 enables OpenSSL X509 strict mode in create_default_context().
+    Some valid enterprise/proxy CA chains omit Authority Key Identifier and are
+    rejected only by that extra strict flag. Disabling STRICT keeps normal CA
+    verification and hostname checking enabled.
+    """
+    context = ssl.create_default_context()
+    strict_flag = getattr(ssl, "VERIFY_X509_STRICT", 0)
+    if strict_flag:
+        context.verify_flags &= ~strict_flag
+    return context
+
+
+HTTPS_CONTEXT = create_https_context()
+
+
 def parse_version(value: str) -> tuple[int, ...]:
     parts = re.findall(r"\d+", str(value or "").strip().lower().removeprefix("v"))
     return tuple(int(part) for part in parts) if parts else (0,)
@@ -1739,7 +1758,7 @@ def github_request_json(url: str, timeout: int = 15) -> dict:
             "X-GitHub-Api-Version": "2022-11-28",
         },
     )
-    with urllib.request.urlopen(request, timeout=timeout) as response:
+    with urllib.request.urlopen(request, timeout=timeout, context=HTTPS_CONTEXT) as response:
         data = json.loads(response.read().decode("utf-8"))
     if not isinstance(data, dict):
         raise RuntimeError("Resposta inválida recebida do GitHub.")
@@ -1784,7 +1803,7 @@ def download_url_bytes(url: str, timeout: int = 30) -> bytes:
         url,
         headers={"User-Agent": f"{APP_NAME}/{APP_VERSION}"},
     )
-    with urllib.request.urlopen(request, timeout=timeout) as response:
+    with urllib.request.urlopen(request, timeout=timeout, context=HTTPS_CONTEXT) as response:
         return response.read()
 
 
@@ -3850,10 +3869,14 @@ class UpdateAvailableWindow(ctk.CTkToplevel):
         window_height = min(max(315 + notes_height, 450), 525)
 
         self.title("Atualização disponível")
-        self.geometry(f"660x{window_height}")
-        self.resizable(False, False)
         self.configure(fg_color=THEME["bg"])
         self.protocol("WM_DELETE_WINDOW", self.destroy)
+
+        # Keep a sensible initial size, but let the user resize the window if
+        # release notes or display scaling make the automatic size awkward.
+        self.resizable(True, True)
+        self.minsize(570, 410)
+        center_window(self, 660, window_height)
 
         outer = ctk.CTkFrame(
             self,
@@ -3996,66 +4019,40 @@ class UpdateAvailableWindow(ctk.CTkToplevel):
         footer = ctk.CTkFrame(
             outer,
             fg_color="transparent",
-            height=42,
         )
         footer.pack(fill="x", padx=20, pady=(0, 18))
-        footer.pack_propagate(False)
 
-        ctk.CTkButton(
-            footer,
-            text="Atualizar agora",
-            font=FONT_BOLD,
-            width=148,
-            height=38,
-            command=self.start_update,
-            fg_color=THEME["accent"],
-            hover_color=THEME["accent_hover"],
-            text_color=THEME["button_text"],
-        ).pack(side="left")
+        # Equal columns keep the four actions aligned at any window width.
+        for column in range(4):
+            footer.grid_columnconfigure(column, weight=1, uniform="update_actions")
 
-        ctk.CTkButton(
-            footer,
-            text="Ver no GitHub",
-            font=FONT_BOLD,
-            width=125,
-            height=38,
-            command=self.open_release,
-            fg_color=THEME["surface_3"],
-            hover_color=THEME["accent_soft"],
-            text_color=THEME["secondary_button_text"],
-        ).pack(side="left", padx=(9, 0))
-
-        ctk.CTkButton(
-            footer,
-            text="Ignorar versão",
-            font=FONT_BOLD,
-            width=128,
-            height=38,
-            command=self.skip_version,
-            fg_color=THEME["surface_3"],
-            hover_color=THEME["accent_soft"],
-            text_color=THEME["secondary_button_text"],
-        ).pack(side="right")
-
-        ctk.CTkButton(
-            footer,
-            text="Agora não",
-            font=FONT_BOLD,
-            width=105,
-            height=38,
-            command=self.destroy,
-            fg_color=THEME["surface_3"],
-            hover_color=THEME["accent_soft"],
-            text_color=THEME["secondary_button_text"],
-        ).pack(side="right", padx=(0, 9))
-
-        # New key prevents a previously saved larger geometry from returning.
-        remember_window_geometry(
-            self,
-            "window_update_available_v3",
-            660,
-            window_height,
+        button_specs = (
+            ("Atualizar agora", self.start_update, THEME["accent"], THEME["accent_hover"], THEME["button_text"]),
+            ("Ver no GitHub", self.open_release, THEME["surface_3"], THEME["accent_soft"], THEME["secondary_button_text"]),
+            ("Ignorar versão", self.skip_version, THEME["surface_3"], THEME["accent_soft"], THEME["secondary_button_text"]),
+            ("Agora não", self.destroy, THEME["surface_3"], THEME["accent_soft"], THEME["secondary_button_text"]),
         )
+
+        for column, (text, command, fg_color, hover_color, text_color) in enumerate(button_specs):
+            ctk.CTkButton(
+                footer,
+                text=text,
+                font=FONT_BOLD,
+                height=38,
+                command=command,
+                fg_color=fg_color,
+                hover_color=hover_color,
+                text_color=text_color,
+            ).grid(
+                row=0,
+                column=column,
+                sticky="ew",
+                padx=(0 if column == 0 else 4, 0 if column == 3 else 4),
+            )
+
+        # Do not restore an old saved size for this dialog. Release-note length
+        # can vary a lot between versions, so start clean each time and allow
+        # manual resizing instead.
         self.transient(parent)
         self.grab_set()
         self.lift()
@@ -5290,6 +5287,21 @@ class App(ctk.CTk):
                 else:
                     error = RuntimeError(f"GitHub respondeu com HTTP {exc.code}.")
                 release = None
+            except urllib.error.URLError as exc:
+                release = None
+                reason = getattr(exc, "reason", None)
+                if isinstance(reason, ssl.SSLCertVerificationError):
+                    error = RuntimeError(
+                        "Não foi possível validar o certificado HTTPS do GitHub. "
+                        "Verifique o certificado da rede/proxy ou tente novamente."
+                    )
+                else:
+                    error = exc
+            except ssl.SSLError as exc:
+                release = None
+                error = RuntimeError(
+                    f"Falha na conexão segura com o GitHub: {exc}"
+                )
             except Exception as exc:
                 release = None
                 error = exc
@@ -5371,7 +5383,7 @@ class App(ctk.CTk):
                     asset_url,
                     headers={"User-Agent": f"{APP_NAME}/{APP_VERSION}"},
                 )
-                with urllib.request.urlopen(request, timeout=60) as response:
+                with urllib.request.urlopen(request, timeout=60, context=HTTPS_CONTEXT) as response:
                     try:
                         total = int(response.headers.get("Content-Length") or 0)
                     except Exception:
