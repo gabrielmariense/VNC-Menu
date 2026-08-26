@@ -1,0 +1,85 @@
+template.vnc — modelo de conexao UltraVNC
+=========================================
+
+O VNC-Menu usa um arquivo chamado exatamente:
+
+    data\template.vnc
+
+O que acontece na primeira execucao
+-----------------------------------
+
+Se template.vnc nao existir, o VNC-Menu cria uma copia a partir de:
+
+    data\template.vnc.example
+
+O template.vnc gerado passa a pertencer a esta instalacao e o VNC-Menu
+nunca o sobrescreve depois disso. Voce pode edita-lo a vontade.
+
+IMPORTANTE: este modelo exige o SecureVNC
+-----------------------------------------
+
+O template.vnc.example vem com a criptografia por plugin DSM LIGADA:
+
+    UseDSMPlugin=1
+    DSMPlugin=SecureVNCPlugin64.dsm
+    AllowUntrustedServers=1
+
+Isso significa que a conexao UltraVNC so funciona se:
+
+  1. o plugin SecureVNCPlugin64.dsm estiver instalado junto ao
+     vncviewer.exe (normalmente em
+     C:\Program Files\uvnc bvba\UltraVNC\), e
+  2. o servidor UltraVNC do computador remoto estiver configurado com o
+     mesmo plugin e a mesma chave.
+
+Se a sua instalacao NAO usa SecureVNC, edite o seu data\template.vnc e
+deixe assim:
+
+    UseDSMPlugin=0
+    DSMPlugin=
+
+Sobre AllowUntrustedServers=1: vale apenas quando o plugin DSM esta em
+uso. Com 1, o viewer aceita servidores cuja chave ainda nao esta na lista
+de confianca sem avisar. E o ajuste pratico para quem conecta em muitas
+maquinas; com 0, cada maquina nova exige confirmacao manual da chave.
+
+Por que template.vnc nao esta no repositorio
+--------------------------------------------
+
+Um perfil exportado do UltraVNC Viewer pode conter a senha de conexao
+gravada (chaves passwd / passwd2). Versionar o arquivo publicaria essa
+senha. Por isso a pasta "data" esta no .gitignore e apenas o
+template.vnc.example, sem senha, e versionado.
+
+Prefira deixar a senha FORA do template e usar:
+
+    Configuracoes > Credenciais UltraVNC
+
+Essa opcao guarda a senha protegida por DPAPI no perfil do usuario do
+Windows, e nao em texto no disco.
+
+Como ajustar o modelo
+---------------------
+
+1. Abra o UltraVNC Viewer (vncviewer.exe).
+2. Preencha um host qualquer e abra as opcoes de conexao ("Options...").
+3. Ajuste o que a sua operacao usa: qualidade, compressao, escala,
+   teclado, tela cheia, plugin DSM, etc.
+4. Use "Save connection settings as..." e salve como data\template.vnc.
+
+O host gravado dentro do template nao importa. O VNC-Menu copia o arquivo
+para uma copia temporaria a cada conexao e passa o destino separadamente
+na linha de comando, como HOST::5900. Por isso o example vem com host
+vazio.
+
+Observacoes
+-----------
+
+- O arquivo e por instalacao, nao por usuario. Todos os usuarios daquela
+  maquina usam o mesmo template.
+- Se voce gravar a senha dentro do template, ela fica em texto no disco e
+  tambem nas copias temporarias em %TEMP%\uvnc_<host>.vnc.
+- Conexoes RealVNC nao usam este arquivo. Elas usam os perfis .vnc
+  gerados em data\realvnc\.
+- Ao atualizar o VNC-Menu, o atualizador preserva a pasta "data" inteira,
+  entao o seu template.vnc nao e substituido.

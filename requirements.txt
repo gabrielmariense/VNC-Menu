@@ -1,5 +1,5 @@
+# Dependencias de execucao do VNC-Menu.
+customtkinter
 pywinauto
-pyinstaller
 pywin32
 comtypes
-customtkinter

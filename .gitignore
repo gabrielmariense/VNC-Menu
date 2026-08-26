@@ -1,9 +1,9 @@
-/dist
-/build
 /logs
-/_internal
-/logs/*.log
 /release
 CREATE-UPDATE-PACKAGE.ps1
-UPDATE-RELEASE-GRUIDE.md
-/data
+/data/realvnc
+/data/hosts.json
+/data/paths.json
+/data/template.vnc
+/vncmenu/__pycache__
+/vncmenu/ui/__pycache__
