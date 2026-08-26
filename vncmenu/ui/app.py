@@ -17,9 +17,9 @@ import urllib.error
 import urllib.request
 import zipfile
 
-from ..config import APP_AUTHOR, APP_NAME, APP_VERSION, COLOR_SCHEME_BLUE, DEFAULT_VIEWER, ERROR_LOG, HOSTS_SOURCE_CUSTOM, HOSTS_SOURCE_SHARED, LOGIN_MODE_AUTO, LOGIN_MODE_MANUAL, SCRIPT_DIR, UPDATE_DOWNLOAD_DIR, UPDATE_RESULT_JSON
+from ..config import APP_AUTHOR, APP_NAME, APP_VERSION, COLOR_SCHEME_BLUE, DEFAULT_VIEWER, ERROR_LOG, HOSTS_SOURCE_CUSTOM, HOSTS_SOURCE_SHARED, LOGIN_MODE_AUTO, LOGIN_MODE_MANUAL, SCRIPT_DIR, SEARCH_DEBOUNCE_MS, SEARCH_HOST_COLUMN_WIDTH, SEARCH_SECTOR_COLUMN_WIDTH, UPDATE_DOWNLOAD_DIR, UPDATE_RESULT_JSON
 from ..applog import audit_log, log_exception
-from ..storage import format_host_port, sanitize_port, bootstrap_directories, find_psexec, get_host_columns, get_hosts_path_for_source, get_sector_hosts, get_sector_names, get_unit_names, hosts_source_display_name, load_global_paths, load_hosts_data, load_settings, normalize_hosts_source, normalize_login_mode, save_settings, set_hosts_source
+from ..storage import format_host_port, sanitize_port, bootstrap_directories, filter_unit_hosts, find_psexec, get_host_columns, get_hosts_path_for_source, get_sector_hosts, get_sector_names, get_unit_names, hosts_source_display_name, load_global_paths, load_hosts_data, load_settings, normalize_hosts_source, normalize_login_mode, save_settings, set_hosts_source
 from ..theme import FONT_BOLD, FONT_NORMAL, FONT_SMALL, FONT_SMALL_BOLD, FONT_TITLE, THEME, apply_color_theme, normalize_color_scheme
 from ..helpers import get_geometry_size, get_window_geometries, is_valid_geometry, prune_window_geometries, reset_scrollable_frame_position, restore_window_geometry, safe_filename, save_window_geometry, show_error, show_info, show_warning
 from ..updates import HTTPS_CONTEXT, calculate_sha256, current_main_entry_name, fetch_latest_release, find_release_zip_asset, get_release_asset_checksum, get_updater_launch_command, normalize_release_version, parse_version
@@ -74,6 +74,19 @@ class App(ctk.CTk):
             saved_sector = sector_names[0]
         self.selected_sector = tk.StringVar(value=saved_sector)
         self.host_columns = get_host_columns(self.settings)
+
+        # Search state. The query is deliberately NOT persisted in settings.json:
+        # a filter that survives a restart looks exactly like a host list that
+        # lost its hosts.
+        self.search_var = tk.StringVar(value="")
+        self.search_query = ""
+        self._search_after_id = None
+        self._suppress_search_trace = False
+        # Registered once, here, and NOT in build_search_row(): changing the
+        # theme destroys and rebuilds the whole main panel, so registering it
+        # there would stack one extra callback per theme change.
+        self.search_var.trace_add("write", self.on_search_changed)
+
         self.mode = tk.StringVar(value="connect")
         self.login_mode = tk.StringVar(
             value=normalize_login_mode(
@@ -177,14 +190,101 @@ class App(ctk.CTk):
             text_color=THEME["text"],
         ).pack(fill="x", padx=20, pady=(0, 20))
 
+    def build_search_row(self):
+        """Full-width search bar above the action buttons."""
+        row = ctk.CTkFrame(self.main, fg_color="transparent")
+        row.grid(row=0, column=0, sticky="ew", padx=22, pady=(22, 12))
+        row.grid_columnconfigure(0, weight=1)
+
+        self.search_entry = ctk.CTkEntry(
+            row,
+            textvariable=self.search_var,
+            height=38,
+            font=FONT_NORMAL,
+            placeholder_text="Buscar por nome ou IP/hostname nesta unidade",
+            placeholder_text_color=THEME["muted"],
+            fg_color=THEME["surface_2"],
+            border_color=THEME["border"],
+            text_color=THEME["text"],
+        )
+        self.search_entry.grid(row=0, column=0, sticky="ew")
+        self.search_entry.bind("<Escape>", self.on_search_escape)
+
+        ctk.CTkButton(
+            row,
+            font=FONT_BOLD,
+            text="✕",
+            width=44,
+            height=38,
+            command=self.clear_search,
+            fg_color=THEME["surface_3"],
+            hover_color=THEME["accent_soft"],
+            text_color=THEME["secondary_button_text"],
+        ).grid(row=0, column=1, sticky="e", padx=(8, 0))
+
+    def on_search_changed(self, *_args):
+        if self._suppress_search_trace:
+            return
+        self.cancel_pending_search()
+        self._search_after_id = self.after(SEARCH_DEBOUNCE_MS, self.apply_search)
+
+    def cancel_pending_search(self):
+        if self._search_after_id is None:
+            return
+        try:
+            self.after_cancel(self._search_after_id)
+        except Exception:
+            pass
+        self._search_after_id = None
+
+    def apply_search(self):
+        self._search_after_id = None
+        self.search_query = self.search_var.get().strip()
+        self.refresh_sectors()
+        self.render_hosts()
+        self.set_mode(self.mode.get())
+        reset_scrollable_frame_position(self.host_grid)
+
+    def reset_search_state(self):
+        """Drop the query WITHOUT redrawing. The caller redraws.
+
+        Used by the sector and unit switches, which already redraw right
+        after; clearing through apply_search() there would render twice.
+        """
+        self.cancel_pending_search()
+        self.search_query = ""
+        if not self.search_var.get():
+            return
+        self._suppress_search_trace = True
+        try:
+            self.search_var.set("")
+        finally:
+            self._suppress_search_trace = False
+
+    def clear_search(self):
+        if not self.search_query and not self.search_var.get():
+            return
+        self.reset_search_state()
+        self.refresh_sectors()
+        self.render_hosts()
+        self.set_mode(self.mode.get())
+        reset_scrollable_frame_position(self.host_grid)
+
+    def on_search_escape(self, _event=None):
+        self.clear_search()
+        return "break"
+
     def build_main_panel(self):
         self.main = ctk.CTkFrame(self, fg_color=THEME["surface"], corner_radius=22)
         self.main.grid(row=0, column=1, sticky="nsew", padx=(0, 18), pady=18)
         self.main.grid_columnconfigure(0, weight=1)
-        self.main.grid_rowconfigure(2, weight=1)
+        # Row 0 is the search bar, so the host grid moved from row 2 to row 3.
+        self.main.grid_rowconfigure(3, weight=1)
+
+        self.build_search_row()
 
         top = ctk.CTkFrame(self.main, fg_color="transparent")
-        top.grid(row=0, column=0, sticky="ew", padx=22, pady=(22, 16))
+        top.grid(row=1, column=0, sticky="ew", padx=22, pady=(0, 16))
         top.grid_columnconfigure(0, weight=1)
 
         actions = ctk.CTkFrame(top, fg_color="transparent")
@@ -241,7 +341,7 @@ class App(ctk.CTk):
         self.btn_printers.pack(side="left")
 
         hint = ctk.CTkFrame(self.main, fg_color=THEME["surface_2"], corner_radius=16)
-        hint.grid(row=1, column=0, sticky="ew", padx=22, pady=(0, 16))
+        hint.grid(row=2, column=0, sticky="ew", padx=22, pady=(0, 16))
         hint.grid_columnconfigure(0, weight=1)
 
         self.mode_label = ctk.CTkLabel(
@@ -293,10 +393,10 @@ class App(ctk.CTk):
         self.update_login_mode_button()
 
         self.host_grid = ctk.CTkScrollableFrame(self.main, fg_color=THEME["bg"], corner_radius=18)
-        self.host_grid.grid(row=2, column=0, sticky="nsew", padx=22, pady=(0, 18))
+        self.host_grid.grid(row=3, column=0, sticky="nsew", padx=22, pady=(0, 18))
 
         self.footer = ctk.CTkFrame(self.main, fg_color="transparent")
-        self.footer.grid(row=3, column=0, sticky="ew", padx=22, pady=(0, 18))
+        self.footer.grid(row=4, column=0, sticky="ew", padx=22, pady=(0, 18))
 
         self.signature_button = ctk.CTkButton(
             self.footer,
@@ -364,11 +464,16 @@ class App(ctk.CTk):
         if mode == "connect":
             self.btn_connect.configure(fg_color=THEME["accent"], hover_color=THEME["accent_hover"], text_color=THEME["button_text"])
             self.btn_restart.configure(fg_color=THEME["surface_3"], hover_color=THEME["accent_soft"], text_color=THEME["secondary_button_text"])
-            self.mode_label.configure(text="Modo atual: CONECTAR")
         else:
             self.btn_connect.configure(fg_color=THEME["surface_3"], hover_color=THEME["accent_soft"], text_color=THEME["secondary_button_text"])
             self.btn_restart.configure(fg_color=THEME["warning"], hover_color=THEME["warning_hover"], text_color=THEME["button_text"])
-            self.mode_label.configure(text="Modo atual: REINICIAR")
+
+        # The active mode is already shown by the highlighted button, so this
+        # label stays empty during normal use. Its only job is the search
+        # state, which is the one thing the buttons cannot show.
+        self.mode_label.configure(
+            text=f"Buscando em: {self.selected_unit.get()}" if self.search_query else ""
+        )
 
     def apply_theme_repaint(self):
         current_mode = self.mode.get()
@@ -428,7 +533,10 @@ class App(ctk.CTk):
             self.selected_sector.set(sector_names[0])
 
         for name in sector_names:
-            selected = name == self.selected_sector.get()
+            # While searching, no sector is driving the list, so none is shown
+            # as selected. Highlighting one next to results from other sectors
+            # is the kind of small lie that turns into a support call.
+            selected = (not self.search_query) and name == self.selected_sector.get()
             btn = ctk.CTkButton(
                 self.sector_frame,
                 font=FONT_BOLD,
@@ -454,9 +562,14 @@ class App(ctk.CTk):
         for child in self.host_grid.winfo_children():
             child.destroy()
 
+        self.source_label.configure(text=f"Lista: {hosts_source_display_name(self.hosts_source)}")
+
+        if self.search_query:
+            self.render_search_results()
+            return
+
         hosts = get_sector_hosts(self.hosts_data, self.selected_unit.get(), self.selected_sector.get())
         self.count_label.configure(text=f"{len(hosts)} host(s) encontrado(s)")
-        self.source_label.configure(text=f"Lista: {hosts_source_display_name(self.hosts_source)}")
 
         if not hosts:
             ctk.CTkLabel(
@@ -511,19 +624,137 @@ class App(ctk.CTk):
                 spacer.pack_propagate(False)
 
 
+    def render_search_results(self):
+        """One row per match: name, IP/hostname, sector.
+
+        A list rather than the usual grid on purpose. The row has room for the
+        three values at any window size, and it stays readable no matter what
+        "Colunas da Tela" is set to, which a two-line card would not.
+        """
+        results = filter_unit_hosts(self.hosts_data, self.selected_unit.get(), self.search_query)
+        self.count_label.configure(text=f"{len(results)} host(s) encontrado(s)")
+
+        if not results:
+            ctk.CTkLabel(
+                self.host_grid,
+                text=f'Nenhum host encontrado para "{self.search_query}" em {self.selected_unit.get()}.',
+                font=FONT_NORMAL,
+                text_color=THEME["muted"],
+            ).pack(anchor="w", padx=18, pady=18)
+            return
+
+        for sector_name, item in results:
+            self.build_search_result_row(sector_name, item)
+
+    def build_search_result_row(self, sector_name, item):
+        name = str(item.get("name") or "Host")
+        host = str(item.get("host") or "")
+        viewer = item.get("viewer", DEFAULT_VIEWER)
+        port = item.get("port")
+
+        row = ctk.CTkFrame(self.host_grid, fg_color=THEME["surface_2"], corner_radius=12, height=40)
+        row.pack(fill="x", padx=8, pady=4)
+        row.pack_propagate(False)
+
+        # The sector chip and the address keep their natural width; the name
+        # column absorbs whatever the window has to spare. Fixed pixel widths
+        # here would leave the row stretching while its contents stayed put.
+        sector_label = ctk.CTkLabel(
+            row,
+            text=sector_name if len(sector_name) <= 18 else sector_name[:17] + "…",
+            font=FONT_SMALL_BOLD,
+            text_color=THEME["secondary_button_text"],
+            fg_color=THEME["surface_3"],
+            corner_radius=999,
+            width=SEARCH_SECTOR_COLUMN_WIDTH,
+            anchor="center",
+        )
+        sector_label.pack(side="right", padx=(8, 14), pady=7)
+
+        host_label = ctk.CTkLabel(
+            row,
+            # Shows the port only when it is not the default one, same rule the
+            # context menu already uses.
+            text=format_host_port(host, sanitize_port(port)),
+            font=FONT_SMALL,
+            text_color=THEME["muted"],
+            width=SEARCH_HOST_COLUMN_WIDTH,
+            anchor="w",
+        )
+        host_label.pack(side="right", padx=(8, 8))
+
+        name_label = ctk.CTkLabel(
+            row,
+            text=name if len(name) <= 60 else name[:59] + "…",
+            font=("Segoe UI", 12, "bold"),
+            text_color=THEME["text"],
+            anchor="w",
+        )
+        name_label.pack(side="left", fill="x", expand=True, padx=(14, 8))
+
+        def on_click(_event=None):
+            # The row carries its OWN sector, not the selected one: it decides
+            # which RealVNC profile gets opened.
+            self.run_host_action(name, host, viewer, port, sector=sector_name)
+
+        def on_context(event):
+            self.show_host_context_menu(event, host, name, port)
+
+        self.bind_result_row_events(row, (name_label, host_label, sector_label), on_click, on_context)
+
+    def bind_result_row_events(self, row, labels, on_click, on_context):
+        """Make a frame full of labels behave like one clickable row."""
+
+        def enter(_event=None):
+            try:
+                row.configure(fg_color=THEME["accent_soft"])
+            except Exception:
+                pass
+
+        def leave(event=None):
+            # Moving onto a child label fires <Leave> on the row itself, so the
+            # colour must only be restored when the pointer really left the row.
+            try:
+                under = row.winfo_containing(event.x_root, event.y_root) if event else None
+                widget = under
+                while widget is not None:
+                    if widget is row:
+                        return
+                    widget = getattr(widget, "master", None)
+            except Exception:
+                pass
+            try:
+                row.configure(fg_color=THEME["surface_2"])
+            except Exception:
+                pass
+
+        for widget in (row, *labels):
+            widget.bind("<Enter>", enter, add="+")
+            widget.bind("<Leave>", leave, add="+")
+            widget.bind("<Button-1>", on_click, add="+")
+            widget.bind("<Button-3>", on_context, add="+")
+
     def on_main_unit_changed(self):
+        # The search only ever covers one unit. Carrying the query across a unit
+        # switch would show a short or empty list for a unit the user has not
+        # searched yet, which reads as "my hosts disappeared".
+        self.reset_search_state()
         sector_names = get_sector_names(self.hosts_data, self.selected_unit.get()) or ["Geral"]
         self.selected_sector.set(sector_names[0])
         self.save_main_selection()
         self.refresh_sectors()
         self.render_hosts()
+        self.set_mode(self.mode.get())
         self.reset_main_scroll_positions()
 
     def set_sector(self, sector_name):
+        # Picking a sector is the natural "get me out of the search" gesture.
+        self.reset_search_state()
         self.selected_sector.set(sector_name)
         self.save_main_selection()
         self.refresh_sectors()
         self.render_hosts()
+        self.set_mode(self.mode.get())
         reset_scrollable_frame_position(self.host_grid)
 
     def save_main_selection(self):
@@ -684,14 +915,6 @@ class App(ctk.CTk):
         menu.post(event.x_root, event.y_root)
         menu.focus_set()
 
-    def show_transient_mode_message(self, message: str, milliseconds: int = 4000):
-        """Show a temporary status in the mode label, without a modal dialog."""
-        try:
-            self.mode_label.configure(text=message)
-        except tk.TclError:
-            return
-        self.after(milliseconds, lambda: self.set_mode(self.mode.get()))
-
     def restart_host_async(self, host, display_name=None):
         """Send the restart from a worker thread so the interface stays usable."""
         target = str(host or "").strip()
@@ -734,9 +957,11 @@ class App(ctk.CTk):
                     )
                     return
 
-                self.show_transient_mode_message(
-                    f'Comando de reinício enviado para "{label}".'
-                )
+                # Sucesso nao avisa nada. O botao ja mostrou "Enviando..." e
+                # voltou ao normal, a confirmacao antes do envio ja disse o que
+                # ia acontecer, e a falha abre um dialogo. Um aviso de sucesso
+                # ainda diria so que o comando foi aceito, nao que a maquina
+                # reiniciou, e teria que ser fechado a cada host.
 
             self.after(0, finish)
 
@@ -746,13 +971,18 @@ class App(ctk.CTk):
             daemon=True,
         ).start()
 
-    def run_host_action(self, name, host, viewer=DEFAULT_VIEWER, port=None):
+    def run_host_action(self, name, host, viewer=DEFAULT_VIEWER, port=None, sector=None):
         if self.mode.get() == "connect":
+            # The sector picks the RealVNC profile file (<Setor>_<Nome>.vnc), so
+            # it has to be the sector the host actually belongs to. A search
+            # result can come from a sector other than the selected one, and
+            # passing the selection there would open the wrong profile.
+            sector_name = sector if sector is not None else self.selected_sector.get()
             launch_vnc(
                 host,
                 viewer,
                 name,
-                self.selected_sector.get(),
+                sector_name,
                 self,
                 automatic_login=self.automatic_login_enabled(),
                 port=port,

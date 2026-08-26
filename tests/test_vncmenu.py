@@ -1150,3 +1150,129 @@ class TestLoggedUsersQuery(VncMenuTestCase):
     def test_missing_host_is_reported_without_touching_the_network(self):
         name, result = self.original({"name": "SemHost", "host": ""})
         self.assertEqual((name, result), ("SemHost", "SEM HOST"))
+
+
+# ---------------------------------------------------------------- busca
+
+
+def _search_fixture():
+    """Two units, so unit scoping can actually be proved."""
+    return {
+        "units": [
+            {
+                "name": "Matriz",
+                "sectors": [
+                    {
+                        "name": "Recepção",
+                        "hosts": [
+                            {"name": "PC-RECEP-01", "host": "192.0.2.11", "viewer": "ultravnc"},
+                            {"name": "PC-RECEP-02", "host": "192.0.2.12", "viewer": "ultravnc"},
+                        ],
+                    },
+                    {
+                        "name": "Financeiro",
+                        "hosts": [
+                            {"name": "PC-FIN-01", "host": "192.0.2.41", "viewer": "realvnc"},
+                            {"name": "NB-DIRETORIA", "host": "192.0.2.44", "viewer": "ultravnc"},
+                        ],
+                    },
+                ],
+            },
+            {
+                "name": "Filial",
+                "sectors": [
+                    {
+                        "name": "Recepção",
+                        "hosts": [
+                            {"name": "PC-RECEP-99", "host": "198.51.100.9", "viewer": "ultravnc"},
+                        ],
+                    }
+                ],
+            },
+        ]
+    }
+
+
+class TestSearchNormalization(VncMenuTestCase):
+    def test_accents_and_case_are_ignored(self):
+        normalize = self.app.normalize_search_text
+        self.assertEqual(normalize("Recepção"), "recepcao")
+        self.assertEqual(normalize("MANUTENÇÃO"), "manutencao")
+        self.assertEqual(normalize("  Almoxarifado  "), "almoxarifado")
+
+    def test_empty_values_normalize_to_empty_string(self):
+        normalize = self.app.normalize_search_text
+        self.assertEqual(normalize(None), "")
+        self.assertEqual(normalize(""), "")
+        self.assertEqual(normalize("   "), "")
+
+
+class TestSearchFiltering(VncMenuTestCase):
+    def setUp(self):
+        self.data = _search_fixture()
+        self.filter = self.app.filter_unit_hosts
+
+    def names(self, query, unit="Matriz"):
+        return [item["name"] for _sector, item in self.filter(self.data, unit, query)]
+
+    def test_matches_the_host_name(self):
+        self.assertEqual(self.names("recep"), ["PC-RECEP-01", "PC-RECEP-02"])
+
+    def test_matches_the_ip(self):
+        self.assertEqual(self.names("192.0.2.41"), ["PC-FIN-01"])
+
+    def test_matching_is_case_insensitive(self):
+        self.assertEqual(self.names("pc-fin"), ["PC-FIN-01"])
+        self.assertEqual(self.names("PC-FIN"), ["PC-FIN-01"])
+
+    def test_search_is_scoped_to_the_selected_unit(self):
+        # PC-RECEP-99 lives in Filial and must not leak into a Matriz search.
+        self.assertNotIn("PC-RECEP-99", self.names("recep"))
+        self.assertEqual(self.names("recep", unit="Filial"), ["PC-RECEP-99"])
+
+    def test_results_carry_their_own_sector(self):
+        # This pairing is what keeps RealVNC opening the right profile.
+        results = self.filter(self.data, "Matriz", "pc-")
+        self.assertEqual(
+            [(sector, item["name"]) for sector, item in results],
+            [
+                ("Recepção", "PC-RECEP-01"),
+                ("Recepção", "PC-RECEP-02"),
+                ("Financeiro", "PC-FIN-01"),
+            ],
+        )
+
+    def test_query_cannot_straddle_name_and_host(self):
+        # "01 192" only matches if the two fields are joined before matching.
+        self.assertEqual(self.names("01 192"), [])
+
+    def test_empty_query_returns_nothing(self):
+        self.assertEqual(self.filter(self.data, "Matriz", ""), [])
+        self.assertEqual(self.filter(self.data, "Matriz", "   "), [])
+        self.assertEqual(self.filter(self.data, "Matriz", None), [])
+
+    def test_unknown_unit_returns_nothing(self):
+        self.assertEqual(self.filter(self.data, "Inexistente", "pc"), [])
+
+    def test_order_is_stable_across_identical_searches(self):
+        self.assertEqual(self.names("pc-"), self.names("pc-"))
+
+    def test_malformed_entries_are_skipped(self):
+        data = _search_fixture()
+        data["units"][0]["sectors"][0]["hosts"].append("nao e um dict")
+        data["units"][0]["sectors"].append("nao e um setor")
+        self.assertEqual(
+            [item["name"] for _s, item in self.filter(data, "Matriz", "pc-")],
+            ["PC-RECEP-01", "PC-RECEP-02", "PC-FIN-01"],
+        )
+
+
+class TestSearchActionSector(VncMenuTestCase):
+    def test_run_host_action_accepts_an_explicit_sector(self):
+        # Without this parameter a RealVNC result found outside the selected
+        # sector would open <SetorSelecionado>_<Nome>.vnc, the wrong profile.
+        import inspect
+
+        signature = inspect.signature(self.app.App.run_host_action)
+        self.assertIn("sector", signature.parameters)
+        self.assertIsNone(signature.parameters["sector"].default)

@@ -13,6 +13,7 @@ The project was created to speed up access to multiple machines, reduce repetiti
 ## Features
 
 - Host organization by **Unit > Sector > Host**.
+- Host search by name or IP/hostname within the selected unit.
 - Support for **UltraVNC** and **RealVNC**, with a per-host VNC port.
 - Per-user UltraVNC credentials protected with **Windows DPAPI**.
 - Automatic UltraVNC authentication, toggleable between **Login automático** and **Login manual**.
@@ -141,6 +142,22 @@ The **Host manual** button follows the currently selected mode:
 - in **Reiniciar** mode, it asks for hostname/IP and confirmation.
 
 In **Conectar** mode, the field accepts an explicit port in `HOST::5901` form.
+
+### Search
+
+The bar above the action buttons finds hosts by **name** or by **IP/hostname**, across every sector of the **selected unit**. Each result shows the name, the address, and the sector it belongs to.
+
+The search ignores case and accents, so `recepcao` finds `Recepção`.
+
+While a search is active:
+
+- the sectors stop driving the list and are dimmed;
+- the area above the list shows `Buscando em: <unit>`;
+- clicking a sector, switching unit, pressing `Esc`, or using the `✕` button returns to normal browsing.
+
+The selected mode still applies: clicking a result connects or restarts it, depending on whether **Conectar** or **Reiniciar** is active. Right-clicking opens the same context menu as the normal list.
+
+The query is not persisted. Reopening the application returns to the selected sector.
 
 ### Context menu
 
@@ -344,8 +361,9 @@ Configurações > PsExec
 It applies to every user of the computer (stored in `data\paths.json`). If the
 field is left empty, the application looks for PsExec on `PATH`.
 
-Common failures are translated into a readable message — host unreachable, name
-not resolved, credentials refused, timed out — instead of the raw PsExec code.
+Common failures are translated into a readable message such as host unreachable,
+name not resolved, credentials refused and timed out, instead of the raw PsExec
+code.
 
 ## Per-user credentials and settings
 

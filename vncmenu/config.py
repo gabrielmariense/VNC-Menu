@@ -23,7 +23,7 @@ PORT = 5900
 APP_NAME = "VNC-Menu"
 
 
-APP_VERSION = "2.0.0"
+APP_VERSION = "2.1.0"
 
 
 APP_AUTHOR = 'Gabriel "GMErebos" Mariense'
@@ -69,6 +69,23 @@ RESTART_TIMEOUT_SECONDS = 25
 # Consultas qwinsta simultaneas. Conservador de proposito: 30 de uma vez
 # contra a mesma rede e bem diferente de 8.
 QWINSTA_MAX_WORKERS = 8
+
+
+# Espera antes de refazer a lista da busca. Cada tecla destroi e recria os
+# widgets do resultado, entao redesenhar a cada tecla trava a digitacao em
+# listas grandes. 150ms nao e percebido como atraso.
+SEARCH_DEBOUNCE_MS = 150
+
+
+# Larguras das colunas de IP/hostname e de setor no resultado da busca. Fixas
+# de proposito: sao elas que mantem enderecos e setores alinhados um embaixo do
+# outro, para conferir contra o chamado. Se o setor variasse de largura, a
+# coluna de IP entortaria a cada linha. O nome fica com a largura que sobrar,
+# entao alargar a janela alarga a coluna do nome, que e a que corta.
+SEARCH_HOST_COLUMN_WIDTH = 150
+
+
+SEARCH_SECTOR_COLUMN_WIDTH = 130
 
 
 VIEWER_ULTRAVNC = "ultravnc"

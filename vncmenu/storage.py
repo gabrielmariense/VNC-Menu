@@ -12,6 +12,7 @@ import copy
 import json
 import os
 import shutil
+import unicodedata
 
 from .config import CREDS_JSON, DATA_DIR, DEFAULT_HOSTS, DEFAULT_SETTINGS, DEFAULT_VIEWER, EMPTY_HOSTS, FALLBACK_SETTINGS_JSON, GLOBAL_PATHS_JSON, HOSTS_SOURCE_CUSTOM, HOSTS_SOURCE_EMPTY, HOSTS_SOURCE_OPTIONS, HOSTS_SOURCE_SHARED, LEGACY_PSEXEC_CONFIG_JSON, LOGIN_MODE_AUTO, LOGIN_MODE_OPTIONS, LOGS_DIR, PORT, REALVNC_DIR, REALVNC_EXE, SETTINGS_JSON, SHARED_HOSTS_JSON, TEMPLATE_VNC, TEMPLATE_VNC_EXAMPLE, ULTRAVNC_EXE, USER_DATA_DIR, USER_HOSTS_JSON, VIEWER_OPTIONS, VIEWER_REALVNC
 from .applog import audit_log, log_exception
@@ -392,6 +393,53 @@ def get_sector_by_name(hosts_data, unit_name, sector_name):
 def get_sector_hosts(hosts_data, unit_name, sector_name):
     sector = get_sector_by_name(hosts_data, unit_name, sector_name)
     return sector.get("hosts", []) if sector else []
+
+
+def normalize_search_text(value) -> str:
+    """Lowercase without accents, so "recepcao" finds "Recepção".
+
+    Support types the machine name the way it appears in the ticket, which
+    rarely carries the accents used in the host list.
+    """
+    text = str(value or "").strip().lower()
+    decomposed = unicodedata.normalize("NFKD", text)
+    return "".join(char for char in decomposed if not unicodedata.combining(char))
+
+
+def filter_unit_hosts(hosts_data, unit_name, query) -> list[tuple[str, dict]]:
+    """Hosts of ONE unit matching the query, paired with their sector name.
+
+    Scoped to a single unit on purpose: each site works inside its own unit,
+    and whoever needs another one switches the unit selector.
+
+    Matches name and host separately rather than against a joined string, so
+    a query cannot straddle the boundary between the two fields. Returns
+    (sector_name, host) in file order, which keeps the result list stable
+    between identical searches. An empty query returns nothing; deciding what
+    "no search" looks like belongs to the caller.
+    """
+    needle = normalize_search_text(query)
+    if not needle:
+        return []
+
+    unit = get_unit_by_name(hosts_data, unit_name)
+    if not unit:
+        return []
+
+    results: list[tuple[str, dict]] = []
+    for sector in unit.get("sectors", []):
+        if not isinstance(sector, dict):
+            continue
+        sector_name = str(sector.get("name") or "Geral")
+        for item in sector.get("hosts", []):
+            if not isinstance(item, dict):
+                continue
+            if (
+                needle in normalize_search_text(item.get("name"))
+                or needle in normalize_search_text(item.get("host"))
+            ):
+                results.append((sector_name, item))
+    return results
 
 
 def load_creds() -> tuple[str, str]:

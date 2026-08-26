@@ -11,6 +11,7 @@ O projeto foi criado para agilizar o acesso a várias máquinas, reduzir tarefas
 ## Funcionalidades
 
 - Organização de hosts por **Unidade > Setor > Host**.
+- Busca de hosts por nome ou IP/hostname dentro da unidade selecionada.
 - Suporte a **UltraVNC** e **RealVNC**, com porta configurável por host.
 - Credenciais UltraVNC por usuário protegidas com **Windows DPAPI**.
 - Preenchimento automático da autenticação UltraVNC, com alternância entre **Login automático** e **Login manual**.
@@ -139,6 +140,22 @@ O botão **Host manual** segue o modo atualmente selecionado:
 - em **Reiniciar**, solicita hostname/IP e confirmação.
 
 Em **Conectar**, o campo aceita porta explícita no formato `HOST::5901`.
+
+### Busca
+
+A barra acima dos botões procura hosts pelo **nome** ou pelo **IP/hostname**, em todos os setores da **unidade selecionada**. Cada resultado mostra o nome, o endereço e o setor a que pertence.
+
+A busca ignora maiúsculas e acentos, então `recepcao` encontra `Recepção`.
+
+Enquanto há uma busca ativa:
+
+- os setores deixam de comandar a lista e aparecem esmaecidos;
+- a área acima da lista mostra `Buscando em: <unidade>`;
+- clicar em um setor, trocar de unidade, pressionar `Esc` ou usar o botão `✕` volta à navegação normal.
+
+O modo selecionado continua valendo: clicar em um resultado conecta ou reinicia, conforme **Conectar** ou **Reiniciar** estiver ativo. O clique com o botão direito abre o mesmo menu de contexto da lista normal.
+
+A busca não é salva. Ao reabrir o aplicativo, a lista volta ao setor selecionado.
 
 ### Menu de contexto
 
@@ -331,7 +348,7 @@ Configurações > PsExec
 
 Vale para todos os usuários do computador (fica em `data\paths.json`). Se o campo ficar vazio, o aplicativo procura o PsExec no `PATH`.
 
-Falhas comuns são traduzidas para uma mensagem legível — host inacessível, nome não resolvido, credenciais recusadas, tempo esgotado — em vez do código bruto do PsExec.
+Falhas comuns são traduzidas para uma mensagem legível, como host inacessível, nome não resolvido, credenciais recusadas e tempo esgotado, em vez do código bruto do PsExec.
 
 ## Credenciais e configurações por usuário
 
