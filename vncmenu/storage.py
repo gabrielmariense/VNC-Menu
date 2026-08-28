@@ -14,7 +14,7 @@ import os
 import shutil
 import unicodedata
 
-from .config import CREDS_JSON, DATA_DIR, DEFAULT_HOSTS, DEFAULT_SETTINGS, DEFAULT_VIEWER, EMPTY_HOSTS, FALLBACK_SETTINGS_JSON, GLOBAL_PATHS_JSON, HOSTS_SOURCE_CUSTOM, HOSTS_SOURCE_EMPTY, HOSTS_SOURCE_OPTIONS, HOSTS_SOURCE_SHARED, LEGACY_PSEXEC_CONFIG_JSON, LOGIN_MODE_AUTO, LOGIN_MODE_OPTIONS, LOGS_DIR, PORT, REALVNC_DIR, REALVNC_EXE, SETTINGS_JSON, SHARED_HOSTS_JSON, TEMPLATE_VNC, TEMPLATE_VNC_EXAMPLE, ULTRAVNC_EXE, USER_DATA_DIR, USER_HOSTS_JSON, VIEWER_OPTIONS, VIEWER_REALVNC
+from .config import CREDS_JSON, DATA_DIR, DEFAULT_HOSTS, DEFAULT_SETTINGS, DEFAULT_VIEWER, EMPTY_HOSTS, FALLBACK_SETTINGS_JSON, GLOBAL_PATHS_JSON, HOSTS_SOURCE_CUSTOM, HOSTS_SOURCE_EMPTY, HOSTS_SOURCE_OPTIONS, HOSTS_SOURCE_SHARED, LEGACY_PSEXEC_CONFIG_JSON, LOGIN_MODE_AUTO, LOGIN_MODE_OPTIONS, LOGS_DIR, OCS_URL, PORT, REALVNC_DIR, REALVNC_EXE, SETTINGS_JSON, SHARED_HOSTS_JSON, TEMPLATE_VNC, TEMPLATE_VNC_EXAMPLE, ULTRAVNC_EXE, USER_DATA_DIR, USER_HOSTS_JSON, VIEWER_OPTIONS, VIEWER_REALVNC
 from .applog import audit_log, log_exception
 from .dpapi import dpapi_decrypt, dpapi_encrypt
 
@@ -97,6 +97,9 @@ def _normalize_global_paths(data: dict | None, legacy_settings: dict | None = No
             or REALVNC_EXE
         ).strip(),
         "psexec_exe": str(psexec_value or "").strip(),
+        # Endereco do console OCS. Vale para a instalacao inteira, como os
+        # viewers e o PsExec; a credencial e que e por usuario.
+        "ocs_url": str(data.get("ocs_url") or OCS_URL).strip(),
     }
 
 
@@ -442,11 +445,34 @@ def filter_unit_hosts(hosts_data, unit_name, query) -> list[tuple[str, dict]]:
     return results
 
 
-def load_creds() -> tuple[str, str]:
+def _read_creds_file() -> dict:
+    """Raw contents of creds.json, or an empty dict."""
     if not CREDS_JSON.exists():
-        return "", ""
+        return {}
     try:
         data = json.loads(CREDS_JSON.read_text(encoding="utf-8"))
+        return data if isinstance(data, dict) else {}
+    except Exception:
+        log_exception()
+        return {}
+
+
+def _write_creds_file(updates: dict) -> None:
+    """Merge into creds.json instead of replacing it.
+
+    The file now holds two independent credentials, UltraVNC and OCS. Writing
+    the whole dict would make saving one erase the other, which the user would
+    only discover the next time the erased one was needed.
+    """
+    data = _read_creds_file()
+    data.update(updates)
+    # Goes through save_json() so the credentials file is written atomically too.
+    save_json(data, CREDS_JSON)
+
+
+def load_creds() -> tuple[str, str]:
+    data = _read_creds_file()
+    try:
         user = data.get("user", "")
         enc_pwd = data.get("password", "")
         pwd = dpapi_decrypt(enc_pwd) if enc_pwd else ""
@@ -457,8 +483,34 @@ def load_creds() -> tuple[str, str]:
 
 
 def save_creds(user: str, pwd: str) -> None:
-    # Goes through save_json() so the credentials file is written atomically too.
-    save_json({"user": user, "password": dpapi_encrypt(pwd)}, CREDS_JSON)
+    _write_creds_file({"user": user, "password": dpapi_encrypt(pwd)})
+
+
+def load_ocs_creds() -> tuple[str, str]:
+    """Credenciais do console OCS, por usuario do Windows, protegidas por DPAPI."""
+    data = _read_creds_file()
+    try:
+        user = data.get("ocs_user", "")
+        enc_pwd = data.get("ocs_password", "")
+        pwd = dpapi_decrypt(enc_pwd) if enc_pwd else ""
+        return user, pwd
+    except Exception:
+        log_exception()
+        return "", ""
+
+
+def save_ocs_creds(user: str, pwd: str) -> None:
+    _write_creds_file({"ocs_user": user, "ocs_password": dpapi_encrypt(pwd)})
+
+
+def load_ocs_url() -> str:
+    return str(load_global_paths().get("ocs_url") or "").strip()
+
+
+def save_ocs_url(url: str) -> bool:
+    paths = load_global_paths()
+    paths["ocs_url"] = str(url or "").strip()
+    return save_global_paths(paths)
 
 
 def _read_settings_file(path: Path) -> dict | None:

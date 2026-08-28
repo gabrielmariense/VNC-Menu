@@ -1276,3 +1276,270 @@ class TestSearchActionSector(VncMenuTestCase):
         signature = inspect.signature(self.app.App.run_host_action)
         self.assertIn("sector", signature.parameters)
         self.assertIsNone(signature.parameters["sector"].default)
+
+
+# ------------------------------------------------------------- changelog
+
+
+class TestChangelogWindow(VncMenuTestCase):
+    def test_window_exists_and_is_wired_to_the_about_button(self):
+        janela = getattr(self.app, "ChangelogWindow", None)
+        self.assertIsNotNone(janela, "ChangelogWindow sumiu de ui/windows.py")
+        for metodo in ("load_async", "show_release", "show_error_state", "set_notes"):
+            self.assertTrue(hasattr(janela, metodo), f"faltou {metodo}")
+        self.assertTrue(hasattr(self.app.AboutWindow, "open_changelog"))
+
+    def test_notes_formatter_supplies_its_own_empty_body_message(self):
+        # A janela NAO trata corpo vazio: quem trata e o formatador. Se este
+        # comportamento mudar, a caixa passaria a abrir em branco.
+        for vazio in ("", None, "   ", "\n\n"):
+            with self.subTest(corpo=vazio):
+                texto = self.app.format_release_notes_for_display(vazio).strip()
+                self.assertTrue(texto, "o formatador devolveu texto vazio")
+                self.assertIn("Nenhuma nota", texto)
+
+    def test_changelog_takes_over_the_modal_grab_from_about(self):
+        # O Sobre e modal. Sem essa troca de grab a janela do changelog abre
+        # atras dele e nao recebe clique nenhum.
+        import inspect
+
+        assinatura = inspect.signature(self.app.ChangelogWindow.__init__)
+        self.assertIn("on_close", assinatura.parameters)
+        self.assertIsNone(assinatura.parameters["on_close"].default)
+        self.assertTrue(hasattr(self.app.AboutWindow, "retake_grab"))
+        # destroy sobrescrito e o que devolve o grab tambem quando fecha no X
+        self.assertIn("destroy", vars(self.app.ChangelogWindow))
+
+    def test_notes_formatter_strips_the_leading_version_heading(self):
+        # A janela ja mostra a versao no topo, entao repetir o titulo dentro da
+        # caixa seria redundante.
+        texto = self.app.format_release_notes_for_display(
+            "## VNC-Menu v2.2.0\n\n### Novidades\n\n- Item de teste\n"
+        )
+        self.assertNotIn("VNC-Menu v2.2.0", texto)
+        self.assertIn("Item de teste", texto)
+
+
+# ------------------------------------------------------------------- OCS
+
+
+def _ocs_row(nome, ip, usuario, lastdate, tag="_HSL", sid="123"):
+    """Linha no formato cru do console: o nome vem embrulhado em <a>."""
+    return {
+        "name": f"<a href='index.php?function=computer&head=1&systemid={sid}'>{nome}</a>",
+        "ipaddr": ip, "userid": usuario, "lastdate": lastdate,
+        "TAG": tag, "userdomain": "CORP",
+    }
+
+
+class TestOcsCleaning(VncMenuTestCase):
+    def test_strips_the_anchor_the_console_wraps_names_in(self):
+        limpar = self.app.clean_text
+        bruto = "<a href='index.php?function=computer&head=1&systemid=45901'>W04-554-045901</a>"
+        self.assertEqual(limpar(bruto), "W04-554-045901")
+
+    def test_unescapes_entities_and_collapses_spaces(self):
+        limpar = self.app.clean_text
+        self.assertEqual(limpar("<b>PC&nbsp;&amp;&nbsp;NOTE</b>"), "PC & NOTE")
+        self.assertEqual(limpar("  W04   554  "), "W04 554")
+
+    def test_empty_values_do_not_blow_up(self):
+        limpar = self.app.clean_text
+        for vazio in (None, "", "   ", "<a></a>"):
+            self.assertEqual(limpar(vazio), "")
+
+    def test_extracts_the_ocs_systemid_from_the_href(self):
+        extrair = self.app.extract_systemid
+        self.assertEqual(extrair("<a href='...&systemid=45901'>X</a>"), "45901")
+        self.assertEqual(extrair("W04-554-045901"), "")
+        self.assertEqual(extrair(None), "")
+
+
+class TestOcsInventoryAge(VncMenuTestCase):
+    def setUp(self):
+        import datetime
+        self.agora = datetime.datetime(2026, 8, 28, 9, 0, 0)
+
+    def test_age_in_days(self):
+        idade = self.app.inventory_age_days
+        self.assertEqual(idade("2026-08-28 08:28:52", self.agora), 0)
+        self.assertEqual(idade("2026-08-27 09:24:39", self.agora), 0)
+        self.assertEqual(idade("2026-07-23 15:52:34", self.agora), 35)
+        self.assertEqual(idade("2025-06-05 16:02:45", self.agora), 448)
+
+    def test_unreadable_dates_return_none_instead_of_guessing(self):
+        idade = self.app.inventory_age_days
+        for ruim in ("", None, "nunca", "28/08/2026"):
+            self.assertIsNone(idade(ruim, self.agora))
+
+    def test_future_dates_clamp_to_zero(self):
+        # Relogio do agente adiantado nao pode virar idade negativa.
+        self.assertEqual(self.app.inventory_age_days("2026-09-30 10:00:00", self.agora), 0)
+
+
+class TestOcsParsing(VncMenuTestCase):
+    def setUp(self):
+        import datetime
+        self.agora = datetime.datetime(2026, 8, 28, 9, 0, 0)
+
+    def test_parses_rows_and_sorts_freshest_first(self):
+        payload = {"recordsFiltered": 3, "data": [
+            _ocs_row("W04-536-014431", "10.0.0.4", "keli.silva", "2026-08-27 21:24:58"),
+            _ocs_row("W04-536-004650", "10.0.0.6", "keli.silva", "2026-08-28 00:33:07"),
+            _ocs_row("W04-536-004707", "10.0.0.14", "keli.silva", "2026-08-27 22:26:25"),
+        ]}
+        r = self.app.parse_search_response(payload, self.agora)
+        self.assertEqual([m["name"] for m in r["machines"]],
+                         ["W04-536-004650", "W04-536-004707", "W04-536-014431"])
+        self.assertFalse(r["truncated"])
+        self.assertEqual(r["total"], 3)
+
+    def test_flags_truncation_instead_of_hiding_it(self):
+        # Pedir 2 e o servidor dizer que existem 340 nao pode virar "achei 2".
+        payload = {"recordsFiltered": 340, "data": [
+            _ocs_row("A", "10.0.0.1", "painel.hsls", "2026-08-28 01:00:00"),
+            _ocs_row("B", "10.0.0.2", "painel.hsls", "2026-08-28 02:00:00"),
+        ]}
+        r = self.app.parse_search_response(payload, self.agora)
+        self.assertTrue(r["truncated"])
+        self.assertEqual(r["total"], 340)
+
+    def test_counts_stale_machines(self):
+        payload = {"recordsFiltered": 3, "data": [
+            _ocs_row("NOVA", "10.0.0.1", "u", "2026-08-28 01:00:00"),
+            _ocs_row("VELHA", "10.0.0.2", "u", "2026-03-05 19:35:15"),
+            _ocs_row("ANTIGA", "10.0.0.3", "u", "2025-06-05 16:02:45"),
+        ]}
+        r = self.app.parse_search_response(payload, self.agora)
+        self.assertEqual(self.app.count_stale(r["machines"]), 2)
+        self.assertFalse(self.app.is_stale(r["machines"][0]))
+        self.assertTrue(self.app.is_stale(r["machines"][-1]))
+
+    def test_machine_without_ip_falls_back_to_its_name(self):
+        # R01-344-CMM01 voltou sem IP no servidor real.
+        payload = {"recordsFiltered": 1,
+                   "data": [_ocs_row("R01-344-CMM01", "", "painel.hsls", "2026-05-06 12:32:24")]}
+        r = self.app.parse_search_response(payload, self.agora)
+        maquina = r["machines"][0]
+        self.assertEqual(maquina["ip"], "")
+        self.assertEqual(self.app.connection_target(maquina), "R01-344-CMM01")
+
+    def test_connection_target_prefers_the_ip(self):
+        alvo = self.app.connection_target
+        self.assertEqual(alvo({"ip": "10.0.0.5", "name": "PC-01"}), "10.0.0.5")
+        self.assertEqual(alvo({"ip": "", "name": "PC-01"}), "PC-01")
+        self.assertEqual(alvo({"ip": "", "name": ""}), "")
+
+    def test_malformed_payloads_raise_instead_of_returning_empty(self):
+        # Uma lista vazia diria "esse usuario nao tem maquina", que e mentira.
+        OcsError = self.app.OcsError
+        for ruim in ({}, {"data": "nao e lista"}, [], None, "texto"):
+            with self.subTest(payload=ruim):
+                with self.assertRaises(OcsError):
+                    self.app.parse_search_response(ruim, self.agora)
+
+    def test_non_dict_rows_are_skipped_not_fatal(self):
+        payload = {"recordsFiltered": 2, "data": [
+            _ocs_row("BOA", "10.0.0.1", "u", "2026-08-28 01:00:00"),
+            "linha estranha",
+        ]}
+        r = self.app.parse_search_response(payload, self.agora)
+        self.assertEqual([m["name"] for m in r["machines"]], ["BOA"])
+
+
+class TestOcsSearchBody(VncMenuTestCase):
+    def test_body_carries_the_term_and_the_csrf_token(self):
+        import urllib.parse
+        corpo = self.app.build_search_body("keli.silva", ("CSRF_8", "a" * 40), 200)
+        campos = dict(urllib.parse.parse_qsl(corpo.decode(), keep_blank_values=True))
+        self.assertEqual(campos["search[value]"], "keli.silva")
+        self.assertEqual(campos["length"], "200")
+        self.assertEqual(campos["CSRF_8"], "a" * 40)
+        # As 41 colunas precisam ir: o PHP indexa parte da consulta por posicao.
+        self.assertEqual(campos["columns[0][data]"], "CHECK")
+        self.assertEqual(campos["columns[5][data]"], "userid")
+        self.assertEqual(campos["columns[28][data]"], "ipaddr")
+        self.assertEqual(campos["columns[40][data]"], "ACTIONS")
+
+    def test_body_is_valid_without_a_token(self):
+        corpo = self.app.build_search_body("x", None, 50)
+        self.assertIn(b"search%5Bvalue%5D=x", corpo)
+
+
+class TestCredentialsMerge(VncMenuTestCase):
+    """creds.json passou a guardar duas credenciais: UltraVNC e OCS.
+
+    DPAPI so existe no Windows, entao aqui o par encrypt/decrypt vira um
+    reversivel simples. O que precisa ser testado e a MESCLAGEM do arquivo,
+    nao a criptografia do sistema.
+    """
+
+    def mesclagem_testavel(self):
+        return (
+            vncmenu_loader.patched_global(self.app, "dpapi_encrypt", lambda v: f"enc:{v}"),
+            vncmenu_loader.patched_global(
+                self.app, "dpapi_decrypt", lambda v: str(v)[4:] if str(v).startswith("enc:") else ""
+            ),
+        )
+
+    def test_saving_one_credential_does_not_erase_the_other(self):
+        # Gravar uma reescrevendo o arquivo inteiro apagaria a outra, e so se
+        # descobriria ao precisar dela.
+        cifrar, decifrar = self.mesclagem_testavel()
+        with cifrar, decifrar:
+            self.app.save_creds("usuario-vnc", "senha-vnc")
+            self.app.save_ocs_creds("usuario-ocs", "senha-ocs")
+
+            self.assertEqual(self.app.load_creds(), ("usuario-vnc", "senha-vnc"))
+            self.assertEqual(self.app.load_ocs_creds(), ("usuario-ocs", "senha-ocs"))
+
+            # E na ordem inversa tambem.
+            self.app.save_creds("outro-vnc", "outra-senha")
+            self.assertEqual(self.app.load_ocs_creds(), ("usuario-ocs", "senha-ocs"))
+            self.assertEqual(self.app.load_creds(), ("outro-vnc", "outra-senha"))
+
+    def test_missing_ocs_credentials_read_as_empty(self):
+        self.assertIsInstance(self.app.load_ocs_creds(), tuple)
+
+
+class TestOcsWindows(VncMenuTestCase):
+    def test_windows_exist_and_are_wired(self):
+        for nome in ("OcsSearchWindow", "OcsConfigWindow"):
+            self.assertTrue(hasattr(self.app, nome), f"{nome} sumiu de ui/windows.py")
+        for metodo in ("open_ocs_search", "open_ocs_config"):
+            self.assertTrue(hasattr(self.app.App, metodo), f"App.{metodo} sumiu")
+        for metodo in ("start_search", "render", "build_row", "format_age"):
+            self.assertTrue(hasattr(self.app.OcsSearchWindow, metodo))
+
+    def test_age_label_is_short_enough_to_sit_beside_the_date(self):
+        # A idade e o que impede alguem de confiar num registro velho, entao
+        # precisa caber sempre, sem empurrar a coluna do nome.
+        rotular = self.app.OcsSearchWindow.format_age
+        self.assertEqual(rotular({"age_days": 0}), "hoje")
+        self.assertEqual(rotular({"age_days": 1}), "1 dia")
+        self.assertEqual(rotular({"age_days": 448}), "448 d")
+        for texto in ("hoje", "1 dia", "448 d"):
+            self.assertLessEqual(len(texto), 6)
+        # Sem idade conhecida nao se inventa nada.
+        self.assertEqual(rotular({"age_days": None}), "")
+        self.assertEqual(rotular({}), "")
+
+    def test_date_label_always_carries_the_year(self):
+        # Um registro de 448 dias mostrado como "05/06" pareceria recente.
+        formatar = self.app.OcsSearchWindow.format_date
+        self.assertEqual(formatar({"lastdate": "2025-06-05 16:02:45"}), "05/06/25 16:02")
+        self.assertEqual(formatar({"lastdate": "2026-08-28 08:28:52"}), "28/08/26 08:28")
+        self.assertEqual(formatar({"lastdate": ""}), "sem data")
+        self.assertEqual(formatar({}), "sem data")
+        # Formato inesperado aparece como veio, em vez de sumir.
+        self.assertEqual(formatar({"lastdate": "28/08/2026"}), "28/08/2026")
+
+    def test_clickable_row_helper_is_shared_not_duplicated(self):
+        # A logica de hover e chata o bastante para nao existir em duas copias.
+        self.assertTrue(hasattr(self.app, "bind_clickable_row"))
+        import inspect
+        parametros = list(inspect.signature(self.app.bind_clickable_row).parameters)
+        self.assertEqual(
+            parametros,
+            ["row", "labels", "on_click", "on_context", "normal_color", "hover_color"],
+        )

@@ -23,7 +23,7 @@ PORT = 5900
 APP_NAME = "VNC-Menu"
 
 
-APP_VERSION = "2.1.0"
+APP_VERSION = "2.3.0"
 
 
 APP_AUTHOR = 'Gabriel "GMErebos" Mariense'
@@ -86,6 +86,60 @@ SEARCH_HOST_COLUMN_WIDTH = 150
 
 
 SEARCH_SECTOR_COLUMN_WIDTH = 130
+
+
+# --- OCS Inventory -------------------------------------------------------
+# Consulta o console web, nao a REST API: a REST esta instalada no servidor
+# mas responde 500. Enquanto isso nao for corrigido, o console e o unico
+# caminho de leitura disponivel.
+
+# Vazio de proposito: cada instalacao aponta para o proprio servidor em
+# Configuracoes > OCS Inventory. Nao existe padrao razoavel para chutar.
+OCS_URL = ""
+
+
+OCS_TIMEOUT_SECONDS = 25
+
+
+# Quantas linhas pedir por busca. Contas de servico (painel.*) devolvem
+# dezenas; o cliente compara com recordsFiltered e avisa se truncou, entao
+# este numero limita o trafego sem esconder resultado.
+OCS_SEARCH_LIMIT = 200
+
+
+# A partir de quantos dias o ultimo inventario e considerado velho. O OCS
+# guarda o usuario da ULTIMA coleta, entao uma linha antiga pode apontar
+# para quem nao usa mais aquela maquina.
+OCS_STALE_DAYS = 30
+
+
+# Larguras das colunas do resultado do OCS. Ficam aqui porque o CABECALHO e as
+# LINHAS precisam usar exatamente os mesmos valores; com numeros soltos nos
+# dois lugares, mexer em um deles desalinha a tabela sem ninguem perceber.
+OCS_COL_IP = 120
+OCS_COL_SESSION = 135
+OCS_COL_DATE = 115
+OCS_COL_AGE = 66
+OCS_COL_TAG = 100
+
+
+# Altura ocupada por UMA linha do resultado: 46 do widget mais 4 de pady em
+# cima e 4 embaixo. Se build_row mudar a altura da linha, mudar aqui junto.
+OCS_ROW_PITCH = 54
+
+
+# Quantas linhas inteiras a janela mostra ao abrir.
+OCS_VISIBLE_ROWS = 5
+
+
+# Altura da janela na abertura. A 520 a lista tinha 220px uteis, ou seja
+# exatamente 4 linhas, e a quinta abria cortada ao meio, o que faz parecer
+# que o resultado terminou ali. 5 linhas pedem 270px, entao +50, mais folga
+# para a ultima nao encostar na borda de baixo.
+OCS_WINDOW_HEIGHT = 580
+
+
+OCS_WINDOW_WIDTH = 960
 
 
 VIEWER_ULTRAVNC = "ultravnc"

@@ -771,18 +771,26 @@ def query_all_logged_users(hosts, max_workers=QWINSTA_MAX_WORKERS):
     minutos com a barra de progresso parada. Os hosts sao independentes,
     entao rodam juntos; pool.map devolve na ordem de entrada.
     """
+    return format_users_output(query_logged_users_raw(hosts, max_workers))
+
+
+def query_logged_users_raw(hosts, max_workers=QWINSTA_MAX_WORKERS):
+    """Mesma consulta, devolvendo os pares (nome, resultado) sem formatar.
+
+    A janela do OCS precisa comparar o usuario de cada maquina, nao exibir um
+    relatorio de texto, entao consome esta versao. format_users_output() fica
+    para quem quer o texto pronto.
+    """
     items = list(hosts)
     if not items:
-        return format_users_output([])
+        return []
 
     workers = max(1, min(int(max_workers), len(items)))
     with ThreadPoolExecutor(
         max_workers=workers,
         thread_name_prefix="VNC-Menu-Qwinsta",
     ) as pool:
-        rows = list(pool.map(_query_logged_user, items))
-
-    return format_users_output(rows)
+        return list(pool.map(_query_logged_user, items))
 
 
 def format_users_output(rows):

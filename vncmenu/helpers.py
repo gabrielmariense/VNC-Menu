@@ -276,3 +276,42 @@ def modal_window(win, parent=None):
                 previous_grab.focus_force()
         except Exception:
             pass
+
+
+def bind_clickable_row(row, labels, on_click, on_context, normal_color, hover_color):
+    """Faz um frame cheio de labels se comportar como uma linha clicavel.
+
+    Usado pela lista da busca de hosts e pela do inventario OCS. Fica aqui
+    porque a parte chata nao e o clique, e o hover: entrar num label filho
+    dispara <Leave> no proprio frame, entao a cor so pode voltar quando o
+    ponteiro tiver saido da linha INTEIRA, nao de um pedaco dela.
+    """
+
+    def enter(_event=None):
+        try:
+            row.configure(fg_color=hover_color)
+        except Exception:
+            pass
+
+    def leave(event=None):
+        try:
+            under = row.winfo_containing(event.x_root, event.y_root) if event else None
+            widget = under
+            while widget is not None:
+                if widget is row:
+                    return
+                widget = getattr(widget, "master", None)
+        except Exception:
+            pass
+        try:
+            row.configure(fg_color=normal_color)
+        except Exception:
+            pass
+
+    for widget in (row, *labels):
+        widget.bind("<Enter>", enter, add="+")
+        widget.bind("<Leave>", leave, add="+")
+        if on_click is not None:
+            widget.bind("<Button-1>", on_click, add="+")
+        if on_context is not None:
+            widget.bind("<Button-3>", on_context, add="+")
