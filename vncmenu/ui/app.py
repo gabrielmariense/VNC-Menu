@@ -21,17 +21,20 @@ from ..config import APP_AUTHOR, APP_NAME, APP_VERSION, COLOR_SCHEME_BLUE, DEFAU
 from ..applog import audit_log, log_exception
 from ..storage import format_host_port, sanitize_port, bootstrap_directories, filter_unit_hosts, find_psexec, get_host_columns, get_hosts_path_for_source, get_sector_hosts, get_sector_names, get_unit_names, hosts_source_display_name, load_global_paths, load_hosts_data, load_settings, normalize_hosts_source, normalize_login_mode, save_settings, set_hosts_source
 from ..theme import FONT_BOLD, FONT_NORMAL, FONT_SMALL, FONT_SMALL_BOLD, FONT_TITLE, THEME, apply_color_theme, normalize_color_scheme
-from ..helpers import get_geometry_size, get_window_geometries, is_valid_geometry, prune_window_geometries, reset_scrollable_frame_position, restore_window_geometry, safe_filename, save_window_geometry, show_error, show_info, show_warning
+from ..helpers import bind_clickable_row, get_geometry_size, get_window_geometries, is_valid_geometry, prune_window_geometries, reset_scrollable_frame_position, restore_window_geometry, safe_filename, save_window_geometry, show_error, show_info, show_warning
 from ..updates import HTTPS_CONTEXT, calculate_sha256, current_main_entry_name, fetch_latest_release, find_release_zip_asset, get_release_asset_checksum, get_updater_launch_command, normalize_release_version, parse_version
 from .dialogs import ask_custom_connection, ask_text, choose_hosts_source_dialog, confirm_action, ensure_hosts_source_selected, shared_hosts_edit_warning, show_psexec_required_dialog
-from ..remote import PsExecQueryError, host_responds_to_ping, launch_vnc, log_psexec_failure, query_all_logged_users, query_remote_printers, restart_host
-from .windows import AboutWindow, CredsWindow, HostUnitsConfigWindow, PrinterProgressWindow, PsExecPathWindow, QwinstaProgressWindow, SettingsWindow, UpdateAvailableWindow, UpdateCheckProgressWindow, UpdateDownloadWindow, ViewerPathsWindow, show_psexec_error_dialog, show_text_window
+from ..remote import PsExecQueryError, format_users_output, host_responds_to_ping, launch_vnc, log_psexec_failure, query_all_logged_users, query_logged_users_raw, query_remote_printers, restart_host
+from .windows import AboutWindow, CredsWindow, OcsConfigWindow, OcsSearchWindow, HostUnitsConfigWindow, PrinterProgressWindow, PsExecPathWindow, QwinstaProgressWindow, SettingsWindow, UpdateAvailableWindow, UpdateCheckProgressWindow, UpdateDownloadWindow, ViewerPathsWindow, show_psexec_error_dialog, show_text_window
 
 class App(ctk.CTk):
     def __init__(self):
         super().__init__()
         self.title("VNC-Menu")
-        self.minsize(900, 560)
+        # 940 e nao 900: a linha de acoes tem 5 botoes (582px) e a 900 o
+        # ultimo saia cortado. Se algum botao entrar ou sair daqui, refazer
+        # a conta: largura = 582 + 36 (janela) + 260 (lateral) + 12 + 44.
+        self.minsize(940, 560)
 
         self.settings = load_settings()
 
@@ -113,12 +116,12 @@ class App(ctk.CTk):
         geometry = get_window_geometries(self.settings).get("main")
         if geometry and is_valid_geometry(str(geometry)):
             width, height = get_geometry_size(str(geometry), 980, 610)
-            return max(900, width), max(560, height)
+            return max(940, width), max(560, height)
 
         raw = str(self.settings.get("main_window_size") or "980x610").lower().strip()
         try:
             width_text, height_text = raw.split("x", 1)
-            width = max(900, int(width_text))
+            width = max(940, int(width_text))
             height = max(560, int(height_text))
             return width, height
         except Exception:
@@ -288,57 +291,73 @@ class App(ctk.CTk):
         top.grid_columnconfigure(0, weight=1)
 
         actions = ctk.CTkFrame(top, fg_color="transparent")
-        actions.grid(row=0, column=0, sticky="e")
+        # sticky="ew" mais colunas de peso igual: os botoes dividem a linha
+        # inteira em vez de ficarem com largura fixa. Assim a linha continua
+        # cheia em qualquer largura de janela, e acrescentar ou remover um
+        # botao no futuro so muda a fatia de cada um, sem cortar nem sobrar.
+        actions.grid(row=0, column=0, sticky="ew")
 
         self.btn_connect = ctk.CTkButton(
             actions,
             font=FONT_BOLD,
             text="Conectar",
-            width=110,
             height=38,
             command=lambda: self.set_mode("connect"),
             text_color=THEME["button_text"],
         )
-        self.btn_connect.pack(side="left", padx=(0, 8))
         self.btn_connect.bind("<Double-Button-1>", lambda _event: self.connect_custom_host())
 
         self.btn_restart = ctk.CTkButton(
             actions,
             font=FONT_BOLD,
             text="Reiniciar",
-            width=110,
             height=38,
             command=lambda: self.set_mode("restart"),
             text_color=THEME["button_text"],
         )
-        self.btn_restart.pack(side="left", padx=(0, 8))
         self.btn_restart.bind("<Double-Button-1>", lambda _event: self.restart_custom_host())
 
         self.btn_users = ctk.CTkButton(
             actions,
             font=FONT_BOLD,
             text="Usuários",
-            width=110,
             height=38,
             command=self.show_qwinsta_users,
             fg_color=THEME["surface_3"],
             hover_color=THEME["accent_soft"],
             text_color=THEME["secondary_button_text"],
         )
-        self.btn_users.pack(side="left", padx=(0, 8))
 
         self.btn_printers = ctk.CTkButton(
             actions,
             font=FONT_BOLD,
             text="Impressoras",
-            width=110,
             height=38,
             command=self.show_remote_printers,
             fg_color=THEME["surface_3"],
             hover_color=THEME["accent_soft"],
             text_color=THEME["secondary_button_text"],
         )
-        self.btn_printers.pack(side="left")
+
+        self.btn_ocs = ctk.CTkButton(
+            actions,
+            font=FONT_BOLD,
+            text="Inventário",
+            height=38,
+            command=self.open_ocs_search,
+            fg_color=THEME["surface_3"],
+            hover_color=THEME["accent_soft"],
+            text_color=THEME["secondary_button_text"],
+        )
+
+        # uniform= amarra as colunas na mesma largura; sem isso o texto mais
+        # longo puxaria a coluna dele e os botoes ficariam desiguais.
+        botoes = (self.btn_connect, self.btn_restart, self.btn_users,
+                  self.btn_printers, self.btn_ocs)
+        for coluna, botao in enumerate(botoes):
+            ultimo = coluna == len(botoes) - 1
+            actions.grid_columnconfigure(coluna, weight=1, uniform="acoes")
+            botao.grid(row=0, column=coluna, sticky="ew", padx=(0, 0 if ultimo else 8))
 
         hint = ctk.CTkFrame(self.main, fg_color=THEME["surface_2"], corner_radius=16)
         hint.grid(row=2, column=0, sticky="ew", padx=22, pady=(0, 16))
@@ -700,39 +719,10 @@ class App(ctk.CTk):
         def on_context(event):
             self.show_host_context_menu(event, host, name, port)
 
-        self.bind_result_row_events(row, (name_label, host_label, sector_label), on_click, on_context)
-
-    def bind_result_row_events(self, row, labels, on_click, on_context):
-        """Make a frame full of labels behave like one clickable row."""
-
-        def enter(_event=None):
-            try:
-                row.configure(fg_color=THEME["accent_soft"])
-            except Exception:
-                pass
-
-        def leave(event=None):
-            # Moving onto a child label fires <Leave> on the row itself, so the
-            # colour must only be restored when the pointer really left the row.
-            try:
-                under = row.winfo_containing(event.x_root, event.y_root) if event else None
-                widget = under
-                while widget is not None:
-                    if widget is row:
-                        return
-                    widget = getattr(widget, "master", None)
-            except Exception:
-                pass
-            try:
-                row.configure(fg_color=THEME["surface_2"])
-            except Exception:
-                pass
-
-        for widget in (row, *labels):
-            widget.bind("<Enter>", enter, add="+")
-            widget.bind("<Leave>", leave, add="+")
-            widget.bind("<Button-1>", on_click, add="+")
-            widget.bind("<Button-3>", on_context, add="+")
+        bind_clickable_row(
+            row, (name_label, host_label, sector_label), on_click, on_context,
+            THEME["surface_2"], THEME["accent_soft"],
+        )
 
     def on_main_unit_changed(self):
         # The search only ever covers one unit. Carrying the query across a unit
@@ -895,6 +885,10 @@ class App(ctk.CTk):
             close_menu()
             self.show_remote_printers(host, display_name)
 
+        def open_sessions():
+            close_menu()
+            self.show_host_sessions(host, display_name)
+
         # Show the configured hostname/IP as the first line so support can
         # quickly confirm the target without opening the hosts configuration.
         menu.add_command(
@@ -909,6 +903,10 @@ class App(ctk.CTk):
             command=open_startup_folder,
         )
         menu.add_command(label="Impressoras", command=open_printers)
+        # Mesma consulta do botao Usuarios, porem em um host so. E o unico
+        # caminho para ver o texto cru do qwinsta de uma maquina especifica,
+        # que e o que diz POR QUE ela aparece como "erro" na busca do OCS.
+        menu.add_command(label="Sessões", command=open_sessions)
 
         # post() leaves the menu active until the user selects an item or clicks
         # elsewhere. Do not destroy it in a finally block.
@@ -1315,6 +1313,13 @@ class App(ctk.CTk):
 
         HostUnitsConfigWindow(self, self.hosts_data, self.on_hosts_saved, self.hosts_path)
 
+    def open_ocs_search(self):
+        """Busca de maquinas por usuario no inventario do OCS."""
+        OcsSearchWindow(self)
+
+    def open_ocs_config(self):
+        OcsConfigWindow(self)
+
     def open_creds(self):
         CredsWindow(self)
 
@@ -1401,6 +1406,69 @@ class App(ctk.CTk):
                     self,
                     f"Usuários logados - {label}",
                     result,
+                    remember_geometry_key=None,
+                )
+
+            self.after(0, finish)
+
+        threading.Thread(target=worker, daemon=True).start()
+
+    def show_host_sessions(self, host, display_name=None):
+        """Consulta as sessoes de UM host e mostra o retorno cru do qwinsta.
+
+        O botao Usuarios so consulta o setor inteiro e a busca do OCS so tem
+        espaco para "erro" na coluna. Aqui a maquina e escolhida a mao e o
+        texto do qwinsta aparece inteiro, que e o que diz se foi acesso
+        negado, nome nao resolvido ou tempo esgotado.
+        """
+        host = str(host or "").strip().lstrip("\\")
+        if not host:
+            return
+        display_name = str(display_name or "").strip()
+        label = display_name or host
+
+        # Uma consulta por host de cada vez. Sem isso, dois cliques seguidos
+        # abrem duas janelas de progresso e duas de resultado para o mesmo
+        # host, e a segunda cobre a primeira.
+        em_andamento = getattr(self, "_session_queries", None)
+        if em_andamento is None:
+            em_andamento = self._session_queries = set()
+        chave = host.casefold()
+        if chave in em_andamento:
+            return
+        em_andamento.add(chave)
+
+        audit_log("HOST_SESSION_QUERY", f"name={display_name or '-'}; host={host}")
+        progress = QwinstaProgressWindow(self, label, 1)
+
+        def worker():
+            try:
+                rows = query_logged_users_raw([{"name": label, "host": host}])
+                error = None
+            except Exception as exc:
+                log_exception(exc)
+                rows, error = [], exc
+
+            def finish():
+                em_andamento.discard(chave)
+                try:
+                    if progress.winfo_exists():
+                        progress.close()
+                except Exception:
+                    pass
+
+                if error is not None:
+                    show_error(
+                        self,
+                        "Sessões",
+                        f"Falha ao consultar as sessões de {label}:\n{error}\n\nLog: {ERROR_LOG}",
+                    )
+                    return
+
+                show_text_window(
+                    self,
+                    f"Sessões - {label}",
+                    format_users_output(rows),
                     remember_geometry_key=None,
                 )
 

@@ -40,6 +40,7 @@ PACKAGE_MODULES = [
     "vncmenu.theme",
     "vncmenu.helpers",
     "vncmenu.updates",
+    "vncmenu.ocs",
     "vncmenu.ui.dialogs",
     "vncmenu.remote",
     "vncmenu.ui.windows",

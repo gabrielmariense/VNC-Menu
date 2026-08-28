@@ -5,22 +5,27 @@ sobre, janelas de progresso e a janela de saida de texto.
 """
 
 from typing import Any
+from datetime import datetime
 from pathlib import Path
 import customtkinter as ctk
 from tkinter import filedialog
 import json
 import os
+import threading
 import tkinter as tk
 import webbrowser
 
-from ..config import APP_AUTHOR, APP_NAME, APP_VERSION, COLOR_SCHEME_BLUE, COLOR_SCHEME_PURPLE, ERROR_LOG, GITHUB_PROFILE_URL, GITHUB_RELEASES_URL, GITHUB_URL, LICENSE_URL, LOGS_DIR, REALVNC_EXE, SHARED_HOSTS_JSON, ULTRAVNC_EXE, VIEWER_REALVNC
+from ..config import APP_AUTHOR, APP_NAME, APP_VERSION, COLOR_SCHEME_BLUE, COLOR_SCHEME_PURPLE, DEFAULT_VIEWER, ERROR_LOG, OCS_COL_AGE, OCS_COL_DATE, OCS_COL_IP, OCS_COL_SESSION, OCS_COL_TAG, OCS_ROW_PITCH, OCS_STALE_DAYS, OCS_VISIBLE_ROWS, OCS_WINDOW_HEIGHT, OCS_WINDOW_WIDTH, GITHUB_PROFILE_URL, GITHUB_RELEASES_URL, GITHUB_URL, LICENSE_URL, LOGS_DIR, REALVNC_EXE, SHARED_HOSTS_JSON, ULTRAVNC_EXE, VIEWER_REALVNC
 from ..applog import audit_log, log_exception
-from ..storage import format_host_port, sanitize_port, get_sector_by_name, get_sector_names, get_unit_by_name, get_unit_names, load_creds, load_global_paths, load_psexec_path, normalize_hosts_data, sanitize_viewer, save_creds, save_global_paths, save_json, save_psexec_path, save_settings, viewer_display_name
+from ..storage import format_host_port, load_ocs_creds, load_ocs_url, sanitize_port, save_ocs_creds, save_ocs_url, get_sector_by_name, get_sector_names, get_unit_by_name, get_unit_names, load_creds, load_global_paths, load_psexec_path, normalize_hosts_data, sanitize_viewer, save_creds, save_global_paths, save_json, save_psexec_path, save_settings, viewer_display_name
 from ..theme import FONT_BOLD, FONT_NORMAL, FONT_SMALL, FONT_SMALL_BOLD, FONT_SUBTITLE, THEME, color_scheme_display_name
-from ..helpers import center_window, fit_dialog_to_content, remember_window_geometry, rename_realvnc_profile, rename_realvnc_profiles_for_sector, safe_filename, save_window_geometry, show_error, show_warning
-from ..updates import format_release_notes_for_display, normalize_release_version
+from ..helpers import bind_clickable_row, center_window, reset_scrollable_frame_position, fit_dialog_to_content, remember_window_geometry, rename_realvnc_profile, rename_realvnc_profiles_for_sector, safe_filename, save_window_geometry, show_error, show_warning
+from ..updates import fetch_latest_release, format_release_notes_for_display, normalize_release_version
 from .dialogs import ModalDialog, ask_host_details, ask_text, confirm_action
-from ..remote import PsExecQueryError
+from ..remote import PsExecQueryError, format_users_output, query_logged_users_raw
+from ..ocs import (OcsError, SESSION_DIFFERENT, SESSION_ERROR, SESSION_NONE, SESSION_OFFLINE,
+                   SESSION_SAME, connection_target, count_stale, format_session, is_stale,
+                   search_machines_by_user, session_status)
 
 def show_text_window(
     parent,
@@ -1492,13 +1497,813 @@ class UpdateAvailableWindow(ctk.CTkToplevel):
         self.destroy()
 
 
+class OcsConfigWindow(ctk.CTkToplevel):
+    """Endereco do console OCS e credencial de acesso.
+
+    O endereco vale para a instalacao inteira (data/paths.json), como os
+    viewers e o PsExec. A credencial e por usuario do Windows e vai protegida
+    por DPAPI no creds.json, junto da do UltraVNC.
+    """
+
+    def __init__(self, parent):
+        super().__init__(parent)
+        self.parent = parent
+        self.title("OCS Inventory")
+        self.geometry("620x420")
+        self.resizable(False, False)
+        self.configure(fg_color=THEME["bg"])
+        self.protocol("WM_DELETE_WINDOW", self.destroy)
+
+        box = ctk.CTkFrame(self, fg_color=THEME["surface"], corner_radius=18)
+        box.pack(fill="both", expand=True, padx=18, pady=18)
+        box.grid_columnconfigure(0, weight=1)
+
+        ctk.CTkLabel(box, text="OCS Inventory", font=FONT_SUBTITLE,
+                     text_color=THEME["text"]).grid(row=0, column=0, sticky="w",
+                                                    padx=18, pady=(18, 4))
+        ctk.CTkLabel(
+            box,
+            text=("Usado para descobrir em quais máquinas um usuário aparece.\n"
+                  "O endereço vale para todos deste computador; a senha é só sua."),
+            font=FONT_NORMAL, text_color=THEME["muted"], justify="left", anchor="w",
+        ).grid(row=1, column=0, sticky="ew", padx=18, pady=(0, 14))
+
+        usuario_salvo, senha_salva = load_ocs_creds()
+        campos = [
+            ("Endereço do servidor", load_ocs_url(), "http://ocs.suaempresa.local", False),
+            ("Usuário do console", usuario_salvo, "usuário do OCS", False),
+            ("Senha", senha_salva, "senha do OCS", True),
+        ]
+        self.entries = []
+        for indice, (rotulo, valor, dica, secreto) in enumerate(campos):
+            ctk.CTkLabel(box, text=rotulo, font=FONT_SMALL_BOLD,
+                         text_color=THEME["muted"]).grid(
+                row=2 + indice * 2, column=0, sticky="w", padx=18, pady=(8, 2))
+            entrada = ctk.CTkEntry(
+                box, height=36, font=FONT_NORMAL, placeholder_text=dica,
+                placeholder_text_color=THEME["muted"], fg_color=THEME["surface_2"],
+                border_color=THEME["border"], text_color=THEME["text"],
+                show="•" if secreto else "",
+            )
+            entrada.grid(row=3 + indice * 2, column=0, sticky="ew", padx=18)
+            if valor:
+                entrada.insert(0, valor)
+            self.entries.append(entrada)
+
+        acoes = ctk.CTkFrame(box, fg_color="transparent")
+        acoes.grid(row=9, column=0, sticky="ew", padx=18, pady=(20, 18))
+        ctk.CTkButton(acoes, font=FONT_BOLD, text="Salvar", width=120, height=38,
+                      command=self.save, fg_color=THEME["accent"],
+                      hover_color=THEME["accent_hover"],
+                      text_color=THEME["button_text"]).pack(side="right")
+        ctk.CTkButton(acoes, font=FONT_BOLD, text="Cancelar", width=110, height=38,
+                      command=self.destroy, fg_color=THEME["surface_3"],
+                      hover_color=THEME["accent_soft"],
+                      text_color=THEME["secondary_button_text"]).pack(side="right", padx=(0, 8))
+
+        center_window(self, 620, 420)
+        self.transient(parent)
+        self.grab_set()
+        self.focus_force()
+
+    def save(self):
+        url = self.entries[0].get().strip()
+        usuario = self.entries[1].get().strip()
+        senha = self.entries[2].get()
+
+        if not save_ocs_url(url):
+            show_error(self, "OCS Inventory",
+                       "Não foi possível salvar o endereço em data\\paths.json.")
+            return
+        try:
+            save_ocs_creds(usuario, senha)
+        except Exception as exc:
+            log_exception(exc)
+            show_error(self, "OCS Inventory",
+                       f"Não foi possível salvar a credencial:\n{exc}")
+            return
+
+        # A senha nunca vai para o log.
+        audit_log("OCS_CONFIG_SAVED", f"url={url}; usuario={usuario}")
+        self.destroy()
+
+
+class OcsSearchWindow(ctk.CTkToplevel):
+    """Em quais maquinas um usuario aparece, segundo o inventario do OCS.
+
+    O dado NAO e ao vivo: o OCS guarda o usuario da ultima coleta do agente.
+    Por isso cada linha mostra a data do inventario e as antigas ficam
+    marcadas. Sem isso alguem tenta conectar numa maquina que nao reporta ha
+    um ano achando que a informacao vale.
+    """
+
+    def __init__(self, parent):
+        super().__init__(parent)
+        self.parent = parent
+        self._buscando = False
+        self._conferindo = False
+        self._maquinas = []
+        self._conferido_em = None
+        # Linhas ja desenhadas e o recuo atual do cabecalho. Ver align_header().
+        self._linhas = []
+        self._header_pad = None
+
+        self.title("Buscar máquinas por usuário")
+        self.configure(fg_color=THEME["bg"])
+        self.resizable(True, True)
+        # 740 e o minimo em que a coluna do nome ainda cabe: as colunas fixas
+        # somam 476px com os espacamentos, e um nome tipo W04-554-045901
+        # precisa de ~180px. Abaixo disso o nome comecava a ser cortado.
+        # Com a coluna da sessao ao vivo as fixas somam ~622px com os
+        # espacamentos, e o nome ainda precisa de ~180px.
+        self.minsize(905, 430)
+        center_window(self, OCS_WINDOW_WIDTH, OCS_WINDOW_HEIGHT)
+        self.protocol("WM_DELETE_WINDOW", self.destroy)
+
+        outer = ctk.CTkFrame(self, fg_color=THEME["surface"], corner_radius=20)
+        outer.pack(fill="both", expand=True, padx=14, pady=14)
+        self.corpo = outer
+
+        ctk.CTkLabel(outer, text="Buscar máquinas por usuário",
+                     font=("Segoe UI", 20, "bold"),
+                     text_color=THEME["text"]).pack(anchor="w", padx=20, pady=(18, 2))
+        ctk.CTkLabel(
+            outer,
+            text="Inventário do OCS, de toda a empresa. Não é a sessão atual da máquina.",
+            font=FONT_NORMAL, text_color=THEME["muted"],
+        ).pack(anchor="w", padx=20, pady=(0, 12))
+
+        linha = ctk.CTkFrame(outer, fg_color="transparent")
+        linha.pack(fill="x", padx=20, pady=(0, 10))
+        linha.grid_columnconfigure(0, weight=1)
+
+        self.entry = ctk.CTkEntry(
+            linha, height=38, font=FONT_NORMAL,
+            placeholder_text="nome de usuário, por exemplo nome.sobrenome",
+            placeholder_text_color=THEME["muted"], fg_color=THEME["surface_2"],
+            border_color=THEME["border"], text_color=THEME["text"],
+        )
+        self.entry.grid(row=0, column=0, sticky="ew")
+        self.entry.bind("<Return>", lambda _e: self.start_search())
+
+        self.btn = ctk.CTkButton(
+            linha, font=FONT_BOLD, text="Buscar", width=110, height=38,
+            command=self.start_search, fg_color=THEME["accent"],
+            hover_color=THEME["accent_hover"], text_color=THEME["button_text"])
+        self.btn.grid(row=0, column=1, padx=(8, 0))
+
+        self.status = ctk.CTkLabel(outer, text="", font=FONT_SMALL,
+                                   text_color=THEME["muted"], anchor="w", justify="left")
+        self.status.pack(fill="x", padx=20, pady=(0, 8))
+
+        # O rodape e empacotado ANTES da lista, com side="bottom". No pack do
+        # Tk quem tem expand=True fica com o espaco que sobra, e ao encolher a
+        # janela os widgets empacotados DEPOIS dele sao os primeiros a sumir.
+        # Era por isso que os botoes desapareciam ao reduzir a janela. Reservar
+        # a faixa de baixo primeiro garante que eles fiquem sempre visiveis e
+        # que quem encolhe e a lista, que ja tem rolagem.
+        rodape = ctk.CTkFrame(outer, fg_color="transparent")
+        rodape.pack(side="bottom", fill="x", padx=20, pady=(0, 18))
+        ctk.CTkButton(rodape, font=FONT_BOLD, text="Fechar", width=110, height=38,
+                      command=self.destroy, fg_color=THEME["accent"],
+                      hover_color=THEME["accent_hover"],
+                      text_color=THEME["button_text"]).pack(side="right")
+        ctk.CTkButton(rodape, font=FONT_BOLD, text="Configurar OCS", width=150, height=38,
+                      command=self.open_config, fg_color=THEME["surface_3"],
+                      hover_color=THEME["accent_soft"],
+                      text_color=THEME["secondary_button_text"]).pack(side="left")
+
+        # Sob demanda, nao automatico: sao um ping e um qwinsta por maquina,
+        # e disparar isso a cada busca castigaria a rede sem necessidade.
+        self.btn_conferir = ctk.CTkButton(
+            rodape, font=FONT_BOLD, text="Confirmar sessões", width=170, height=38,
+            command=self.start_session_check, fg_color=THEME["surface_3"],
+            hover_color=THEME["accent_soft"], text_color=THEME["secondary_button_text"])
+        self.btn_conferir.pack(side="left", padx=(8, 0))
+        self.btn_conferir.configure(state="disabled")
+
+        # Sem isto, a coluna vazia da sessao e ambigua entre "ninguem logado"
+        # e "ninguem conferiu ainda", que sao coisas bem diferentes.
+        self.sessao_label = ctk.CTkLabel(rodape, text="", font=FONT_SMALL,
+                                         text_color=THEME["muted"], anchor="w")
+        self.sessao_label.pack(side="left", padx=(12, 0))
+
+        self.btn_detalhes = ctk.CTkButton(
+            rodape, font=FONT_BOLD, text="Detalhes", width=100, height=38,
+            command=self.show_session_details, fg_color=THEME["surface_3"],
+            hover_color=THEME["accent_soft"], text_color=THEME["secondary_button_text"])
+
+        # Cabecalho fora da area rolavel, para nao subir junto com as linhas.
+        # Usa as MESMAS constantes de largura que build_row, senao desalinha.
+        # O recuo lateral inicial e so um chute razoavel: quem acerta a coluna
+        # e align_header(), depois que existe uma linha para medir.
+        cabecalho = ctk.CTkFrame(outer, fg_color="transparent", height=22)
+        cabecalho.pack(fill="x", padx=28, pady=(0, 2))
+        cabecalho.pack_propagate(False)
+        self.cabecalho = cabecalho
+
+        def coluna(texto, largura, lado="right", pad=(8, 8)):
+            ctk.CTkLabel(cabecalho, text=texto, font=FONT_SMALL_BOLD,
+                         text_color=THEME["muted"], width=largura,
+                         anchor="w").pack(side=lado, padx=pad)
+
+        coluna("UNIDADE", OCS_COL_TAG, pad=(8, 14))
+        coluna("IDADE", OCS_COL_AGE)
+        coluna("ÚLTIMO INVENTÁRIO", OCS_COL_DATE)
+        coluna("LOGADO AGORA", OCS_COL_SESSION)
+        coluna("IP", OCS_COL_IP)
+        ctk.CTkLabel(cabecalho, text="MÁQUINA", font=FONT_SMALL_BOLD,
+                     text_color=THEME["muted"], anchor="w").pack(
+            side="left", fill="x", expand=True, padx=(14, 8))
+
+        self.lista = ctk.CTkScrollableFrame(outer, fg_color=THEME["bg"], corner_radius=16)
+        self.lista.pack(fill="both", expand=True, padx=20, pady=(0, 14))
+        # Redimensionar a janela pode fazer a barra de rolagem aparecer ou
+        # sumir, e isso sozinho ja move a borda direita das linhas.
+        self.lista.bind("<Configure>", lambda _e: self.align_header())
+
+        self.transient(parent)
+        self.after(120, self.entry.focus_set)
+        self.show_message("Digite um usuário e clique em Buscar.")
+
+    # ------------------------------------------------------------------ ui
+
+    def clear_list(self):
+        for filho in self.lista.winfo_children():
+            filho.destroy()
+        self._linhas = []
+
+    def align_header(self):
+        """Encosta o cabecalho nas linhas, medindo uma linha de verdade.
+
+        As linhas ficam dentro do CTkScrollableFrame, que tem recuo proprio e
+        ainda perde largura para a barra de rolagem quando ela aparece; o
+        cabecalho fica fora dele. Somar esses recuos na mao nao resolve: o
+        recuo interno e detalhe privado do customtkinter, que nao esta preso a
+        uma versao no requirements.txt, e a barra de rolagem desalinharia
+        mesmo com o numero certo, porque aparece e some conforme o resultado.
+        Medir a linha cobre os dois casos e nao depende de versao.
+        """
+        if not self._linhas:
+            return
+        referencia = self._linhas[0]
+        try:
+            if not (referencia.winfo_exists() and self.corpo.winfo_exists()):
+                return
+            self.update_idletasks()
+            base_x = self.corpo.winfo_rootx()
+            base_w = self.corpo.winfo_width()
+            linha_x = referencia.winfo_rootx()
+            linha_w = referencia.winfo_width()
+        except tk.TclError:
+            return
+
+        esquerda = linha_x - base_x
+        direita = (base_x + base_w) - (linha_x + linha_w)
+        # Janela ainda nao desenhada: as medidas vem como 1x1 e produziriam um
+        # recuo negativo, que o Tk recusa.
+        if esquerda < 0 or direita < 0:
+            return
+
+        novo = (esquerda, direita)
+        if novo == self._header_pad:
+            return
+        self._header_pad = novo
+        try:
+            self.cabecalho.pack_configure(padx=novo)
+        except tk.TclError:
+            pass
+
+    def show_message(self, texto, cor=None):
+        self.clear_list()
+        ctk.CTkLabel(self.lista, text=texto, font=FONT_NORMAL,
+                     text_color=cor or THEME["muted"], justify="left",
+                     anchor="w", wraplength=760).pack(anchor="w", padx=16, pady=16)
+
+    def open_config(self):
+        # Mesma troca de grab do Sobre: sem soltar, a filha abriria atras.
+        try:
+            self.grab_release()
+        except Exception:
+            pass
+        OcsConfigWindow(self)
+
+    # --------------------------------------------------------------- busca
+
+    def start_search(self):
+        if self._buscando:
+            return
+        termo = self.entry.get().strip()
+        if not termo:
+            self.show_message("Digite um nome de usuário para buscar.")
+            return
+
+        url = load_ocs_url()
+        usuario, senha = load_ocs_creds()
+        if not url or not usuario:
+            self.show_message(
+                "O OCS ainda não está configurado.\n\n"
+                "Clique em Configurar OCS e informe o endereço do servidor "
+                "e a sua credencial do console.",
+                THEME["warning_hover"],
+            )
+            return
+
+        # Busca nova invalida a conferencia anterior: manter "verificadas as
+        # 14:32" ao lado de resultados de OUTRA pessoa seria mentira.
+        self._conferido_em = None
+        self._maquinas = []
+        self.update_session_label()
+
+        self._buscando = True
+        self.btn.configure(state="disabled", text="Buscando...")
+        self.status.configure(text="")
+        self.show_message(f"Consultando o OCS por {termo}...")
+
+        def worker():
+            try:
+                resultado = search_machines_by_user(url, usuario, senha, termo)
+                erro = None
+            except OcsError as exc:
+                resultado, erro = None, exc
+            except Exception as exc:
+                log_exception(exc)
+                resultado, erro = None, OcsError(f"Falha inesperada ao consultar o OCS:\n{exc}")
+
+            def finish():
+                self._buscando = False
+                try:
+                    self.btn.configure(state="normal", text="Buscar")
+                except tk.TclError:
+                    # A janela foi fechada enquanto a consulta corria.
+                    return
+                if erro is not None:
+                    self.show_message(str(erro), THEME["warning_hover"])
+                    self.status.configure(text="")
+                    return
+                self.render(termo, resultado or {})
+
+            try:
+                self.after(0, finish)
+            except tk.TclError:
+                pass
+
+        threading.Thread(target=worker, name="VNC-Menu-OCS", daemon=True).start()
+
+    def render(self, termo, resultado):
+        maquinas = resultado.get("machines") or []
+        self._maquinas = maquinas
+        self._resultado = resultado
+        self._termo = termo
+        self.update_session_label()
+        try:
+            self.btn_conferir.configure(state="normal" if maquinas else "disabled")
+        except tk.TclError:
+            pass
+        self.clear_list()
+
+        if not maquinas:
+            self.show_message(
+                f'Nenhuma máquina encontrada para "{termo}".\n\n'
+                "O OCS registra o usuário da última coleta do agente, então "
+                "quem nunca fez login numa máquina inventariada não aparece."
+            )
+            self.status.configure(text="")
+            return
+
+        antigas = count_stale(maquinas)
+        partes = [f"{len(maquinas)} máquina(s)"]
+        if antigas:
+            partes.append(f"{antigas} com inventário de mais de {OCS_STALE_DAYS} dias")
+        if resultado.get("truncated"):
+            partes.append(
+                f"mostrando só as primeiras de {resultado.get('total')}, refine a busca"
+            )
+
+        divergentes = sum(1 for m in maquinas if m.get("session_status") == SESSION_DIFFERENT)
+        confirmadas = sum(1 for m in maquinas if m.get("session_status") == SESSION_SAME)
+        if confirmadas:
+            partes.append(f"{confirmadas} confirmada(s) agora")
+        if divergentes:
+            partes.append(f"{divergentes} com OUTRO usuário logado agora")
+        naoverificadas = sum(
+            1 for m in maquinas
+            if m.get("session_status") in (SESSION_ERROR, SESSION_OFFLINE)
+        )
+        if naoverificadas:
+            partes.append(f"{naoverificadas} não foi possível verificar")
+        self.status.configure(text="   ·   ".join(partes))
+
+        for maquina in maquinas:
+            self.build_row(maquina)
+
+        # A lista anterior podia estar rolada; sem isto uma busca com poucos
+        # resultados abre fora da area visivel e parece vazia.
+        reset_scrollable_frame_position(self.lista)
+
+        # Duas vezes de proposito. A primeira acerta o caso comum; a segunda
+        # cobre a barra de rolagem, que o customtkinter mostra ou esconde num
+        # callback proprio, depois que este metodo ja voltou. align_header()
+        # so mexe no layout quando o valor muda, entao a segunda chamada nao
+        # custa nada quando a primeira ja acertou.
+        self.align_header()
+        self.after(60, self.align_header)
+
+    def update_session_label(self):
+        try:
+            if self._conferido_em is None:
+                self.sessao_label.configure(text="Sessões sem confirmação",
+                                            text_color=THEME["muted"])
+                self.btn_detalhes.pack_forget()
+                return
+            self.sessao_label.configure(
+                text=f"Sessões verificadas em {self._conferido_em.strftime('%d/%m/%y %H:%M')}",
+                text_color=THEME["muted"])
+            if any(m.get("session_status") in (SESSION_ERROR, SESSION_OFFLINE)
+                   for m in self._maquinas):
+                self.btn_detalhes.pack(side="left", padx=(8, 0))
+            else:
+                self.btn_detalhes.pack_forget()
+        except tk.TclError:
+            pass
+
+    def show_session_details(self):
+        """Mostra o texto CRU que o qwinsta devolveu para cada maquina.
+
+        A coluna so cabe "erro". O motivo real, que e o que permite agir,
+        aparece aqui: acesso negado, nome nao resolvido, tempo esgotado.
+        Reaproveita o mesmo formatador da tela de Usuarios.
+        """
+        linhas = [
+            (m.get("name") or "?", m.get("session_live") or "(não verificado)")
+            for m in self._maquinas
+        ]
+        show_text_window(self, "Detalhe das sessões", format_users_output(linhas),
+                         remember_geometry_key=None)
+
+    def start_session_check(self):
+        """Roda ping + qwinsta nas maquinas achadas para saber quem esta nelas agora.
+
+        O OCS so sabe quem estava logado na ULTIMA coleta do agente, que pode
+        ser de meses atras. Esta conferencia e o que transforma um palpite
+        velho numa resposta de agora.
+        """
+        if self._conferindo or not self._maquinas:
+            return
+
+        alvos = [
+            {"name": m.get("name") or "?", "host": connection_target(m)}
+            for m in self._maquinas
+        ]
+
+        self._conferindo = True
+        self.btn_conferir.configure(state="disabled", text="Confirmando...")
+
+        def worker():
+            try:
+                linhas = query_logged_users_raw(alvos)
+                erro = None
+            except Exception as exc:
+                log_exception(exc)
+                linhas, erro = [], exc
+
+            def finish():
+                self._conferindo = False
+                try:
+                    self.btn_conferir.configure(state="normal", text="Confirmar sessões")
+                except tk.TclError:
+                    return
+                if erro is not None:
+                    show_error(self, "Confirmar sessões",
+                               f"Falha ao consultar as sessões:\n{erro}")
+                    return
+                # pool.map preserva a ordem de entrada, entao zip alinha certo.
+                for maquina, (_nome, resultado) in zip(self._maquinas, linhas):
+                    maquina["session_live"] = resultado
+                    maquina["session_status"] = session_status(maquina.get("user"), resultado)
+                self._conferido_em = datetime.now()
+                audit_log(
+                    "OCS_SESSION_CHECK",
+                    f"maquinas={len(self._maquinas)}; "
+                    f"divergentes={sum(1 for m in self._maquinas if m.get('session_status') == SESSION_DIFFERENT)}",
+                )
+                self.render(getattr(self, "_termo", ""), getattr(self, "_resultado", {}))
+
+            try:
+                self.after(0, finish)
+            except tk.TclError:
+                pass
+
+        threading.Thread(target=worker, name="VNC-Menu-OCS-Sessao", daemon=True).start()
+
+    def session_color(self, estado):
+        if estado == SESSION_DIFFERENT:
+            return THEME["accent_hover"]
+        if estado == SESSION_ERROR:
+            return THEME["warning_hover"]
+        return THEME["muted"]
+
+    def build_row(self, maquina):
+        velha = is_stale(maquina)
+        nome = maquina.get("name") or "?"
+        alvo = connection_target(maquina)
+
+        row = ctk.CTkFrame(self.lista, fg_color=THEME["surface_2"],
+                           corner_radius=12, height=46)
+        row.pack(fill="x", padx=8, pady=4)
+        row.pack_propagate(False)
+        # align_header() mede a primeira linha para achar o recuo do cabecalho.
+        self._linhas.append(row)
+
+        tag = ctk.CTkLabel(
+            row, text=(maquina.get("tag") or "-")[:12], font=FONT_SMALL_BOLD,
+            text_color=THEME["secondary_button_text"], fg_color=THEME["surface_3"],
+            corner_radius=999, width=OCS_COL_TAG, anchor="center")
+        tag.pack(side="right", padx=(8, 14), pady=8)
+
+        # Idade separada da data: e ela que impede alguem de confiar num
+        # registro de um ano atras, entao fica curta e sempre visivel.
+        idade = ctk.CTkLabel(
+            row, text=self.format_age(maquina), font=("Segoe UI", 12, "bold"),
+            text_color=THEME["warning_hover"] if velha else THEME["muted"],
+            width=OCS_COL_AGE, anchor="w")
+        idade.pack(side="right", padx=(8, 8))
+
+        data = ctk.CTkLabel(
+            row, text=self.format_date(maquina), font=("Segoe UI", 12),
+            text_color=THEME["warning_hover"] if velha else THEME["muted"],
+            width=OCS_COL_DATE, anchor="w")
+        data.pack(side="right", padx=(8, 8))
+
+        estado = maquina.get("session_status")
+        sessao = ctk.CTkLabel(
+            row, text=format_session(maquina.get("session_live")),
+            font=("Segoe UI", 12, "bold") if estado == SESSION_DIFFERENT else ("Segoe UI", 12),
+            text_color=self.session_color(estado), width=OCS_COL_SESSION, anchor="w")
+        sessao.pack(side="right", padx=(8, 8))
+
+        endereco = ctk.CTkLabel(row, text=(maquina.get("ip") or "sem IP"),
+                                font=("Segoe UI", 12), text_color=THEME["muted"],
+                                width=OCS_COL_IP, anchor="w")
+        endereco.pack(side="right", padx=(8, 8))
+
+        etiqueta = ctk.CTkLabel(
+            row, text=nome if len(nome) <= 40 else nome[:39] + "…",
+            font=("Segoe UI", 13, "bold"),
+            text_color=THEME["muted"] if velha else THEME["text"], anchor="w")
+        etiqueta.pack(side="left", fill="x", expand=True, padx=(14, 8))
+
+        def clicar(_event=None):
+            if not alvo:
+                show_warning(self, "OCS", f'"{nome}" não tem IP nem nome utilizável.')
+                return
+            # sector="" de proposito: estas maquinas nao estao no hosts.json,
+            # entao nao existe perfil RealVNC <Setor>_<Nome>.vnc para elas.
+            self.parent.run_host_action(nome, alvo, DEFAULT_VIEWER, None, sector="")
+
+        def menu(event):
+            if alvo:
+                self.parent.show_host_context_menu(event, alvo, nome, None)
+
+        bind_clickable_row(row, (etiqueta, endereco, sessao, data, idade, tag), clicar, menu,
+                           THEME["surface_2"], THEME["accent_soft"])
+
+    @staticmethod
+    def format_date(maquina):
+        """Data curta, sempre com ano: um registro de 448 dias sem ano engana."""
+        bruto = str(maquina.get("lastdate") or "").strip()
+        if not bruto:
+            return "sem data"
+        try:
+            quando = datetime.strptime(bruto, "%Y-%m-%d %H:%M:%S")
+        except ValueError:
+            return bruto[:16]
+        return quando.strftime("%d/%m/%y %H:%M")
+
+    @staticmethod
+    def format_age(maquina):
+        """Idade curta, para caber ao lado da data sem empurrar o nome."""
+        idade = maquina.get("age_days")
+        if not isinstance(idade, int):
+            return ""
+        if idade == 0:
+            return "hoje"
+        if idade == 1:
+            return "1 dia"
+        return f"{idade} d"
+
+
+class ChangelogWindow(ctk.CTkToplevel):
+    """Notas da ultima versao publicada, dentro do aplicativo.
+
+    Existe porque a janela de atualizacao so aparece quando HA atualizacao:
+    depois de instalar, nao ha mais como reler o que mudou. Reaproveita o
+    mesmo formatador e o mesmo estilo de caixa de texto usados la.
+
+    A consulta ao GitHub roda em thread separada. A janela abre na hora, em
+    estado de carregando, para nao travar a interface enquanto a rede
+    responde.
+    """
+
+    def __init__(self, parent, on_close=None):
+        super().__init__(parent)
+        self.parent = parent
+        self._on_close = on_close
+
+        self.title("Changelog")
+        self.configure(fg_color=THEME["bg"])
+        self.resizable(True, True)
+        self.minsize(520, 380)
+        center_window(self, 660, 470)
+        self.protocol("WM_DELETE_WINDOW", self.destroy)
+
+        outer = ctk.CTkFrame(self, fg_color=THEME["surface"], corner_radius=20)
+        outer.pack(fill="both", expand=True, padx=14, pady=14)
+
+        header = ctk.CTkFrame(outer, fg_color="transparent")
+        header.pack(fill="x", padx=20, pady=(18, 12))
+
+        ctk.CTkLabel(
+            header,
+            text="Changelog",
+            font=("Segoe UI", 20, "bold"),
+            text_color=THEME["text"],
+        ).pack(anchor="w")
+
+        self.subtitle = ctk.CTkLabel(
+            header,
+            text=f"Versão instalada: {APP_VERSION}",
+            font=FONT_NORMAL,
+            text_color=THEME["muted"],
+        )
+        self.subtitle.pack(anchor="w", pady=(4, 0))
+
+        notes_header = ctk.CTkFrame(outer, fg_color="transparent")
+        notes_header.pack(fill="x", padx=20, pady=(0, 7))
+
+        ctk.CTkLabel(
+            notes_header,
+            text="Notas da versão",
+            font=FONT_BOLD,
+            text_color=THEME["text"],
+        ).pack(side="left")
+
+        self.release_label = ctk.CTkLabel(
+            notes_header,
+            text="",
+            font=FONT_SMALL,
+            text_color=THEME["muted"],
+        )
+        self.release_label.pack(side="right")
+
+        # Mesmo estilo da caixa da janela de atualizacao, de proposito.
+        self.notes_box = ctk.CTkTextbox(
+            outer,
+            font=("Segoe UI", 12),
+            fg_color=THEME["bg"],
+            text_color=THEME["text"],
+            border_width=1,
+            border_color=THEME["border"],
+            corner_radius=13,
+            wrap="word",
+            spacing1=3,
+            spacing3=3,
+        )
+        self.notes_box.pack(fill="both", expand=True, padx=20, pady=(0, 14))
+        self.set_notes("Carregando as notas da última versão...")
+
+        footer = ctk.CTkFrame(outer, fg_color="transparent")
+        footer.pack(fill="x", padx=20, pady=(0, 18))
+
+        self.retry_button = ctk.CTkButton(
+            footer,
+            font=FONT_BOLD,
+            text="Tentar de novo",
+            width=145,
+            height=38,
+            command=self.load_async,
+            fg_color=THEME["surface_3"],
+            hover_color=THEME["accent_soft"],
+            text_color=THEME["secondary_button_text"],
+        )
+        # So aparece se a consulta falhar.
+        self.retry_button.pack_forget()
+
+        ctk.CTkButton(
+            footer,
+            font=FONT_BOLD,
+            text="Fechar",
+            width=110,
+            height=38,
+            command=self.destroy,
+            fg_color=THEME["accent"],
+            hover_color=THEME["accent_hover"],
+            text_color=THEME["button_text"],
+        ).pack(side="right")
+
+        # Quem abre esta janela e o Sobre, que e modal (grab_set). Sem tomar o
+        # grab aqui, esta janela aparece ATRAS do Sobre e nao aceita clique
+        # nenhum. O Sobre solta o grab antes de abrir e retoma no on_close.
+        self.transient(parent)
+        self.grab_set()
+        self.lift()
+        self.focus_force()
+
+        self.load_async()
+
+    def destroy(self):
+        """Avisa quem abriu, uma unica vez, mesmo se fechar pelo X."""
+        callback = self._on_close
+        self._on_close = None
+        try:
+            super().destroy()
+        finally:
+            if callback is not None:
+                try:
+                    callback()
+                except Exception:
+                    pass
+
+    def set_notes(self, texto: str):
+        """Troca o conteudo da caixa, que fica sempre somente leitura."""
+        try:
+            self.notes_box.configure(state="normal")
+            self.notes_box.delete("1.0", "end")
+            self.notes_box.insert("1.0", texto)
+            self.notes_box.configure(state="disabled")
+        except tk.TclError:
+            # A janela foi fechada no meio da atualizacao do texto.
+            pass
+
+    def load_async(self):
+        self.retry_button.pack_forget()
+        self.set_notes("Carregando as notas da última versão...")
+
+        def worker():
+            try:
+                release = fetch_latest_release()
+                erro = None
+            except Exception as exc:
+                release = None
+                erro = exc
+
+            def finish():
+                if erro is not None:
+                    log_exception(erro)
+                    self.show_error_state(erro)
+                    return
+                self.show_release(release or {})
+
+            # after() so vale enquanto a janela existir.
+            try:
+                self.after(0, finish)
+            except tk.TclError:
+                pass
+
+        threading.Thread(target=worker, name="VNC-Menu-Changelog", daemon=True).start()
+
+    def show_release(self, release: dict):
+        versao = normalize_release_version(str(release.get("tag_name") or ""))
+        nome = str(release.get("name") or "").strip()
+        corpo = format_release_notes_for_display(str(release.get("body") or "")).strip()
+
+        try:
+            if versao:
+                self.subtitle.configure(
+                    text=f"Versão instalada: {APP_VERSION}    ·    Última publicada: {versao}"
+                )
+            self.release_label.configure(text=nome or (f"v{versao}" if versao else ""))
+        except tk.TclError:
+            return
+
+        # Sem tratamento de corpo vazio aqui: format_release_notes_for_display()
+        # ja devolve a propria mensagem quando a release nao tem notas, e e a
+        # mesma que a janela de atualizacao mostra.
+        self.set_notes(corpo)
+        audit_log("CHANGELOG_VIEWED", f"versao_publicada={versao or '-'}")
+
+    def show_error_state(self, erro: Exception):
+        self.set_notes(
+            "Não foi possível carregar as notas da última versão.\n\n"
+            f"{erro}\n\n"
+            "Verifique a conexão com a internet. Se a rede exigir proxy, o "
+            "acesso ao GitHub precisa estar liberado.\n\n"
+            f"O histórico também fica em:\n{GITHUB_RELEASES_URL}"
+        )
+        try:
+            self.retry_button.pack(side="left")
+        except tk.TclError:
+            pass
+
+
 class AboutWindow(ctk.CTkToplevel):
     def __init__(self, parent):
         super().__init__(parent)
         self.parent = parent
 
         self.title(f"Sobre o {APP_NAME}")
-        self.geometry("610x430")
+        # 680 e nao 610: a linha de botoes ganhou o Changelog e nao cabia mais.
+        self.geometry("680x430")
         self.resizable(False, False)
         self.configure(fg_color=THEME["bg"])
 
@@ -1622,6 +2427,18 @@ class AboutWindow(ctk.CTkToplevel):
         ctk.CTkButton(
             buttons,
             font=FONT_BOLD,
+            text="Changelog",
+            width=130,
+            height=38,
+            command=self.open_changelog,
+            fg_color=THEME["surface_3"],
+            hover_color=THEME["accent_soft"],
+            text_color=THEME["secondary_button_text"],
+        ).pack(side="left", padx=(8, 0))
+
+        ctk.CTkButton(
+            buttons,
+            font=FONT_BOLD,
             text="Pasta de logs",
             width=145,
             height=38,
@@ -1650,7 +2467,7 @@ class AboutWindow(ctk.CTkToplevel):
             text_color=THEME["muted"],
         ).pack(anchor="center", pady=(0, 14))
 
-        center_window(self, 610, 430)
+        center_window(self, 680, 430)
 
         self.transient(parent)
         self.grab_set()
@@ -1663,6 +2480,32 @@ class AboutWindow(ctk.CTkToplevel):
             pass
         self.destroy()
         self.parent.after(80, lambda: self.parent.check_for_updates(manual=True))
+
+    def open_changelog(self):
+        """Abre as notas da ultima versao dentro do aplicativo.
+
+        O Sobre e modal. Se ele mantiver o grab, a janela do changelog abre
+        atras dele e fica sem receber clique, sem jeito de trazer para frente.
+        Entao o grab e passado adiante e retomado quando a filha fecha, o que
+        deixa o Sobre aberto e utilizavel de novo em vez de fecha-lo.
+        """
+        try:
+            self.grab_release()
+        except Exception:
+            pass
+        ChangelogWindow(self, on_close=self.retake_grab)
+
+    def retake_grab(self):
+        """Devolve a modalidade ao Sobre depois que o changelog fecha."""
+        try:
+            if self.winfo_exists():
+                self.grab_set()
+                self.lift()
+                self.focus_force()
+        except Exception:
+            # O proprio Sobre pode ter sido fechado enquanto o changelog
+            # estava aberto. Nesse caso nao ha grab para devolver.
+            pass
 
     def open_url(self, url: str):
         try:
@@ -1749,7 +2592,8 @@ class SettingsWindow(ctk.CTkToplevel):
 
         paths = self._section(content, "CAMINHOS")
         self._nav_button(paths, "Viewers VNC", self.parent.open_viewer_paths)
-        self._nav_button(paths, "PsExec", self.parent.open_psexec_path, last=True)
+        self._nav_button(paths, "PsExec", self.parent.open_psexec_path)
+        self._nav_button(paths, "OCS Inventory", self.parent.open_ocs_config, last=True)
 
         appearance = self._section(content, "APARÊNCIA")
         self.dark_var = tk.BooleanVar(value=bool(self.parent.dark_mode))
