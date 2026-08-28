@@ -15,9 +15,9 @@ import threading
 import tkinter as tk
 import webbrowser
 
-from ..config import APP_AUTHOR, APP_NAME, APP_VERSION, COLOR_SCHEME_BLUE, COLOR_SCHEME_PURPLE, DEFAULT_VIEWER, ERROR_LOG, OCS_COL_AGE, OCS_COL_DATE, OCS_COL_IP, OCS_COL_SESSION, OCS_COL_TAG, OCS_ROW_PITCH, OCS_STALE_DAYS, OCS_VISIBLE_ROWS, OCS_WINDOW_HEIGHT, OCS_WINDOW_WIDTH, GITHUB_PROFILE_URL, GITHUB_RELEASES_URL, GITHUB_URL, LICENSE_URL, LOGS_DIR, REALVNC_EXE, SHARED_HOSTS_JSON, ULTRAVNC_EXE, VIEWER_REALVNC
+from ..config import APP_AUTHOR, APP_NAME, APP_VERSION, COLOR_SCHEME_BLUE, COLOR_SCHEME_PURPLE, DEFAULT_VIEWER, ERROR_LOG, OCS_COL_AGE, OCS_COL_DATE, OCS_COL_IP, OCS_COL_SESSION, OCS_COL_TAG, OCS_ROW_PITCH, OCS_STALE_DAYS, OCS_VISIBLE_ROWS, OCS_WINDOW_HEIGHT, OCS_WINDOW_WIDTH, GITHUB_PROFILE_URL, GITHUB_RELEASES_URL, GITHUB_URL, LICENSE_URL, LOGS_DIR, REALVNC_EXE, SHARED_HOSTS_JSON, ULTRAVNC_EXE, VIEWER_OPTIONS, VIEWER_REALVNC
 from ..applog import audit_log, log_exception
-from ..storage import format_host_port, load_ocs_creds, load_ocs_url, sanitize_port, save_ocs_creds, save_ocs_url, get_sector_by_name, get_sector_names, get_unit_by_name, get_unit_names, load_creds, load_global_paths, load_psexec_path, normalize_hosts_data, sanitize_viewer, save_creds, save_global_paths, save_json, save_psexec_path, save_settings, viewer_display_name
+from ..storage import format_host_port, load_ocs_creds, load_ocs_url, sanitize_port, split_host_port, save_ocs_creds, save_ocs_url, get_sector_by_name, get_sector_names, get_unit_by_name, get_unit_names, load_creds, load_global_paths, load_psexec_path, normalize_hosts_data, sanitize_viewer, save_creds, save_global_paths, save_json, save_psexec_path, save_settings, viewer_display_name
 from ..theme import FONT_BOLD, FONT_NORMAL, FONT_SMALL, FONT_SMALL_BOLD, FONT_SUBTITLE, THEME, color_scheme_display_name
 from ..helpers import bind_clickable_row, center_window, reset_scrollable_frame_position, fit_dialog_to_content, remember_window_geometry, rename_realvnc_profile, rename_realvnc_profiles_for_sector, safe_filename, save_window_geometry, show_error, show_warning
 from ..updates import fetch_latest_release, format_release_notes_for_display, normalize_release_version
@@ -1586,6 +1586,140 @@ class OcsConfigWindow(ctk.CTkToplevel):
         # A senha nunca vai para o log.
         audit_log("OCS_CONFIG_SAVED", f"url={url}; usuario={usuario}")
         self.destroy()
+
+
+class HostActionsWindow(ctk.CTkToplevel):
+    """Um host digitado a mao, com as acoes do app reunidas num lugar.
+
+    Substitui o antigo botao que alternava entre conectar e reiniciar. O host
+    fica editavel no topo e cada acao age sobre ele, entao da para conectar,
+    reiniciar, ver sessoes e impressoras sem reabrir a janela. E tambem onde a
+    limpeza de perfis vai entrar depois, por isso vale mante-la organizada.
+
+    Nao e modal: chama de volta o App (self.parent) para cada acao, do mesmo
+    jeito que a janela do OCS faz, e nao segura grab nenhum.
+    """
+
+    def __init__(self, parent, initial_host=""):
+        super().__init__(parent)
+        self.parent = parent
+        self.title("Host manual")
+        self.configure(fg_color=THEME["bg"])
+        self.resizable(False, False)
+        center_window(self, 460, 384)
+        self.protocol("WM_DELETE_WINDOW", self.destroy)
+
+        box = ctk.CTkFrame(self, fg_color=THEME["surface"], corner_radius=18)
+        box.pack(fill="both", expand=True, padx=16, pady=16)
+
+        ctk.CTkLabel(box, text="Host manual", font=FONT_SUBTITLE,
+                     text_color=THEME["text"]).pack(anchor="w", padx=18, pady=(18, 2))
+        ctk.CTkLabel(
+            box,
+            text="Digite o hostname ou IP e escolha a ação. Aceita host::porta.",
+            font=FONT_NORMAL, text_color=THEME["muted"],
+            wraplength=400, justify="left",
+        ).pack(anchor="w", padx=18, pady=(0, 14))
+
+        self.host_var = tk.StringVar(value=str(initial_host or ""))
+        self.entry = ctk.CTkEntry(
+            box, textvariable=self.host_var, height=38, font=FONT_NORMAL,
+            placeholder_text="hostname ou IP", placeholder_text_color=THEME["muted"],
+            fg_color=THEME["surface_2"], border_color=THEME["border"],
+            text_color=THEME["text"])
+        self.entry.pack(fill="x", padx=18, pady=(0, 12))
+        self.entry.bind("<Return>", lambda _e: self.do_connect())
+
+        ctk.CTkLabel(box, text="Viewer", font=FONT_SMALL_BOLD,
+                     text_color=THEME["muted"]).pack(anchor="w", padx=18, pady=(0, 4))
+        self.viewer_var = tk.StringVar(value=DEFAULT_VIEWER)
+        ctk.CTkOptionMenu(
+            box, font=FONT_BOLD, values=VIEWER_OPTIONS, variable=self.viewer_var,
+            width=180, fg_color=THEME["surface_3"], button_color=THEME["accent_soft"],
+            button_hover_color=THEME["accent_hover"], text_color=THEME["secondary_button_text"],
+            dropdown_fg_color=THEME["surface"], dropdown_hover_color=THEME["accent_soft"],
+            dropdown_text_color=THEME["text"],
+        ).pack(anchor="w", padx=18, pady=(0, 16))
+
+        acoes = ctk.CTkFrame(box, fg_color="transparent")
+        acoes.pack(fill="x", padx=18, pady=(0, 12))
+        acoes.grid_columnconfigure(0, weight=1, uniform="hostacoes")
+        acoes.grid_columnconfigure(1, weight=1, uniform="hostacoes")
+
+        self.btn_connect = ctk.CTkButton(
+            acoes, font=FONT_BOLD, text="Conectar", height=40, command=self.do_connect,
+            fg_color=THEME["accent"], hover_color=THEME["accent_hover"],
+            text_color=THEME["button_text"])
+        self.btn_restart = ctk.CTkButton(
+            acoes, font=FONT_BOLD, text="Reiniciar", height=40, command=self.do_restart,
+            fg_color=THEME["warning"], hover_color=THEME["warning_hover"],
+            text_color=THEME["button_text"])
+        self.btn_sessions = ctk.CTkButton(
+            acoes, font=FONT_BOLD, text="Sessões", height=40, command=self.do_sessions,
+            fg_color=THEME["surface_3"], hover_color=THEME["accent_soft"],
+            text_color=THEME["secondary_button_text"])
+        self.btn_printers = ctk.CTkButton(
+            acoes, font=FONT_BOLD, text="Impressoras", height=40, command=self.do_printers,
+            fg_color=THEME["surface_3"], hover_color=THEME["accent_soft"],
+            text_color=THEME["secondary_button_text"])
+
+        self.btn_connect.grid(row=0, column=0, sticky="ew", padx=(0, 6), pady=(0, 8))
+        self.btn_restart.grid(row=0, column=1, sticky="ew", padx=(6, 0), pady=(0, 8))
+        self.btn_sessions.grid(row=1, column=0, sticky="ew", padx=(0, 6))
+        self.btn_printers.grid(row=1, column=1, sticky="ew", padx=(6, 0))
+
+        ctk.CTkButton(
+            box, font=FONT_BOLD, text="Fechar", height=36, width=110, command=self.destroy,
+            fg_color=THEME["surface_3"], hover_color=THEME["accent_soft"],
+            text_color=THEME["secondary_button_text"]).pack(anchor="e", padx=18, pady=(0, 18))
+
+        # Botoes so ligam quando ha um host: agir sobre campo vazio abriria o
+        # viewer sem alvo, ou pediria confirmacao de reinicio de coisa nenhuma.
+        self.host_var.trace_add("write", lambda *_a: self.update_buttons_state())
+        self.update_buttons_state()
+
+        self.transient(parent)
+        self.after(120, self.entry.focus_set)
+
+    def current_host(self):
+        return self.host_var.get().strip()
+
+    def update_buttons_state(self):
+        estado = "normal" if self.current_host() else "disabled"
+        for botao in (self.btn_connect, self.btn_restart,
+                      self.btn_sessions, self.btn_printers):
+            try:
+                botao.configure(state=estado)
+            except tk.TclError:
+                pass
+
+    def do_connect(self):
+        bruto = self.current_host()
+        if not bruto:
+            return
+        host, port = split_host_port(bruto)
+        self.parent.connect_manual_host(host, self.viewer_var.get(), port)
+
+    def do_restart(self):
+        bruto = self.current_host()
+        if not bruto:
+            return
+        host, _port = split_host_port(bruto)
+        self.parent.restart_manual_host(host)
+
+    def do_sessions(self):
+        bruto = self.current_host()
+        if not bruto:
+            return
+        host, _port = split_host_port(bruto)
+        self.parent.show_host_sessions(host, host)
+
+    def do_printers(self):
+        bruto = self.current_host()
+        if not bruto:
+            return
+        host, _port = split_host_port(bruto)
+        self.parent.show_remote_printers(host, host)
 
 
 class OcsSearchWindow(ctk.CTkToplevel):

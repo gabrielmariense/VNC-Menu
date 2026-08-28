@@ -23,9 +23,9 @@ from ..storage import format_host_port, sanitize_port, bootstrap_directories, fi
 from ..theme import FONT_BOLD, FONT_NORMAL, FONT_SMALL, FONT_SMALL_BOLD, FONT_TITLE, THEME, apply_color_theme, normalize_color_scheme
 from ..helpers import bind_clickable_row, get_geometry_size, get_window_geometries, is_valid_geometry, prune_window_geometries, reset_scrollable_frame_position, restore_window_geometry, safe_filename, save_window_geometry, show_error, show_info, show_warning
 from ..updates import HTTPS_CONTEXT, calculate_sha256, current_main_entry_name, fetch_latest_release, find_release_zip_asset, get_release_asset_checksum, get_updater_launch_command, normalize_release_version, parse_version
-from .dialogs import ask_custom_connection, ask_text, choose_hosts_source_dialog, confirm_action, ensure_hosts_source_selected, shared_hosts_edit_warning, show_psexec_required_dialog
+from .dialogs import ask_text, choose_hosts_source_dialog, confirm_action, ensure_hosts_source_selected, shared_hosts_edit_warning, show_psexec_required_dialog
 from ..remote import PsExecQueryError, format_users_output, host_responds_to_ping, launch_vnc, log_psexec_failure, query_all_logged_users, query_logged_users_raw, query_remote_printers, restart_host
-from .windows import AboutWindow, CredsWindow, OcsConfigWindow, OcsSearchWindow, HostUnitsConfigWindow, PrinterProgressWindow, PsExecPathWindow, QwinstaProgressWindow, SettingsWindow, UpdateAvailableWindow, UpdateCheckProgressWindow, UpdateDownloadWindow, ViewerPathsWindow, show_psexec_error_dialog, show_text_window
+from .windows import AboutWindow, CredsWindow, HostActionsWindow, OcsConfigWindow, OcsSearchWindow, HostUnitsConfigWindow, PrinterProgressWindow, PsExecPathWindow, QwinstaProgressWindow, SettingsWindow, UpdateAvailableWindow, UpdateCheckProgressWindow, UpdateDownloadWindow, ViewerPathsWindow, show_psexec_error_dialog, show_text_window
 
 class App(ctk.CTk):
     def __init__(self):
@@ -90,7 +90,6 @@ class App(ctk.CTk):
         # there would stack one extra callback per theme change.
         self.search_var.trace_add("write", self.on_search_changed)
 
-        self.mode = tk.StringVar(value="connect")
         self.login_mode = tk.StringVar(
             value=normalize_login_mode(
                 self.settings.get("login_mode", LOGIN_MODE_AUTO)
@@ -104,7 +103,7 @@ class App(ctk.CTk):
         self.build_main_panel()
         self.update_window_title()
         self.refresh_all()
-        self.set_mode("connect")
+        self.update_search_state_label()
         restore_window_geometry(self, "main", initial_width, initial_height)
 
         self.bind("<Configure>", self.schedule_main_window_size_save)
@@ -245,7 +244,7 @@ class App(ctk.CTk):
         self.search_query = self.search_var.get().strip()
         self.refresh_sectors()
         self.render_hosts()
-        self.set_mode(self.mode.get())
+        self.update_search_state_label()
         reset_scrollable_frame_position(self.host_grid)
 
     def reset_search_state(self):
@@ -270,7 +269,7 @@ class App(ctk.CTk):
         self.reset_search_state()
         self.refresh_sectors()
         self.render_hosts()
-        self.set_mode(self.mode.get())
+        self.update_search_state_label()
         reset_scrollable_frame_position(self.host_grid)
 
     def on_search_escape(self, _event=None):
@@ -296,26 +295,6 @@ class App(ctk.CTk):
         # cheia em qualquer largura de janela, e acrescentar ou remover um
         # botao no futuro so muda a fatia de cada um, sem cortar nem sobrar.
         actions.grid(row=0, column=0, sticky="ew")
-
-        self.btn_connect = ctk.CTkButton(
-            actions,
-            font=FONT_BOLD,
-            text="Conectar",
-            height=38,
-            command=lambda: self.set_mode("connect"),
-            text_color=THEME["button_text"],
-        )
-        self.btn_connect.bind("<Double-Button-1>", lambda _event: self.connect_custom_host())
-
-        self.btn_restart = ctk.CTkButton(
-            actions,
-            font=FONT_BOLD,
-            text="Reiniciar",
-            height=38,
-            command=lambda: self.set_mode("restart"),
-            text_color=THEME["button_text"],
-        )
-        self.btn_restart.bind("<Double-Button-1>", lambda _event: self.restart_custom_host())
 
         self.btn_users = ctk.CTkButton(
             actions,
@@ -352,8 +331,10 @@ class App(ctk.CTk):
 
         # uniform= amarra as colunas na mesma largura; sem isso o texto mais
         # longo puxaria a coluna dele e os botoes ficariam desiguais.
-        botoes = (self.btn_connect, self.btn_restart, self.btn_users,
-                  self.btn_printers, self.btn_ocs)
+        # Conectar e Reiniciar sairam daqui: conectar virou o clique no host,
+        # reiniciar foi para o menu de contexto. Sobram as tres ferramentas
+        # que agem por conta propria.
+        botoes = (self.btn_users, self.btn_printers, self.btn_ocs)
         for coluna, botao in enumerate(botoes):
             ultimo = coluna == len(botoes) - 1
             actions.grid_columnconfigure(coluna, weight=1, uniform="acoes")
@@ -393,7 +374,7 @@ class App(ctk.CTk):
             text="Host manual",
             width=120,
             height=32,
-            command=self.run_custom_host_action,
+            command=self.open_manual_host,
             fg_color=THEME["surface_3"],
             hover_color=THEME["accent_soft"],
             text_color=THEME["secondary_button_text"],
@@ -478,25 +459,18 @@ class App(ctk.CTk):
     def automatic_login_enabled(self) -> bool:
         return normalize_login_mode(self.login_mode.get()) == LOGIN_MODE_AUTO
 
-    def set_mode(self, mode):
-        self.mode.set(mode)
-        if mode == "connect":
-            self.btn_connect.configure(fg_color=THEME["accent"], hover_color=THEME["accent_hover"], text_color=THEME["button_text"])
-            self.btn_restart.configure(fg_color=THEME["surface_3"], hover_color=THEME["accent_soft"], text_color=THEME["secondary_button_text"])
-        else:
-            self.btn_connect.configure(fg_color=THEME["surface_3"], hover_color=THEME["accent_soft"], text_color=THEME["secondary_button_text"])
-            self.btn_restart.configure(fg_color=THEME["warning"], hover_color=THEME["warning_hover"], text_color=THEME["button_text"])
-
-        # The active mode is already shown by the highlighted button, so this
-        # label stays empty during normal use. Its only job is the search
-        # state, which is the one thing the buttons cannot show.
-        self.mode_label.configure(
-            text=f"Buscando em: {self.selected_unit.get()}" if self.search_query else ""
-        )
+    def update_search_state_label(self):
+        # A busca some a lista do setor e mostra os resultados; sem este aviso
+        # nao ha como saber que a lista curta e um filtro, e nao a lista real
+        # do setor. Fica vazio fora da busca.
+        try:
+            self.mode_label.configure(
+                text=f"Buscando em: {self.selected_unit.get()}" if self.search_query else ""
+            )
+        except tk.TclError:
+            pass
 
     def apply_theme_repaint(self):
-        current_mode = self.mode.get()
-
         # Remove the old widget tree before changing CustomTkinter's global
         # appearance mode. This prevents the brief old-theme redraw and avoids
         # callbacks touching widgets that are about to be destroyed.
@@ -512,7 +486,7 @@ class App(ctk.CTk):
         self.build_sidebar()
         self.build_main_panel()
         self.refresh_all()
-        self.set_mode(current_mode)
+        self.update_search_state_label()
 
     def apply_theme_repaint_and_reopen_settings(self):
         try:
@@ -734,7 +708,7 @@ class App(ctk.CTk):
         self.save_main_selection()
         self.refresh_sectors()
         self.render_hosts()
-        self.set_mode(self.mode.get())
+        self.update_search_state_label()
         self.reset_main_scroll_positions()
 
     def set_sector(self, sector_name):
@@ -744,7 +718,7 @@ class App(ctk.CTk):
         self.save_main_selection()
         self.refresh_sectors()
         self.render_hosts()
-        self.set_mode(self.mode.get())
+        self.update_search_state_label()
         reset_scrollable_frame_position(self.host_grid)
 
     def save_main_selection(self):
@@ -889,12 +863,20 @@ class App(ctk.CTk):
             close_menu()
             self.show_host_sessions(host, display_name)
 
+        def open_restart():
+            close_menu()
+            self.restart_host_from_menu(host, display_name)
+
         # Show the configured hostname/IP as the first line so support can
         # quickly confirm the target without opening the hosts configuration.
         menu.add_command(
             label=f"Host/IP: {host_label}",
             state="disabled",
         )
+        menu.add_separator()
+        # Reiniciar era um modo global; virou acao por host aqui, com a mesma
+        # confirmacao de antes, para nao reiniciar maquina por engano.
+        menu.add_command(label="Reiniciar", command=open_restart)
         menu.add_separator()
         menu.add_command(label="Copiar IP", command=copy_ip)
         menu.add_command(label="Abrir c$", command=open_c_share)
@@ -925,11 +907,10 @@ class App(ctk.CTk):
             show_info(self, "Reiniciar", "Um reinício já está sendo enviado. Aguarde.")
             return
 
+        # Guard so a second restart cannot be sent while one is in flight.
+        # There is no longer a Reiniciar button to grey out, but the guard
+        # still prevents a double reboot from two quick confirmations.
         self._restart_running = True
-        try:
-            self.btn_restart.configure(state="disabled", text="Enviando...")
-        except tk.TclError:
-            pass
 
         def worker():
             try:
@@ -940,12 +921,6 @@ class App(ctk.CTk):
 
             def finish():
                 self._restart_running = False
-                try:
-                    self.btn_restart.configure(state="normal", text="Reiniciar")
-                    self.set_mode(self.mode.get())
-                except tk.TclError:
-                    # The panel was rebuilt (theme change) while the command ran.
-                    pass
 
                 if error is not None:
                     show_error(
@@ -970,37 +945,47 @@ class App(ctk.CTk):
         ).start()
 
     def run_host_action(self, name, host, viewer=DEFAULT_VIEWER, port=None, sector=None):
-        if self.mode.get() == "connect":
-            # The sector picks the RealVNC profile file (<Setor>_<Nome>.vnc), so
-            # it has to be the sector the host actually belongs to. A search
-            # result can come from a sector other than the selected one, and
-            # passing the selection there would open the wrong profile.
-            sector_name = sector if sector is not None else self.selected_sector.get()
-            launch_vnc(
-                host,
-                viewer,
-                name,
-                sector_name,
-                self,
-                automatic_login=self.automatic_login_enabled(),
-                port=port,
-            )
-            return
+        # O clique num host agora significa sempre conectar. Reiniciar saiu
+        # daqui para o menu de contexto, entao um clique distraido nao reinicia
+        # mais a maquina.
+        #
+        # O setor escolhe o perfil RealVNC (<Setor>_<Nome>.vnc), entao tem que
+        # ser o setor a que o host pertence de fato. Um resultado de busca pode
+        # vir de outro setor, e passar a selecao abriria o perfil errado.
+        sector_name = sector if sector is not None else self.selected_sector.get()
+        launch_vnc(
+            host,
+            viewer,
+            name,
+            sector_name,
+            self,
+            automatic_login=self.automatic_login_enabled(),
+            port=port,
+        )
 
-        if confirm_action(self, "Confirmar reinício", f'Reiniciar "{name}" agora?'):
-            self.restart_host_async(host, name)
-
-    def run_custom_host_action(self):
-        if self.mode.get() == "restart":
-            self.restart_custom_host()
+    def restart_host_from_menu(self, host, display_name=None):
+        """Reinicio pelo menu de contexto do host, com a mesma confirmacao."""
+        label = str(display_name or "").strip() or str(host or "").strip()
+        if not label:
             return
-        self.connect_custom_host()
+        if confirm_action(self, "Confirmar reinício", f'Reiniciar "{label}" agora?'):
+            self.restart_host_async(host, display_name)
 
-    def connect_custom_host(self):
-        result = ask_custom_connection(self)
-        if not result:
+    def open_manual_host(self):
+        """Janela de acoes para um host digitado a mao.
+
+        Substitui o antigo botao que alternava conectar/reiniciar. Reune num
+        so lugar tudo que o app sabe fazer com um host, e e onde a limpeza de
+        perfis vai entrar depois.
+        """
+        HostActionsWindow(self)
+
+    def connect_manual_host(self, host, viewer=DEFAULT_VIEWER, port=None):
+        host = str(host or "").strip().lstrip("\\")
+        if not host:
             return
-        host, viewer, port = result
+        # Sem nome nem setor: um host avulso nao esta no hosts.json, entao nao
+        # existe perfil RealVNC <Setor>_<Nome>.vnc para ele.
         launch_vnc(
             host,
             viewer,
@@ -1009,12 +994,12 @@ class App(ctk.CTk):
             port=port,
         )
 
-    def restart_custom_host(self):
-        target = ask_text(self, "Reiniciar host", "Digite o hostname ou IP:")
-        if not target:
+    def restart_manual_host(self, host):
+        host = str(host or "").strip().lstrip("\\")
+        if not host:
             return
-        if confirm_action(self, "Confirmar reinício", f'Reiniciar "{target}" agora?'):
-            self.restart_host_async(target)
+        if confirm_action(self, "Confirmar reinício", f'Reiniciar "{host}" agora?'):
+            self.restart_host_async(host)
 
     def reload_hosts_from_current_source(self):
         self.hosts_source = normalize_hosts_source(self.settings.get("hosts_source")) or HOSTS_SOURCE_SHARED
