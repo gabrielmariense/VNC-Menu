@@ -2413,7 +2413,10 @@ class TestSidebarFitsSectorNames(VncMenuTestCase):
         largura = self._numero(
             self._source(self.app.App.build_sidebar), r"CTkFrame\(self, width")
         util = largura - 40 - 16 - 20 - 12
-        self.assertGreaterEqual(util // 7, 33,
+        # 7.4px por caractere: Segoe UI 13 NEGRITO, que e o peso usado na
+        # lista. Medido em captura: 184px de botao mostravam 27 caracteres em
+        # peso normal (~6.8px), e negrito e ~8% mais largo.
+        self.assertGreaterEqual(int(util // 7.4), 33,
                                 "nao cabe o maior nome de setor da lista real")
 
     def test_the_minimum_window_grew_with_the_sidebar(self):
@@ -2431,11 +2434,14 @@ class TestSidebarFitsSectorNames(VncMenuTestCase):
         # descuido: o nome de setor comprido valia mais.
         self.assertGreaterEqual(minima - largura, 940 - 300)
 
-    def test_only_the_selected_sector_is_bold(self):
-        # Negrito e ~8% mais largo; usa-lo em todos custava caracteres sem
-        # marcar nada, porque a selecao e dada pela cor de fundo.
+    def test_the_selection_is_marked_by_colour_not_weight(self):
+        # Todos os setores em negrito; o contraste da selecao vem do fundo.
+        # Negrito custa ~8% de largura, entao a conta do teste acima usa a
+        # largura do caractere em negrito, nao em peso normal.
         fonte = self._source(self.app.App.refresh_sectors)
-        self.assertIn("FONT_BOLD if selected else FONT_NORMAL", fonte)
+        self.assertNotIn("FONT_BOLD if selected", fonte)
+        self.assertIn("font=FONT_BOLD", fonte)
+        self.assertIn('fg_color=THEME["accent"] if selected', fonte)
 
 
 class TestSidebarWidthIsActuallyApplied(VncMenuTestCase):
@@ -2545,3 +2551,301 @@ class TestCredentialFieldLookup(VncMenuTestCase):
                 raise RuntimeError("sumiu")
 
         self.assertIsInstance(self.app._describe_dialog(Quebrado()), str)
+
+
+class _FakeWidget:
+    """Widget de mentira com o suficiente de Tk para testar o pool."""
+
+    def __init__(self, registro=None):
+        self.opcoes = {}
+        self._gerenciador = ""
+        self.destruido = False
+        self.registro = registro
+        if registro is not None:
+            registro.append(self)
+
+    def configure(self, **kwargs):
+        self.opcoes.update(kwargs)
+
+    def winfo_manager(self):
+        return self._gerenciador
+
+    def pack(self, **_k):
+        self._gerenciador = "pack"
+
+    def pack_forget(self):
+        self._gerenciador = ""
+
+    def grid(self, **_k):
+        self._gerenciador = "grid"
+
+    def grid_forget(self):
+        self._gerenciador = ""
+
+    def destroy(self):
+        self.destruido = True
+
+
+class TestWidgetPool(VncMenuTestCase):
+    """Reaproveitar em vez de destruir e recriar a cada redesenho."""
+
+    def test_it_creates_only_what_is_missing(self):
+        criados = []
+        pool = []
+        self.app.ensure_widget_pool(pool, 3, lambda: _FakeWidget(criados))
+        self.assertEqual(len(criados), 3)
+        self.app.ensure_widget_pool(pool, 5, lambda: _FakeWidget(criados))
+        # Dois novos, nao cinco: os tres primeiros continuam vivos.
+        self.assertEqual(len(criados), 5)
+
+    def test_shrinking_hides_instead_of_destroying(self):
+        pool = []
+        widgets = self.app.ensure_widget_pool(pool, 4, _FakeWidget)
+        for w in widgets:
+            w.pack()
+        self.app.ensure_widget_pool(pool, 2, _FakeWidget)
+        self.assertEqual([w.winfo_manager() for w in pool[:2]], ["pack", "pack"])
+        self.assertEqual([w.winfo_manager() for w in pool[2:]], ["", ""])
+        self.assertFalse(any(w.destruido for w in pool))
+
+    def test_hiding_respects_the_geometry_manager_in_use(self):
+        pool = []
+        widgets = self.app.ensure_widget_pool(pool, 2, _FakeWidget)
+        widgets[0].pack()
+        widgets[1].grid()
+        self.app.ensure_widget_pool(pool, 0, _FakeWidget)
+        self.assertEqual([w.winfo_manager() for w in widgets], ["", ""])
+
+    def test_a_huge_list_does_not_stay_alive_forever(self):
+        # Trocar um setor de 200 hosts por um de 5 nao pode deixar 200
+        # widgets vivos, mas destruir a cada refresh anularia o ganho.
+        pool = []
+        self.app.ensure_widget_pool(pool, 200, _FakeWidget)
+        self.app.ensure_widget_pool(pool, 5, _FakeWidget, keep=64)
+        self.assertEqual(len(pool), 64)
+        self.assertEqual(len(self.app.ensure_widget_pool(pool, 5, _FakeWidget)), 5)
+
+    def test_it_returns_exactly_the_requested_widgets(self):
+        pool = []
+        self.app.ensure_widget_pool(pool, 10, _FakeWidget)
+        devolvidos = self.app.ensure_widget_pool(pool, 3, _FakeWidget)
+        self.assertEqual(devolvidos, pool[:3])
+
+    def test_asking_for_none_is_not_an_error(self):
+        pool = []
+        self.assertEqual(self.app.ensure_widget_pool(pool, 0, _FakeWidget), [])
+
+
+class TestPooledListsResetEveryMutableProperty(VncMenuTestCase):
+    """O risco do reaproveitamento e o estado velho sobrando.
+
+    Um botao reaproveitado que mantivesse o command anterior levaria ao setor
+    ou ao host errado — falha silenciosa e perigosa. Estes testes garantem que
+    toda propriedade que varia por item e reatribuida no configure().
+    """
+
+    def _configure_kwargs(self, funcao):
+        import ast as _ast, inspect, textwrap
+        arvore = _ast.parse(textwrap.dedent(inspect.getsource(funcao)))
+        chaves = set()
+        for no in _ast.walk(arvore):
+            if (isinstance(no, _ast.Call)
+                    and isinstance(no.func, _ast.Attribute)
+                    and no.func.attr == "configure"):
+                chaves.update(k.arg for k in no.keywords if k.arg)
+        return chaves
+
+    def test_the_sidebar_sectors_reset_text_colors_and_command(self):
+        chaves = self._configure_kwargs(self.app.App.refresh_sectors)
+        for esperado in ("text", "command", "fg_color", "hover_color",
+                         "text_color", "font"):
+            self.assertIn(esperado, chaves, f"{esperado} nao e reatribuido")
+
+    def test_the_host_cards_reset_text_and_command(self):
+        chaves = self._configure_kwargs(self.app.App.render_hosts)
+        self.assertIn("text", chaves)
+        self.assertIn("command", chaves)
+
+    def test_the_editor_sectors_reset_text_colors_and_command(self):
+        chaves = self._configure_kwargs(
+            self.app.HostUnitsConfigWindow.refresh_sectors)
+        for esperado in ("text", "command", "fg_color", "text_color"):
+            self.assertIn(esperado, chaves, f"{esperado} nao e reatribuido")
+
+    def test_no_list_destroys_its_children_on_every_redraw(self):
+        import inspect
+        for funcao in (self.app.App.refresh_sectors,
+                       self.app.App.render_hosts,
+                       self.app.App.render_search_results,
+                       self.app.HostUnitsConfigWindow.refresh_sectors,
+                       self.app.HostUnitsConfigWindow.render_hosts):
+            fonte = inspect.getsource(funcao)
+            self.assertNotIn("winfo_children()", fonte,
+                             f"{funcao.__name__} ainda reconstroi tudo")
+            self.assertIn("ensure_widget_pool", fonte, funcao.__name__)
+
+
+class TestTextFitsTheRealWidth(VncMenuTestCase):
+    """O corte era fixo em 22 caracteres, sem relacao com a largura do botao.
+
+    Alargar a janela deixava o nome cortado no mesmo ponto, com o card maior e
+    espaco sobrando.
+    """
+
+    def test_a_name_that_fits_is_untouched(self):
+        self.assertEqual(
+            self.app.fit_text_to_width("PS Adulto 01", 400, 7.4), "PS Adulto 01")
+
+    def test_a_wider_button_shows_more_of_the_name(self):
+        nome = "Amb NCV - Gerencia Enfermagem 02"
+        estreito = self.app.fit_text_to_width(nome, 120, 7.4)
+        largo = self.app.fit_text_to_width(nome, 260, 7.4)
+        self.assertLess(len(estreito), len(largo))
+        self.assertTrue(estreito.endswith("…"))
+
+    def test_enough_width_stops_truncating(self):
+        nome = "Amb NCV - Gerencia Enfermagem 02"
+        self.assertEqual(self.app.fit_text_to_width(nome, 4000, 7.4), nome)
+
+    def test_a_useless_width_keeps_something_readable(self):
+        # Coluna espremida nao pode virar so reticencias.
+        cortado = self.app.fit_text_to_width("Radiologia 02", 4, 7.4)
+        self.assertGreaterEqual(len(cortado), 6)
+
+    def test_broken_measurements_return_the_name_untouched(self):
+        for largura, por_char in ((0, 7.4), (-10, 7.4), (200, 0), (None, 7.4),
+                                  (200, None), ("x", 7.4)):
+            self.assertEqual(
+                self.app.fit_text_to_width("Radiologia 02", largura, por_char),
+                "Radiologia 02", f"{largura}/{por_char}")
+
+    def test_more_columns_means_less_room_per_card(self):
+        janela = types.SimpleNamespace(winfo_width=lambda: 900)
+        app = types.SimpleNamespace(
+            host_grid=janela,
+            CARD_CHAR_WIDTH=self.app.App.CARD_CHAR_WIDTH,
+            CARD_TEXT_PADDING=self.app.App.CARD_TEXT_PADDING,
+        )
+        nome = "Amb NCV - Gerencia Enfermagem 02"
+        duas = self.app.App._fit_card_text(app, nome, 2)
+        quatro = self.app.App._fit_card_text(app, nome, 4)
+        self.assertGreater(len(duas), len(quatro))
+
+    def test_before_the_first_draw_it_does_not_cut_to_one_character(self):
+        # O Tk reporta 1px antes do primeiro desenho; cortar por esse numero
+        # deixaria todo card com uma letra ate o proximo <Configure>.
+        app = types.SimpleNamespace(
+            host_grid=types.SimpleNamespace(winfo_width=lambda: 1),
+            CARD_CHAR_WIDTH=self.app.App.CARD_CHAR_WIDTH,
+            CARD_TEXT_PADDING=self.app.App.CARD_TEXT_PADDING,
+        )
+        texto = self.app.App._fit_card_text(app, "PS Adulto 01", 2)
+        self.assertEqual(texto, "PS Adulto 01")
+
+    def test_resizing_reapplies_the_cut(self):
+        import inspect
+        fonte = inspect.getsource(self.app.App.__init__)
+        self.assertIn("schedule_card_text_refit", fonte)
+        refit = inspect.getsource(self.app.App.refit_card_text)
+        self.assertIn("_fit_card_text", refit)
+        self.assertIn("configure(", refit)
+        # Redesenhar tudo a cada pixel de arrasto e o que tornava isso
+        # inviavel antes; o refit so pode mexer no texto.
+        self.assertNotIn("render_hosts", refit)
+
+
+class TestPooledRowsDeclareTheirColumns(VncMenuTestCase):
+    """As linhas reaproveitadas sao subclasses, nao CTkFrame com atributo solto.
+
+    Pendurar `row.colunas` numa CTkFrame funciona em Python e falha no
+    verificador de tipos. A subclasse resolve os dois e deixa o nome de cada
+    coluna explicito.
+    """
+
+    def test_the_search_row_is_its_own_class(self):
+        self.assertTrue(hasattr(self.app, "SearchResultRow"))
+        import inspect
+        fonte = inspect.getsource(self.app.SearchResultRow)
+        for coluna in ("sector_label", "host_label", "name_label"):
+            self.assertIn(f"self.{coluna}", fonte)
+
+    def test_the_host_table_row_is_its_own_class(self):
+        self.assertTrue(hasattr(self.app, "HostTableRow"))
+        self.assertIn("self.colunas", __import__("inspect").getsource(
+            self.app.HostTableRow))
+
+    def test_no_attributes_are_hung_on_a_plain_frame(self):
+        import inspect
+        for funcao in (self.app.App._build_search_row,
+                       self.app.HostUnitsConfigWindow._criar_linha_host):
+            fonte = inspect.getsource(funcao)
+            for atributo in ("row.colunas =", "row.sector_label =",
+                             "row.host_label =", "row.name_label ="):
+                self.assertNotIn(atributo, fonte, funcao.__name__)
+
+    def test_binds_use_the_boolean_add(self):
+        # CTk declara add como bool; "+" funciona em runtime mas o
+        # verificador de tipos recusa.
+        import inspect
+        for funcao in (self.app.App.__init__,
+                       self.app.App.render_hosts,
+                       self.app.HostUnitsConfigWindow._criar_linha_host):
+            self.assertNotIn('add="+"', inspect.getsource(funcao),
+                             funcao.__qualname__)
+
+
+class TestCommandOutputIsMonospaced(VncMenuTestCase):
+    """Saida de comando remoto precisa de fonte monoespacada.
+
+    A consulta de impressoras devolve colunas alinhadas por espacos. Numa
+    fonte proporcional o alinhamento se perde, e era o caso da janela de
+    Impressoras, que usava Segoe UI 11.
+    """
+
+    def test_there_is_a_single_mono_font_constant(self):
+        self.assertTrue(hasattr(self.app, "FONT_MONO"))
+        familia, tamanho = self.app.FONT_MONO[0], self.app.FONT_MONO[1]
+        self.assertEqual(familia, "Consolas")
+        # Maior que a Segoe UI 11 que estava na janela de Impressoras.
+        self.assertGreaterEqual(tamanho, 12)
+
+    def test_the_printers_output_uses_it(self):
+        import inspect
+        fonte = inspect.getsource(self.app.PrintersWindow.__init__)
+        self.assertIn("font=FONT_MONO", fonte)
+        self.assertNotIn('font=FONT_SMALL, wrap="none"', fonte)
+
+    def test_the_shared_text_window_uses_the_same_constant(self):
+        import inspect
+        fonte = inspect.getsource(self.app.show_text_window)
+        self.assertIn("font=FONT_MONO", fonte)
+        self.assertNotIn('("Consolas", 12)', fonte)
+
+
+class TestHostsEditorTableIsReadable(VncMenuTestCase):
+    def test_header_and_rows_use_the_same_bold_font(self):
+        import inspect
+        cabecalho = inspect.getsource(
+            self.app.HostUnitsConfigWindow.build_right_panel)
+        linha = inspect.getsource(self.app.HostTableRow)
+        self.assertIn("font=FONT_BOLD", cabecalho)
+        self.assertIn("font=FONT_BOLD", linha)
+        self.assertNotIn('("Segoe UI", 12)', linha)
+
+    def test_header_and_rows_share_the_same_horizontal_padding(self):
+        # Com 16 no cabecalho e 14 nas linhas, titulo e dado ficavam 2px
+        # fora de prumo.
+        import inspect, re as _re
+        cabecalho = inspect.getsource(
+            self.app.HostUnitsConfigWindow.build_right_panel)
+        linha = inspect.getsource(self.app.HostTableRow)
+        alvo = 'sticky="ew", padx=14'
+        self.assertIn(alvo, cabecalho)
+        self.assertIn(alvo, linha)
+
+    def test_the_editor_sectors_are_bold_too(self):
+        import inspect
+        fonte = inspect.getsource(
+            self.app.HostUnitsConfigWindow.refresh_sectors)
+        self.assertNotIn("FONT_BOLD if selected", fonte)
+        self.assertIn("font=FONT_BOLD", fonte)

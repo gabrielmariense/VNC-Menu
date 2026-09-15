@@ -23,7 +23,7 @@ PORT = 5900
 APP_NAME = "VNC-Menu"
 
 
-APP_VERSION = "2.5.0"
+APP_VERSION = "2.5.1"
 
 
 APP_AUTHOR = 'Gabriel "GMErebos" Mariense'

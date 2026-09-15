@@ -18,8 +18,8 @@ import webbrowser
 from ..config import APP_AUTHOR, APP_NAME, STARTUP_FOLDER, APP_VERSION, COLOR_SCHEME_BLUE, COLOR_SCHEME_PURPLE, DEFAULT_VIEWER, ERROR_LOG, GITHUB_PROFILE_URL, GITHUB_RELEASES_URL, GITHUB_URL, LICENSE_URL, LOGS_DIR, REALVNC_EXE, SHARED_HOSTS_JSON, ULTRAVNC_EXE, VIEWER_OPTIONS, VIEWER_REALVNC
 from ..applog import audit_log, log_exception
 from ..storage import find_psexec, format_host_port, sanitize_port, split_host_port, get_sector_by_name, get_sector_names, get_unit_by_name, get_unit_names, load_creds, load_global_paths, load_psexec_path, normalize_hosts_data, sanitize_viewer, save_creds, save_global_paths, save_json, save_psexec_path, save_settings, viewer_display_name
-from ..theme import FONT_BOLD, FONT_NORMAL, FONT_SMALL, FONT_SMALL_BOLD, FONT_SUBTITLE, THEME, color_scheme_display_name
-from ..helpers import bind_clickable_row, center_window, reset_scrollable_frame_position, fit_dialog_to_content, remember_window_geometry, rename_realvnc_profile, rename_realvnc_profiles_for_sector, safe_filename, save_window_geometry, show_error, show_warning
+from ..theme import FONT_BOLD, FONT_MONO, FONT_NORMAL, FONT_SMALL, FONT_SMALL_BOLD, FONT_SUBTITLE, THEME, color_scheme_display_name
+from ..helpers import bind_clickable_row, center_window, ensure_widget_pool, reset_scrollable_frame_position, fit_dialog_to_content, remember_window_geometry, rename_realvnc_profile, rename_realvnc_profiles_for_sector, safe_filename, save_window_geometry, show_error, show_warning
 from ..updates import fetch_latest_release, format_release_notes_for_display, normalize_release_version
 from .dialogs import ModalDialog, ask_host_details, ask_text, confirm_action, show_psexec_required_dialog
 from ..remote import PsExecQueryError, driver_install_failures, script_runs_hidden, format_driver_install_report, format_script_run_report, format_users_output, host_responds_to_ping, install_printer_drivers, log_psexec_failure, query_logged_users_raw, query_remote_printers, run_startup_script, validate_script_name
@@ -67,7 +67,7 @@ def show_text_window(
     textbox = ctk.CTkTextbox(
         outer,
         height=textbox_height,
-        font=("Consolas", 12),
+        font=FONT_MONO,
         fg_color=THEME["bg"],
         text_color=THEME["text"],
         corner_radius=12,
@@ -519,6 +519,34 @@ class SectorsWindow(SimpleListEditor):
         self.render_items()
 
 
+class HostTableRow(ctk.CTkFrame):
+    """Linha da tabela de hosts, com as tres colunas declaradas.
+
+    Subclasse em vez de pendurar `colunas` numa CTkFrame: o Python aceita o
+    atributo avulso, o verificador de tipos nao, e aqui o nome fica explicito
+    para quem ler depois.
+    """
+
+    def __init__(self, master):
+        super().__init__(
+            master, fg_color=THEME["surface_2"], corner_radius=10, height=36)
+        self.pack_propagate(False)
+        self.grid_columnconfigure(0, weight=3, uniform="host_table")
+        self.grid_columnconfigure(1, weight=3, uniform="host_table")
+        self.grid_columnconfigure(2, weight=1, uniform="host_table")
+
+        self.colunas: list = []
+        for col in range(3):
+            label = ctk.CTkLabel(
+                self,
+                font=FONT_BOLD,
+                text_color=THEME["text"],
+                anchor="w" if col < 2 else "center",
+            )
+            label.grid(row=0, column=col, sticky="ew", padx=14, pady=7)
+            self.colunas.append(label)
+
+
 class HostUnitsConfigWindow(ctk.CTkToplevel):
     def __init__(self, parent, hosts_data, on_save, hosts_path=SHARED_HOSTS_JSON):
         super().__init__(parent)
@@ -613,6 +641,7 @@ class HostUnitsConfigWindow(ctk.CTkToplevel):
         ).pack(fill="x", padx=18, pady=(0, 18))
 
         ctk.CTkLabel(self.left, text="Setores", font=FONT_SMALL_BOLD, text_color=THEME["muted"]).pack(anchor="w", padx=18, pady=(0, 6))
+        self._sector_pool = []
         self.sector_frame = ctk.CTkScrollableFrame(self.left, fg_color=THEME["bg"], corner_radius=14)
         self.sector_frame.pack(fill="both", expand=True, padx=18, pady=(0, 14))
 
@@ -670,11 +699,16 @@ class HostUnitsConfigWindow(ctk.CTkToplevel):
             ctk.CTkLabel(
                 table_header,
                 text=label,
-                font=FONT_SMALL_BOLD,
+                font=FONT_BOLD,
                 text_color=THEME["muted"],
                 anchor="w" if col < 2 else "center",
-            ).grid(row=0, column=col, sticky="ew", padx=16, pady=8)
+                # padx igual ao das linhas (HostTableRow): com 16 aqui e 14
+                # la, titulo e dado ficavam 2px fora de prumo.
+            ).grid(row=0, column=col, sticky="ew", padx=14, pady=8)
 
+        self._host_row_pool = []
+        self._indice_da_linha = {}
+        self._label_vazio = None
         self.host_rows = ctk.CTkScrollableFrame(
             self.right,
             fg_color=THEME["bg"],
@@ -748,21 +782,24 @@ class HostUnitsConfigWindow(ctk.CTkToplevel):
         self.unit_menu.set(self.selected_unit.get())
 
     def refresh_sectors(self):
-        for child in self.sector_frame.winfo_children():
-            child.destroy()
-
         names = get_sector_names(self.data, self.selected_unit.get()) or ["Geral"]
         if self.selected_sector.get() not in names:
             self.selected_sector.set(names[0])
 
-        for name in names:
+        def criar_botao():
+            return ctk.CTkButton(self.sector_frame, anchor="w", height=38)
+
+        botoes = ensure_widget_pool(self._sector_pool, len(names), criar_botao)
+
+        for botao, name in zip(botoes, names):
             selected = name == self.selected_sector.get()
-            btn = ctk.CTkButton(
-                self.sector_frame,
+            # Toda propriedade mutavel e reatribuida: um botao reaproveitado
+            # que guardasse o command antigo levaria ao setor errado.
+            botao.configure(
+                # Negrito em todos, como na barra lateral principal: quem
+                # marca a selecao e a cor de fundo.
                 font=FONT_BOLD,
                 text=name,
-                anchor="w",
-                height=38,
                 fg_color=THEME["accent"] if selected else THEME["surface_2"],
                 hover_color=(
                     THEME["accent_hover"]
@@ -776,58 +813,78 @@ class HostUnitsConfigWindow(ctk.CTkToplevel):
                 ),
                 command=lambda n=name: self.select_sector(n),
             )
-            btn.pack(fill="x", padx=8, pady=5)
+            if not botao.winfo_manager():
+                botao.pack(fill="x", padx=8, pady=5)
 
     def render_hosts(self):
-        for child in self.host_rows.winfo_children():
-            child.destroy()
-
-        self.host_row_widgets = {}
-
         self.path_label.configure(text=f"{self.selected_unit.get()} > {self.selected_sector.get()}")
         hosts = self.current_hosts()
 
         if not hosts:
-            ctk.CTkLabel(
-                self.host_rows,
-                text="Nenhum host neste setor.",
-                font=FONT_NORMAL,
-                text_color=THEME["muted"],
-            ).pack(anchor="w", padx=16, pady=16)
+            for linha in self._host_row_pool:
+                if linha.winfo_manager():
+                    linha.pack_forget()
+            self.host_row_widgets = {}
+            self._mostrar_vazio("Nenhum host neste setor.")
             return
 
-        for idx, item in enumerate(hosts):
+        self._esconder_vazio()
+        linhas = ensure_widget_pool(
+            self._host_row_pool, len(hosts), self._criar_linha_host)
+        self.host_row_widgets = {}
+
+        for idx, (linha, item) in enumerate(zip(linhas, hosts)):
             selected = idx == self.selected_host_index
-            bg = THEME["accent_soft"] if selected else THEME["surface_2"]
+            self.host_row_widgets[idx] = linha
+            self._indice_da_linha[linha] = idx
 
-            row = ctk.CTkFrame(self.host_rows, fg_color=bg, corner_radius=10, height=36)
-            self.host_row_widgets[idx] = row
-            row.pack(fill="x", padx=8, pady=3)
-            row.pack_propagate(False)
-            row.grid_columnconfigure(0, weight=3, uniform="host_table")
-            row.grid_columnconfigure(1, weight=3, uniform="host_table")
-            row.grid_columnconfigure(2, weight=1, uniform="host_table")
+            linha.configure(
+                fg_color=THEME["accent_soft"] if selected else THEME["surface_2"])
 
-            values = [
+            valores = [
                 str(item.get("name") or ""),
                 format_host_port(item.get("host"), sanitize_port(item.get("port"))),
                 viewer_display_name(item.get("viewer")),
             ]
+            for coluna, valor in zip(linha.colunas, valores):
+                coluna.configure(text=valor)
 
-            for col, value in enumerate(values):
-                label = ctk.CTkLabel(
-                    row,
-                    text=value,
-                    font=("Segoe UI", 12),
-                    text_color=THEME["text"],
-                    anchor="w" if col < 2 else "center",
-                )
-                label.grid(row=0, column=col, sticky="ew", padx=14, pady=7)
-                label.bind("<Button-1>", lambda _e, i=idx: self.select_host(i))
-                label.bind("<Double-Button-1>", lambda _e, i=idx: self.edit_host_index(i))
+            if not linha.winfo_manager():
+                linha.pack(fill="x", padx=8, pady=3)
 
-            row.bind("<Button-1>", lambda _e, i=idx: self.select_host(i))
-            row.bind("<Double-Button-1>", lambda _e, i=idx: self.edit_host_index(i))
+    def _criar_linha_host(self):
+        """Linha vazia da tabela. O conteudo e o indice entram depois."""
+        row = HostTableRow(self.host_rows)
+
+        # Ligados UMA vez: o handler le o indice atual daquela linha, entao
+        # reaproveitar nao exige refazer binding a cada redesenho.
+        for alvo in (row, *row.colunas):
+            alvo.bind("<Button-1>", lambda _e, w=row: self._clicar_linha(w), add=True)
+            alvo.bind(
+                "<Double-Button-1>", lambda _e, w=row: self._editar_linha(w), add=True)
+        return row
+
+    def _clicar_linha(self, linha):
+        indice = self._indice_da_linha.get(linha)
+        if indice is not None:
+            self.select_host(indice)
+
+    def _editar_linha(self, linha):
+        indice = self._indice_da_linha.get(linha)
+        if indice is not None:
+            self.edit_host_index(indice)
+
+    def _mostrar_vazio(self, texto):
+        if self._label_vazio is None:
+            self._label_vazio = ctk.CTkLabel(
+                self.host_rows, font=FONT_NORMAL, text_color=THEME["muted"])
+        self._label_vazio.configure(text=texto)
+        if not self._label_vazio.winfo_manager():
+            self._label_vazio.pack(anchor="w", padx=16, pady=16)
+
+    def _esconder_vazio(self):
+        if self._label_vazio is not None and self._label_vazio.winfo_manager():
+            self._label_vazio.pack_forget()
 
     def select_sector(self, name):
         self.selected_sector.set(name)
@@ -2316,7 +2373,7 @@ class PrintersWindow(ctk.CTkToplevel):
         ).pack(fill="x", padx=18, pady=(0, 14))
 
         # ---------------------------------------------------------- consulta
-        ctk.CTkLabel(box, text="Computador (hostname ou IP)", font=FONT_SMALL_BOLD,
+        ctk.CTkLabel(box, text="Computador (hostname ou IP)", font=FONT_BOLD,
                      text_color=THEME["muted"]).pack(anchor="w", padx=18, pady=(0, 4))
         self.host_entry = ctk.CTkEntry(
             box, height=38, font=FONT_NORMAL,
@@ -2339,7 +2396,7 @@ class PrintersWindow(ctk.CTkToplevel):
             fill="x", padx=18, pady=(0, 14))
 
         # ------------------------------------------------------------ script
-        ctk.CTkLabel(box, text="Script de inicialização", font=FONT_SMALL_BOLD,
+        ctk.CTkLabel(box, text="Script de inicialização", font=FONT_BOLD,
                      text_color=THEME["muted"]).pack(anchor="w", padx=18, pady=(0, 4))
 
         linha = ctk.CTkFrame(box, fg_color="transparent")
@@ -2360,7 +2417,7 @@ class PrintersWindow(ctk.CTkToplevel):
             text_color=THEME["secondary_button_text"])
         self.btn_folder.grid(row=0, column=1, sticky="e", padx=(8, 0))
 
-        ctk.CTkLabel(box, text=STARTUP_FOLDER, font=FONT_SMALL,
+        ctk.CTkLabel(box, text=STARTUP_FOLDER, font=FONT_NORMAL,
                      text_color=THEME["muted"], justify="left", anchor="w",
                      ).pack(fill="x", padx=18, pady=(0, 10))
 
@@ -2373,7 +2430,7 @@ class PrintersWindow(ctk.CTkToplevel):
             text="Antes de executar, os drivers das filas citadas no script "
                  "são instalados na máquina. Sem isso, o usuário comum não "
                  "consegue puxar a impressora do servidor nem manualmente.",
-            font=FONT_SMALL, text_color=THEME["muted"],
+            font=FONT_NORMAL, text_color=THEME["muted"],
             wraplength=580, justify="left", anchor="w",
         ).pack(fill="x", padx=18, pady=(0, 12))
 
@@ -2387,7 +2444,7 @@ class PrintersWindow(ctk.CTkToplevel):
         # ------------------------------------------------------------- saida
         self.output = ctk.CTkTextbox(
             box, fg_color=THEME["surface_2"], border_color=THEME["border"],
-            text_color=THEME["text"], font=FONT_SMALL, wrap="none")
+            text_color=THEME["text"], font=FONT_MONO, wrap="none")
         self.output.pack(fill="both", expand=True, padx=18, pady=(0, 14))
 
         ctk.CTkButton(

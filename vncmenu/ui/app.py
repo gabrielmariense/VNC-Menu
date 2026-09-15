@@ -21,11 +21,47 @@ from ..config import APP_AUTHOR, APP_NAME, APP_VERSION, COLOR_SCHEME_BLUE, DEFAU
 from ..applog import audit_log, log_exception
 from ..storage import format_host_port, sanitize_port, bootstrap_directories, filter_unit_hosts, get_host_columns, get_hosts_path_for_source, get_sector_hosts, get_sector_names, get_unit_names, hosts_source_display_name, load_global_paths, load_hosts_data, load_settings, normalize_hosts_source, normalize_login_mode, save_settings, set_hosts_source
 from ..theme import FONT_BOLD, FONT_NORMAL, FONT_SMALL, FONT_SMALL_BOLD, FONT_TITLE, THEME, apply_color_theme, normalize_color_scheme
-from ..helpers import bind_clickable_row, get_geometry_size, get_window_geometries, is_valid_geometry, prune_window_geometries, reset_scrollable_frame_position, restore_window_geometry, safe_filename, save_window_geometry, show_error, show_info, show_warning
+from ..helpers import bind_clickable_row, ensure_widget_pool, fit_text_to_width, get_geometry_size, get_window_geometries, is_valid_geometry, prune_window_geometries, reset_scrollable_frame_position, restore_window_geometry, safe_filename, save_window_geometry, show_error, show_info, show_warning
 from ..updates import HTTPS_CONTEXT, calculate_sha256, current_main_entry_name, fetch_latest_release, find_release_zip_asset, get_release_asset_checksum, get_updater_launch_command, normalize_release_version, parse_version
 from .dialogs import ask_text, choose_hosts_source_dialog, confirm_action, ensure_hosts_source_selected, shared_hosts_edit_warning
 from ..remote import format_users_output, launch_vnc, query_all_logged_users, query_logged_users_raw, restart_host
 from .windows import AboutWindow, CredsWindow, HostActionsWindow, HostUnitsConfigWindow, PrintersWindow, PsExecPathWindow, QwinstaProgressWindow, SettingsWindow, UpdateAvailableWindow, UpdateCheckProgressWindow, UpdateDownloadWindow, ViewerPathsWindow, show_text_window
+
+class SearchResultRow(ctk.CTkFrame):
+    """Linha do resultado da busca, com as tres colunas declaradas.
+
+    Subclasse em vez de pendurar os labels numa CTkFrame: o Python aceita o
+    atributo avulso, o verificador de tipos nao, e aqui o nome de cada coluna
+    fica explicito.
+
+    A etiqueta do setor e o endereco ficam com a largura natural; o nome
+    absorve o que a janela tiver de sobra. Largura fixa aqui deixaria a linha
+    esticando com o conteudo parado.
+    """
+
+    def __init__(self, master):
+        super().__init__(
+            master, fg_color=THEME["surface_2"], corner_radius=12, height=40)
+        self.pack_propagate(False)
+
+        self.sector_label = ctk.CTkLabel(
+            self, font=FONT_SMALL_BOLD, text_color=THEME["secondary_button_text"],
+            fg_color=THEME["surface_3"], corner_radius=999,
+            width=SEARCH_SECTOR_COLUMN_WIDTH, anchor="center",
+        )
+        self.sector_label.pack(side="right", padx=(8, 14), pady=7)
+
+        self.host_label = ctk.CTkLabel(
+            self, font=FONT_SMALL, text_color=THEME["muted"],
+            width=SEARCH_HOST_COLUMN_WIDTH, anchor="w",
+        )
+        self.host_label.pack(side="right", padx=(8, 8))
+
+        self.name_label = ctk.CTkLabel(
+            self, font=("Segoe UI", 12, "bold"), text_color=THEME["text"], anchor="w",
+        )
+        self.name_label.pack(side="left", fill="x", expand=True, padx=(14, 8))
+
 
 class App(ctk.CTk):
     def __init__(self):
@@ -48,6 +84,9 @@ class App(ctk.CTk):
         initial_width, initial_height = self.get_saved_main_window_size()
         self.geometry(f"{initial_width}x{initial_height}")
         self._main_geometry_save_after = None
+        self._card_refit_after = None
+        self._card_data = {}
+        self._row_data = {}
         self._update_check_running = False
         self._restart_running = False
         # Declarada aqui para o tipo ficar claro; open_printers_window() a
@@ -110,6 +149,10 @@ class App(ctk.CTk):
         restore_window_geometry(self, "main", initial_width, initial_height)
 
         self.bind("<Configure>", self.schedule_main_window_size_save)
+        # Segundo bind, com debounce proprio e mais curto: o nome do host
+        # precisa ser recortado para a largura NOVA do card. Sem isto o card
+        # crescia e o texto continuava cortado no mesmo ponto.
+        self.bind("<Configure>", self.schedule_card_text_refit, add=True)
         self.protocol("WM_DELETE_WINDOW", self.on_main_close)
         self.after(1200, self.show_pending_update_result)
         self.after(2500, self.maybe_check_for_updates_on_startup)
@@ -140,6 +183,36 @@ class App(ctk.CTk):
             self.after_cancel(self._main_geometry_save_after)
 
         self._main_geometry_save_after = self.after(700, self.save_main_window_size)
+
+    def schedule_card_text_refit(self, event=None):
+        if event is not None and event.widget is not self:
+            return
+        if self._card_refit_after:
+            try:
+                self.after_cancel(self._card_refit_after)
+            except Exception:
+                pass
+        self._card_refit_after = self.after(120, self.refit_card_text)
+
+    def refit_card_text(self):
+        """Recorta os nomes para a largura atual dos cards.
+
+        So mexe no texto: com os cards reaproveitados, isto e um punhado de
+        configure(). Era inviavel antes, quando redesenhar significava
+        destruir e recriar a lista inteira a cada pixel de arrasto.
+        """
+        self._card_refit_after = None
+        if self.search_query:
+            return
+        cols = max(1, min(int(self.host_columns), 6))
+        for card, item in list(self._card_data.items()):
+            try:
+                if not card.winfo_manager():
+                    continue
+                card.configure(
+                    text=self._fit_card_text(str(item.get("name") or "Host"), cols))
+            except Exception:
+                pass
 
     def save_main_window_size(self):
         self._main_geometry_save_after = None
@@ -192,6 +265,9 @@ class App(ctk.CTk):
         self.unit_menu.pack(fill="x", padx=20, pady=(0, 18))
 
         ctk.CTkLabel(self.sidebar, text="SETORES", font=FONT_SMALL_BOLD, text_color=THEME["muted"]).pack(anchor="w", padx=20, pady=(0, 6))
+        # O pool acompanha o container: apply_theme_repaint() destroi a barra
+        # inteira, e um pool guardado fora dela ficaria com widgets mortos.
+        self._sector_pool = []
         self.sector_frame = ctk.CTkScrollableFrame(self.sidebar, fg_color=THEME["bg"], corner_radius=16)
         self.sector_frame.pack(fill="both", expand=True, padx=20, pady=(0, 18))
 
@@ -395,6 +471,10 @@ class App(ctk.CTk):
         self.btn_login_mode.pack(side="left")
         self.update_login_mode_button()
 
+        # Pools do painel principal, pelo mesmo motivo dos setores.
+        self._host_card_pool = []
+        self._search_row_pool = []
+        self._empty_label = None
         self.host_grid = ctk.CTkScrollableFrame(self.main, fg_color=THEME["bg"], corner_radius=18)
         self.host_grid.grid(row=3, column=0, sticky="nsew", padx=22, pady=(0, 18))
 
@@ -521,27 +601,30 @@ class App(ctk.CTk):
         self.unit_menu.set(self.selected_unit.get())
 
     def refresh_sectors(self):
-        for child in self.sector_frame.winfo_children():
-            child.destroy()
-
         sector_names = get_sector_names(self.hosts_data, self.selected_unit.get()) or ["Geral"]
         if self.selected_sector.get() not in sector_names:
             self.selected_sector.set(sector_names[0])
 
-        for name in sector_names:
+        def criar_botao():
+            return ctk.CTkButton(self.sector_frame, anchor="w", height=38)
+
+        botoes = ensure_widget_pool(
+            self._sector_pool, len(sector_names), criar_botao)
+
+        for botao, name in zip(botoes, sector_names):
             # While searching, no sector is driving the list, so none is shown
             # as selected. Highlighting one next to results from other sectors
             # is the kind of small lie that turns into a support call.
             selected = (not self.search_query) and name == self.selected_sector.get()
-            btn = ctk.CTkButton(
-                self.sector_frame,
-                # Negrito so no selecionado: ele e ~8% mais largo, e quem
-                # marca a selecao e a cor de fundo, nao o peso. Em nome de
-                # setor comprido esses 8% sao uns tres caracteres a mais.
-                font=FONT_BOLD if selected else FONT_NORMAL,
+            # TODA propriedade mutavel e reatribuida: um botao reaproveitado
+            # que mantivesse o command antigo levaria para o setor errado.
+            botao.configure(
+                # Negrito em todos: a selecao e marcada pela cor de fundo, que
+                # e contraste suficiente. Negrito e ~8% mais largo, entao a
+                # 340px cabem ~34 caracteres em vez de ~37 — o maior nome de
+                # setor em uso tem 33, ou seja a folga e de um caractere.
+                font=FONT_BOLD,
                 text=name,
-                anchor="w",
-                height=38,
                 fg_color=THEME["accent"] if selected else THEME["surface_2"],
                 hover_color=(
                     THEME["accent_hover"]
@@ -555,73 +638,132 @@ class App(ctk.CTk):
                 ),
                 command=lambda n=name: self.set_sector(n),
             )
-            btn.pack(fill="x", padx=8, pady=5)
+            if not botao.winfo_manager():
+                botao.pack(fill="x", padx=8, pady=5)
+
+    # Largura media do caractere em Segoe UI 12 bold, a fonte do card. Usada
+    # para caber o nome na largura REAL do botao; o corte antigo era fixo em
+    # 22 caracteres e nao mudava ao redimensionar a janela.
+    CARD_CHAR_WIDTH = 7.4
+    # Respiro interno do CTkButton, descontado antes de medir o texto.
+    CARD_TEXT_PADDING = 18
 
     def render_hosts(self):
-        for child in self.host_grid.winfo_children():
-            child.destroy()
-
         self.source_label.configure(text=f"Lista: {hosts_source_display_name(self.hosts_source)}")
 
         if self.search_query:
+            self._hide_pool(self._host_card_pool)
             self.render_search_results()
             return
+
+        self._hide_pool(self._search_row_pool)
 
         hosts = get_sector_hosts(self.hosts_data, self.selected_unit.get(), self.selected_sector.get())
         self.count_label.configure(text=f"{len(hosts)} host(s) encontrado(s)")
 
         if not hosts:
-            ctk.CTkLabel(
-                self.host_grid,
-                text="Nenhum host cadastrado neste setor.",
-                font=FONT_NORMAL,
-                text_color=THEME["muted"],
-            ).pack(anchor="w", padx=18, pady=18)
+            self._hide_pool(self._host_card_pool)
+            self._show_empty_message("Nenhum host cadastrado neste setor.")
             return
 
+        self._hide_empty_message()
         cols = max(1, min(int(self.host_columns), 6))
 
-        for start in range(0, len(hosts), cols):
-            row_hosts = hosts[start:start + cols]
-            row_frame = ctk.CTkFrame(self.host_grid, fg_color="transparent")
-            row_frame.pack(fill="x", padx=8, pady=6)
+        # Os cards vao direto no host_grid, sem linha nem celula intermediaria.
+        # O Tk nao deixa trocar o pai de um widget, entao com a estrutura
+        # antiga um card nunca poderia migrar de linha quando o numero de
+        # colunas mudasse — e sem migrar nao ha reaproveitamento.
+        for coluna in range(6):
+            self.host_grid.grid_columnconfigure(
+                coluna, weight=1 if coluna < cols else 0,
+                uniform="hosts" if coluna < cols else "",
+                minsize=0,
+            )
 
-            for item in row_hosts:
-                display_name = str(item.get("name") or "Host")
-                if len(display_name) > 22:
-                    display_name = display_name[:21] + "…"
+        def criar_card():
+            card = ctk.CTkButton(
+                self.host_grid,
+                font=("Segoe UI", 12, "bold"),
+                text_color=THEME["text"],
+                anchor="center",
+                height=44,
+                fg_color=THEME["surface_2"],
+                hover_color=THEME["accent_soft"],
+                corner_radius=14,
+            )
+            # Ligado UMA vez; o handler le o host atual do dicionario, entao
+            # nao ha rebind a cada redesenho.
+            card.bind(
+                "<Button-3>",
+                lambda event, w=card: self._card_context_menu(event, w),
+                add=True,
+            )
+            return card
 
-                # Each button sits inside an equal-width cell. This prevents
-                # longer labels from making one button wider/taller than the others.
-                cell = ctk.CTkFrame(row_frame, fg_color="transparent", height=44)
-                cell.pack(side="left", fill="x", expand=True, padx=6)
-                cell.pack_propagate(False)
+        cards = ensure_widget_pool(self._host_card_pool, len(hosts), criar_card)
+        self._card_data = {}
 
-                card = ctk.CTkButton(
-                    cell,
-                    text=display_name,
-                    font=("Segoe UI", 12, "bold"),
-                    text_color=THEME["text"],
-                    anchor="center",
-                    height=44,
-                    fg_color=THEME["surface_2"],
-                    hover_color=THEME["accent_soft"],
-                    corner_radius=14,
-                    command=lambda n=item.get("name"), h=item.get("host"), v=item.get("viewer", DEFAULT_VIEWER), p=item.get("port"): self.run_host_action(n, h, v, p),
-                )
-                card.pack(fill="both", expand=True)
-                card.bind(
-                    "<Button-3>",
-                    lambda event, h=item.get("host"), n=item.get("name"), p=item.get("port"): self.show_host_context_menu(event, h, n, p),
-                    add="+",
-                )
+        for indice, (card, item) in enumerate(zip(cards, hosts)):
+            nome = str(item.get("name") or "Host")
+            self._card_data[card] = item
+            card.configure(
+                text=self._fit_card_text(nome, cols),
+                command=lambda n=item.get("name"), h=item.get("host"),
+                v=item.get("viewer", DEFAULT_VIEWER), p=item.get("port"):
+                self.run_host_action(n, h, v, p),
+            )
+            card.grid(
+                row=indice // cols,
+                column=indice % cols,
+                sticky="ew",
+                padx=6,
+                pady=6,
+            )
 
-            missing = cols - len(row_hosts)
-            for _ in range(missing):
-                spacer = ctk.CTkFrame(row_frame, fg_color="transparent", height=44)
-                spacer.pack(side="left", fill="x", expand=True, padx=6)
-                spacer.pack_propagate(False)
+    def _card_context_menu(self, event, card):
+        """Menu de contexto do card, lendo o host atual daquele widget."""
+        item = getattr(self, "_card_data", {}).get(card)
+        if not item:
+            return
+        self.show_host_context_menu(
+            event, item.get("host"), item.get("name"), item.get("port")
+        )
 
+    def _fit_card_text(self, nome, cols):
+        """Nome cortado para a largura real do card, nao para 22 caracteres."""
+        try:
+            disponivel = self.host_grid.winfo_width()
+        except Exception:
+            disponivel = 0
+        if disponivel <= 1:
+            # Antes do primeiro desenho o Tk ainda reporta 1px. Melhor um corte
+            # generoso agora e o ajuste correto no <Configure> seguinte.
+            return nome if len(nome) <= 40 else nome[:39] + "…"
+        largura = (disponivel / max(1, cols)) - (12 + self.CARD_TEXT_PADDING)
+        return fit_text_to_width(nome, largura, self.CARD_CHAR_WIDTH)
+
+    def _hide_pool(self, pool):
+        for widget in pool:
+            gerenciador = widget.winfo_manager()
+            if gerenciador == "pack":
+                widget.pack_forget()
+            elif gerenciador == "grid":
+                widget.grid_forget()
+
+    def _show_empty_message(self, texto):
+        if self._empty_label is None:
+            self._empty_label = ctk.CTkLabel(
+                self.host_grid, font=FONT_NORMAL, text_color=THEME["muted"],
+                anchor="w",
+            )
+        self._empty_label.configure(text=texto)
+        if not self._empty_label.winfo_manager():
+            self._empty_label.grid(
+                row=0, column=0, columnspan=6, sticky="w", padx=18, pady=18)
+
+    def _hide_empty_message(self):
+        if self._empty_label is not None and self._empty_label.winfo_manager():
+            self._empty_label.grid_forget()
 
     def render_search_results(self):
         """One row per match: name, IP/hostname, sector.
@@ -634,75 +776,74 @@ class App(ctk.CTk):
         self.count_label.configure(text=f"{len(results)} host(s) encontrado(s)")
 
         if not results:
-            ctk.CTkLabel(
-                self.host_grid,
-                text=f'Nenhum host encontrado para "{self.search_query}" em {self.selected_unit.get()}.',
-                font=FONT_NORMAL,
-                text_color=THEME["muted"],
-            ).pack(anchor="w", padx=18, pady=18)
+            self._hide_pool(self._search_row_pool)
+            self._show_empty_message(
+                f'Nenhum host encontrado para "{self.search_query}" em {self.selected_unit.get()}.'
+            )
             return
 
-        for sector_name, item in results:
-            self.build_search_result_row(sector_name, item)
+        self._hide_empty_message()
+        linhas = ensure_widget_pool(
+            self._search_row_pool, len(results), self._build_search_row)
+        self._row_data = {}
 
-    def build_search_result_row(self, sector_name, item):
+        for indice, (linha, (sector_name, item)) in enumerate(zip(linhas, results)):
+            self._fill_search_row(linha, sector_name, item)
+            linha.grid(row=indice, column=0, columnspan=6,
+                       sticky="ew", padx=8, pady=4)
+
+    def _build_search_row(self):
+        """Linha vazia do resultado da busca. O conteudo entra depois."""
+        row = SearchResultRow(self.host_grid)
+
+        # Ligado UMA vez: os handlers leem o host atual daquela linha em
+        # _row_data, entao reaproveitar a linha nao exige refazer binding.
+        bind_clickable_row(
+            row,
+            (row.sector_label, row.host_label, row.name_label),
+            lambda _e=None, w=row: self._search_row_click(w),
+            lambda e, w=row: self._search_row_context(e, w),
+            THEME["surface_2"],
+            THEME["accent_soft"],
+        )
+        return row
+
+    def _fill_search_row(self, row, sector_name, item):
         name = str(item.get("name") or "Host")
         host = str(item.get("host") or "")
-        viewer = item.get("viewer", DEFAULT_VIEWER)
         port = item.get("port")
 
-        row = ctk.CTkFrame(self.host_grid, fg_color=THEME["surface_2"], corner_radius=12, height=40)
-        row.pack(fill="x", padx=8, pady=4)
-        row.pack_propagate(False)
+        self._row_data[row] = (sector_name, item)
+        row.sector_label.configure(
+            text=sector_name if len(sector_name) <= 18 else sector_name[:17] + "…")
+        # Shows the port only when it is not the default one, same rule the
+        # context menu already uses.
+        row.host_label.configure(text=format_host_port(host, sanitize_port(port)))
+        row.name_label.configure(
+            text=name if len(name) <= 60 else name[:59] + "…")
 
-        # The sector chip and the address keep their natural width; the name
-        # column absorbs whatever the window has to spare. Fixed pixel widths
-        # here would leave the row stretching while its contents stayed put.
-        sector_label = ctk.CTkLabel(
-            row,
-            text=sector_name if len(sector_name) <= 18 else sector_name[:17] + "…",
-            font=FONT_SMALL_BOLD,
-            text_color=THEME["secondary_button_text"],
-            fg_color=THEME["surface_3"],
-            corner_radius=999,
-            width=SEARCH_SECTOR_COLUMN_WIDTH,
-            anchor="center",
+    def _search_row_click(self, row):
+        dados = getattr(self, "_row_data", {}).get(row)
+        if not dados:
+            return
+        sector_name, item = dados
+        # The row carries its OWN sector, not the selected one: it decides
+        # which RealVNC profile gets opened.
+        self.run_host_action(
+            str(item.get("name") or "Host"),
+            str(item.get("host") or ""),
+            item.get("viewer", DEFAULT_VIEWER),
+            item.get("port"),
+            sector=sector_name,
         )
-        sector_label.pack(side="right", padx=(8, 14), pady=7)
 
-        host_label = ctk.CTkLabel(
-            row,
-            # Shows the port only when it is not the default one, same rule the
-            # context menu already uses.
-            text=format_host_port(host, sanitize_port(port)),
-            font=FONT_SMALL,
-            text_color=THEME["muted"],
-            width=SEARCH_HOST_COLUMN_WIDTH,
-            anchor="w",
-        )
-        host_label.pack(side="right", padx=(8, 8))
-
-        name_label = ctk.CTkLabel(
-            row,
-            text=name if len(name) <= 60 else name[:59] + "…",
-            font=("Segoe UI", 12, "bold"),
-            text_color=THEME["text"],
-            anchor="w",
-        )
-        name_label.pack(side="left", fill="x", expand=True, padx=(14, 8))
-
-        def on_click(_event=None):
-            # The row carries its OWN sector, not the selected one: it decides
-            # which RealVNC profile gets opened.
-            self.run_host_action(name, host, viewer, port, sector=sector_name)
-
-        def on_context(event):
-            self.show_host_context_menu(event, host, name, port)
-
-        bind_clickable_row(
-            row, (name_label, host_label, sector_label), on_click, on_context,
-            THEME["surface_2"], THEME["accent_soft"],
-        )
+    def _search_row_context(self, event, row):
+        dados = getattr(self, "_row_data", {}).get(row)
+        if not dados:
+            return
+        _sector_name, item = dados
+        self.show_host_context_menu(
+            event, item.get("host"), item.get("name"), item.get("port"))
 
     def on_main_unit_changed(self):
         # The search only ever covers one unit. Carrying the query across a unit

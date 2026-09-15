@@ -315,3 +315,69 @@ def bind_clickable_row(row, labels, on_click, on_context, normal_color, hover_co
             widget.bind("<Button-1>", on_click, add="+")
         if on_context is not None:
             widget.bind("<Button-3>", on_context, add="+")
+
+
+def ensure_widget_pool(pool, needed, factory, keep=64):
+    """Reaproveita widgets em vez de destruir e recriar a cada redesenho.
+
+    Criar um CTkButton custa caro: cada um e um tk.Frame com um tk.Canvas
+    (que desenha os cantos arredondados em varios itens) mais um tk.Label.
+    Refazer a lista inteira a cada troca de setor jogava fora e recriava mais
+    de cem objetos Tk, e era isso que dava o piscar branco e a lentidao ao
+    digitar na busca.
+
+    Devolve os `needed` primeiros widgets, ja existentes. Os excedentes sao
+    escondidos pelo gerenciador que estiverem usando e so sao destruidos acima
+    de `keep`: trocar um setor de 200 hosts por um de 5 nao pode deixar 200
+    widgets vivos para sempre, mas destruir a cada refresh anularia o ganho.
+
+    O pool tem de ser recriado junto com o container. Trocar o tema destroi a
+    barra lateral e o painel principal inteiros, entao um pool guardado fora
+    deles ficaria cheio de widgets mortos.
+    """
+    while len(pool) < needed:
+        pool.append(factory())
+
+    for extra in pool[needed:]:
+        gerenciador = extra.winfo_manager()
+        if gerenciador == "pack":
+            extra.pack_forget()
+        elif gerenciador == "grid":
+            extra.grid_forget()
+
+    limite = max(int(needed), int(keep))
+    if len(pool) > limite:
+        for sobra in pool[limite:]:
+            try:
+                sobra.destroy()
+            except Exception:
+                pass
+        del pool[limite:]
+
+    return pool[:needed]
+
+
+def fit_text_to_width(text, pixels, char_width, minimum=6):
+    """Corta o texto para caber em `pixels`, com reticencias.
+
+    Substitui o corte fixo por numero de caracteres, que nao tinha relacao com
+    a largura real do botao: alargar a janela deixava o nome cortado do mesmo
+    jeito. `char_width` e a largura media do caractere na fonte em uso.
+    """
+    texto = str(text or "")
+    try:
+        largura = int(pixels)
+        por_caractere = float(char_width)
+    except (TypeError, ValueError):
+        return texto
+    if largura <= 0 or por_caractere <= 0:
+        return texto
+
+    cabem = int(largura // por_caractere)
+    if cabem >= len(texto):
+        return texto
+    if cabem < int(minimum):
+        cabem = int(minimum)
+    if cabem >= len(texto):
+        return texto
+    return texto[:max(1, cabem - 1)] + "…"

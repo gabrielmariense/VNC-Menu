@@ -148,3 +148,10 @@ FONT_SMALL = ("Segoe UI", 11)
 
 
 FONT_SMALL_BOLD = ("Segoe UI", 11, "bold")
+
+
+# Saida de comando remoto: consulta de impressoras, relatorio do script,
+# qwinsta. Monoespacada de proposito — esses textos vem com as colunas
+# alinhadas por espacos, e uma fonte proporcional desalinha tudo. Em 12 ela
+# ainda le maior que a Segoe UI 11 que estava ali antes.
+FONT_MONO = ("Consolas", 12)
