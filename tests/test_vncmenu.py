@@ -5,8 +5,11 @@ No GUI, no Windows API, no network, no PsExec. Run with:
     python -m unittest discover -s tests -v
 """
 
+import os
 import json
 import sys
+import threading
+import types
 import unittest
 from pathlib import Path
 
@@ -476,7 +479,6 @@ class TestProgressWindows(VncMenuTestCase):
         base = self.app.IndeterminateProgressWindow
         for cls in (
             self.app.QwinstaProgressWindow,
-            self.app.PrinterProgressWindow,
             self.app.UpdateCheckProgressWindow,
         ):
             self.assertTrue(issubclass(cls, base), cls.__name__)
@@ -486,7 +488,6 @@ class TestProgressWindows(VncMenuTestCase):
         self.assertIn("close", vars(base))
         for cls in (
             self.app.QwinstaProgressWindow,
-            self.app.PrinterProgressWindow,
             self.app.UpdateCheckProgressWindow,
         ):
             self.assertNotIn("close", vars(cls))
@@ -499,7 +500,6 @@ class TestProgressWindows(VncMenuTestCase):
         inspect.signature(self.app.QwinstaProgressWindow.__init__).bind(
             None, None, "Unidade > Setor", 3
         )
-        inspect.signature(self.app.PrinterProgressWindow.__init__).bind(None, None, "PC01")
         inspect.signature(self.app.UpdateCheckProgressWindow.__init__).bind(None, None)
         inspect.signature(self.app.IndeterminateProgressWindow.__init__).bind(
             None, None, title="t", heading="h", description="d"
@@ -1320,158 +1320,15 @@ class TestChangelogWindow(VncMenuTestCase):
         self.assertIn("Item de teste", texto)
 
 
-# ------------------------------------------------------------------- OCS
-
-
-def _ocs_row(nome, ip, usuario, lastdate, tag="_HSL", sid="123"):
-    """Linha no formato cru do console: o nome vem embrulhado em <a>."""
-    return {
-        "name": f"<a href='index.php?function=computer&head=1&systemid={sid}'>{nome}</a>",
-        "ipaddr": ip, "userid": usuario, "lastdate": lastdate,
-        "TAG": tag, "userdomain": "CORP",
-    }
-
-
-class TestOcsCleaning(VncMenuTestCase):
-    def test_strips_the_anchor_the_console_wraps_names_in(self):
-        limpar = self.app.clean_text
-        bruto = "<a href='index.php?function=computer&head=1&systemid=45901'>W04-554-045901</a>"
-        self.assertEqual(limpar(bruto), "W04-554-045901")
-
-    def test_unescapes_entities_and_collapses_spaces(self):
-        limpar = self.app.clean_text
-        self.assertEqual(limpar("<b>PC&nbsp;&amp;&nbsp;NOTE</b>"), "PC & NOTE")
-        self.assertEqual(limpar("  W04   554  "), "W04 554")
-
-    def test_empty_values_do_not_blow_up(self):
-        limpar = self.app.clean_text
-        for vazio in (None, "", "   ", "<a></a>"):
-            self.assertEqual(limpar(vazio), "")
-
-    def test_extracts_the_ocs_systemid_from_the_href(self):
-        extrair = self.app.extract_systemid
-        self.assertEqual(extrair("<a href='...&systemid=45901'>X</a>"), "45901")
-        self.assertEqual(extrair("W04-554-045901"), "")
-        self.assertEqual(extrair(None), "")
-
-
-class TestOcsInventoryAge(VncMenuTestCase):
-    def setUp(self):
-        import datetime
-        self.agora = datetime.datetime(2026, 8, 28, 9, 0, 0)
-
-    def test_age_in_days(self):
-        idade = self.app.inventory_age_days
-        self.assertEqual(idade("2026-08-28 08:28:52", self.agora), 0)
-        self.assertEqual(idade("2026-08-27 09:24:39", self.agora), 0)
-        self.assertEqual(idade("2026-07-23 15:52:34", self.agora), 35)
-        self.assertEqual(idade("2025-06-05 16:02:45", self.agora), 448)
-
-    def test_unreadable_dates_return_none_instead_of_guessing(self):
-        idade = self.app.inventory_age_days
-        for ruim in ("", None, "nunca", "28/08/2026"):
-            self.assertIsNone(idade(ruim, self.agora))
-
-    def test_future_dates_clamp_to_zero(self):
-        # Relogio do agente adiantado nao pode virar idade negativa.
-        self.assertEqual(self.app.inventory_age_days("2026-09-30 10:00:00", self.agora), 0)
-
-
-class TestOcsParsing(VncMenuTestCase):
-    def setUp(self):
-        import datetime
-        self.agora = datetime.datetime(2026, 8, 28, 9, 0, 0)
-
-    def test_parses_rows_and_sorts_freshest_first(self):
-        payload = {"recordsFiltered": 3, "data": [
-            _ocs_row("W04-536-014431", "10.0.0.4", "keli.silva", "2026-08-27 21:24:58"),
-            _ocs_row("W04-536-004650", "10.0.0.6", "keli.silva", "2026-08-28 00:33:07"),
-            _ocs_row("W04-536-004707", "10.0.0.14", "keli.silva", "2026-08-27 22:26:25"),
-        ]}
-        r = self.app.parse_search_response(payload, self.agora)
-        self.assertEqual([m["name"] for m in r["machines"]],
-                         ["W04-536-004650", "W04-536-004707", "W04-536-014431"])
-        self.assertFalse(r["truncated"])
-        self.assertEqual(r["total"], 3)
-
-    def test_flags_truncation_instead_of_hiding_it(self):
-        # Pedir 2 e o servidor dizer que existem 340 nao pode virar "achei 2".
-        payload = {"recordsFiltered": 340, "data": [
-            _ocs_row("A", "10.0.0.1", "painel.hsls", "2026-08-28 01:00:00"),
-            _ocs_row("B", "10.0.0.2", "painel.hsls", "2026-08-28 02:00:00"),
-        ]}
-        r = self.app.parse_search_response(payload, self.agora)
-        self.assertTrue(r["truncated"])
-        self.assertEqual(r["total"], 340)
-
-    def test_counts_stale_machines(self):
-        payload = {"recordsFiltered": 3, "data": [
-            _ocs_row("NOVA", "10.0.0.1", "u", "2026-08-28 01:00:00"),
-            _ocs_row("VELHA", "10.0.0.2", "u", "2026-03-05 19:35:15"),
-            _ocs_row("ANTIGA", "10.0.0.3", "u", "2025-06-05 16:02:45"),
-        ]}
-        r = self.app.parse_search_response(payload, self.agora)
-        self.assertEqual(self.app.count_stale(r["machines"]), 2)
-        self.assertFalse(self.app.is_stale(r["machines"][0]))
-        self.assertTrue(self.app.is_stale(r["machines"][-1]))
-
-    def test_machine_without_ip_falls_back_to_its_name(self):
-        # R01-344-CMM01 voltou sem IP no servidor real.
-        payload = {"recordsFiltered": 1,
-                   "data": [_ocs_row("R01-344-CMM01", "", "painel.hsls", "2026-05-06 12:32:24")]}
-        r = self.app.parse_search_response(payload, self.agora)
-        maquina = r["machines"][0]
-        self.assertEqual(maquina["ip"], "")
-        self.assertEqual(self.app.connection_target(maquina), "R01-344-CMM01")
-
-    def test_connection_target_prefers_the_ip(self):
-        alvo = self.app.connection_target
-        self.assertEqual(alvo({"ip": "10.0.0.5", "name": "PC-01"}), "10.0.0.5")
-        self.assertEqual(alvo({"ip": "", "name": "PC-01"}), "PC-01")
-        self.assertEqual(alvo({"ip": "", "name": ""}), "")
-
-    def test_malformed_payloads_raise_instead_of_returning_empty(self):
-        # Uma lista vazia diria "esse usuario nao tem maquina", que e mentira.
-        OcsError = self.app.OcsError
-        for ruim in ({}, {"data": "nao e lista"}, [], None, "texto"):
-            with self.subTest(payload=ruim):
-                with self.assertRaises(OcsError):
-                    self.app.parse_search_response(ruim, self.agora)
-
-    def test_non_dict_rows_are_skipped_not_fatal(self):
-        payload = {"recordsFiltered": 2, "data": [
-            _ocs_row("BOA", "10.0.0.1", "u", "2026-08-28 01:00:00"),
-            "linha estranha",
-        ]}
-        r = self.app.parse_search_response(payload, self.agora)
-        self.assertEqual([m["name"] for m in r["machines"]], ["BOA"])
-
-
-class TestOcsSearchBody(VncMenuTestCase):
-    def test_body_carries_the_term_and_the_csrf_token(self):
-        import urllib.parse
-        corpo = self.app.build_search_body("keli.silva", ("CSRF_8", "a" * 40), 200)
-        campos = dict(urllib.parse.parse_qsl(corpo.decode(), keep_blank_values=True))
-        self.assertEqual(campos["search[value]"], "keli.silva")
-        self.assertEqual(campos["length"], "200")
-        self.assertEqual(campos["CSRF_8"], "a" * 40)
-        # As 41 colunas precisam ir: o PHP indexa parte da consulta por posicao.
-        self.assertEqual(campos["columns[0][data]"], "CHECK")
-        self.assertEqual(campos["columns[5][data]"], "userid")
-        self.assertEqual(campos["columns[28][data]"], "ipaddr")
-        self.assertEqual(campos["columns[40][data]"], "ACTIONS")
-
-    def test_body_is_valid_without_a_token(self):
-        corpo = self.app.build_search_body("x", None, 50)
-        self.assertIn(b"search%5Bvalue%5D=x", corpo)
-
-
 class TestCredentialsMerge(VncMenuTestCase):
-    """creds.json passou a guardar duas credenciais: UltraVNC e OCS.
+    """creds.json e gravado por mesclagem, nao por substituicao.
+
+    Hoje so ha a credencial do UltraVNC, mas o arquivo continua sendo mesclado
+    de proposito: reescrever o dict inteiro faria um gravador apagar qualquer
+    outra chave guardada ali, e o usuario so descobriria ao precisar dela.
 
     DPAPI so existe no Windows, entao aqui o par encrypt/decrypt vira um
-    reversivel simples. O que precisa ser testado e a MESCLAGEM do arquivo,
-    nao a criptografia do sistema.
+    reversivel simples. O que se testa e a MESCLAGEM, nao a criptografia.
     """
 
     def mesclagem_testavel(self):
@@ -1482,64 +1339,1135 @@ class TestCredentialsMerge(VncMenuTestCase):
             ),
         )
 
-    def test_saving_one_credential_does_not_erase_the_other(self):
-        # Gravar uma reescrevendo o arquivo inteiro apagaria a outra, e so se
-        # descobriria ao precisar dela.
+    def test_saving_does_not_erase_other_keys_in_the_file(self):
         cifrar, decifrar = self.mesclagem_testavel()
         with cifrar, decifrar:
+            # Chave de outro gravador (ou de uma versao anterior do app).
+            self.app._write_creds_file({"chave_de_terceiro": "valor"})
             self.app.save_creds("usuario-vnc", "senha-vnc")
-            self.app.save_ocs_creds("usuario-ocs", "senha-ocs")
 
             self.assertEqual(self.app.load_creds(), ("usuario-vnc", "senha-vnc"))
-            self.assertEqual(self.app.load_ocs_creds(), ("usuario-ocs", "senha-ocs"))
+            self.assertEqual(
+                self.app._read_creds_file().get("chave_de_terceiro"), "valor")
 
-            # E na ordem inversa tambem.
+    def test_rewriting_the_credential_keeps_the_rest(self):
+        cifrar, decifrar = self.mesclagem_testavel()
+        with cifrar, decifrar:
+            self.app._write_creds_file({"chave_de_terceiro": "valor"})
+            self.app.save_creds("usuario-vnc", "senha-vnc")
             self.app.save_creds("outro-vnc", "outra-senha")
-            self.assertEqual(self.app.load_ocs_creds(), ("usuario-ocs", "senha-ocs"))
+
             self.assertEqual(self.app.load_creds(), ("outro-vnc", "outra-senha"))
+            self.assertEqual(
+                self.app._read_creds_file().get("chave_de_terceiro"), "valor")
 
-    def test_missing_ocs_credentials_read_as_empty(self):
-        self.assertIsInstance(self.app.load_ocs_creds(), tuple)
+    def test_a_missing_file_reads_as_empty_credentials(self):
+        self.assertIsInstance(self.app.load_creds(), tuple)
 
 
-class TestOcsWindows(VncMenuTestCase):
-    def test_windows_exist_and_are_wired(self):
-        for nome in ("OcsSearchWindow", "OcsConfigWindow"):
-            self.assertTrue(hasattr(self.app, nome), f"{nome} sumiu de ui/windows.py")
-        for metodo in ("open_ocs_search", "open_ocs_config"):
-            self.assertTrue(hasattr(self.app.App, metodo), f"App.{metodo} sumiu")
-        for metodo in ("start_search", "render", "build_row", "format_age"):
-            self.assertTrue(hasattr(self.app.OcsSearchWindow, metodo))
+class TestSingleHostSessionCheck(VncMenuTestCase):
+    """Consulta de sessoes de UMA maquina, pelo menu de contexto.
 
-    def test_age_label_is_short_enough_to_sit_beside_the_date(self):
-        # A idade e o que impede alguem de confiar num registro velho, entao
-        # precisa caber sempre, sem empurrar a coluna do nome.
-        rotular = self.app.OcsSearchWindow.format_age
-        self.assertEqual(rotular({"age_days": 0}), "hoje")
-        self.assertEqual(rotular({"age_days": 1}), "1 dia")
-        self.assertEqual(rotular({"age_days": 448}), "448 d")
-        for texto in ("hoje", "1 dia", "448 d"):
-            self.assertLessEqual(len(texto), 6)
-        # Sem idade conhecida nao se inventa nada.
-        self.assertEqual(rotular({"age_days": None}), "")
-        self.assertEqual(rotular({}), "")
+    O botao Usuarios so roda no setor inteiro, entao sem este caminho nao ha
+    como ver o motivo real de uma maquina especifica falhar.
+    """
 
-    def test_date_label_always_carries_the_year(self):
-        # Um registro de 448 dias mostrado como "05/06" pareceria recente.
-        formatar = self.app.OcsSearchWindow.format_date
-        self.assertEqual(formatar({"lastdate": "2025-06-05 16:02:45"}), "05/06/25 16:02")
-        self.assertEqual(formatar({"lastdate": "2026-08-28 08:28:52"}), "28/08/26 08:28")
-        self.assertEqual(formatar({"lastdate": ""}), "sem data")
-        self.assertEqual(formatar({}), "sem data")
-        # Formato inesperado aparece como veio, em vez de sumir.
-        self.assertEqual(formatar({"lastdate": "28/08/2026"}), "28/08/2026")
+    def _pieces(self):
+        """Progresso e janela de texto falsos, mais um App de mentira."""
 
-    def test_clickable_row_helper_is_shared_not_duplicated(self):
-        # A logica de hover e chata o bastante para nao existir em duas copias.
-        self.assertTrue(hasattr(self.app, "bind_clickable_row"))
-        import inspect
-        parametros = list(inspect.signature(self.app.bind_clickable_row).parameters)
-        self.assertEqual(
-            parametros,
-            ["row", "labels", "on_click", "on_context", "normal_color", "hover_color"],
+        class FakeProgress:
+            def __init__(self, *args, **kwargs):
+                self.closed = False
+
+            def winfo_exists(self):
+                return True
+
+            def close(self):
+                self.closed = True
+
+        registro = {"textos": [], "erros": [], "progressos": []}
+
+        def fake_progress(*args, **kwargs):
+            p = FakeProgress()
+            registro["progressos"].append(p)
+            return p
+
+        def fake_text_window(parent, title, content, **kwargs):
+            registro["textos"].append((title, content))
+
+        def fake_error(parent, title, message):
+            registro["erros"].append((title, message))
+
+        class FakeApp:
+            """Faz o papel do laco do Tk: guarda os callbacks e os executa.
+
+            Conta com semaforo em vez de Event porque uma consulta pode estar
+            no ar enquanto outra ja terminou; com Event, drenar() correria
+            antes do segundo after() e o teste passaria por acidente.
+            """
+
+            def __init__(self):
+                self.pendentes = []
+                self._lock = threading.Lock()
+                self._chegou = threading.Semaphore(0)
+
+            def after(self, _ms, fn):
+                with self._lock:
+                    self.pendentes.append(fn)
+                self._chegou.release()
+
+            def drenar(self, esperados=1):
+                for _ in range(esperados):
+                    assert self._chegou.acquire(timeout=10), "o worker nunca chamou after()"
+                while True:
+                    with self._lock:
+                        if not self.pendentes:
+                            return
+                        proximo = self.pendentes.pop(0)
+                    proximo()
+
+        return FakeApp(), registro, fake_progress, fake_text_window, fake_error
+
+    def _run(self, consulta, host="10.104.111.6", nome="ANALISTA-01", app=None):
+        fake, registro, fake_progress, fake_text, fake_error = self._pieces()
+        if app is not None:
+            fake = app
+        with vncmenu_loader.patched_global(self.app, "query_logged_users_raw", consulta), \
+             vncmenu_loader.patched_global(self.app, "QwinstaProgressWindow", fake_progress), \
+             vncmenu_loader.patched_global(self.app, "show_text_window", fake_text), \
+             vncmenu_loader.patched_global(self.app, "show_error", fake_error):
+            self.app.App.show_host_sessions(fake, host, nome)
+            fake.drenar()
+        return fake, registro
+
+    def test_the_raw_qwinsta_text_reaches_the_user(self):
+        # O ponto da tela: "ERRO: Acesso negado" e o que permite agir, e a
+        # a lista de setor nunca teria espaco para isso.
+        _fake, registro = self._run(
+            lambda alvos: [(alvos[0]["name"], "ERRO: Acesso negado (5)")]
         )
+        self.assertEqual(len(registro["textos"]), 1)
+        titulo, conteudo = registro["textos"][0]
+        self.assertIn("ANALISTA-01", titulo)
+        self.assertIn("ERRO: Acesso negado (5)", conteudo)
+        self.assertEqual(registro["erros"], [])
+
+    def test_the_host_actually_queried_is_the_one_that_was_clicked(self):
+        vistos = []
+
+        def consulta(alvos):
+            vistos.append(list(alvos))
+            return [(alvos[0]["name"], "VAZIO")]
+
+        self._run(consulta, host="\\\\10.104.111.6  ", nome="ANALISTA-01")
+        self.assertEqual(vistos, [[{"name": "ANALISTA-01", "host": "10.104.111.6"}]])
+
+    def test_a_host_without_a_name_still_gets_a_usable_title(self):
+        _fake, registro = self._run(
+            lambda alvos: [(alvos[0]["name"], "VAZIO")],
+            nome="",
+        )
+        titulo, _conteudo = registro["textos"][0]
+        self.assertIn("10.104.111.6", titulo)
+
+    def test_a_failure_is_shown_instead_of_an_empty_report(self):
+        def explode(_alvos):
+            raise OSError("qwinsta nao encontrado")
+
+        _fake, registro = self._run(explode)
+        self.assertEqual(registro["textos"], [])
+        self.assertEqual(len(registro["erros"]), 1)
+        self.assertIn("qwinsta nao encontrado", registro["erros"][0][1])
+
+    def test_the_progress_window_closes_on_both_paths(self):
+        _fake, ok = self._run(lambda alvos: [(alvos[0]["name"], "VAZIO")])
+        self.assertTrue(all(p.closed for p in ok["progressos"]))
+
+        def explode(_alvos):
+            raise OSError("falhou")
+
+        _fake, ruim = self._run(explode)
+        self.assertTrue(all(p.closed for p in ruim["progressos"]))
+
+    def test_two_clicks_on_the_same_host_do_not_open_two_windows(self):
+        # Sem a trava, o segundo clique abre uma segunda janela de progresso e
+        # uma segunda de resultado, e a de cima esconde a de baixo.
+        liberar = threading.Event()
+
+        def consulta(alvos):
+            liberar.wait(10)
+            return [(alvos[0]["name"], "VAZIO")]
+
+        fake, registro, fake_progress, fake_text, fake_error = self._pieces()
+        with vncmenu_loader.patched_global(self.app, "query_logged_users_raw", consulta), \
+             vncmenu_loader.patched_global(self.app, "QwinstaProgressWindow", fake_progress), \
+             vncmenu_loader.patched_global(self.app, "show_text_window", fake_text), \
+             vncmenu_loader.patched_global(self.app, "show_error", fake_error):
+            self.app.App.show_host_sessions(fake, "10.104.111.6", "ANALISTA-01")
+            self.app.App.show_host_sessions(fake, "10.104.111.6", "ANALISTA-01")
+            self.assertEqual(len(registro["progressos"]), 1)
+            liberar.set()
+            fake.drenar(1)
+
+        self.assertEqual(len(registro["textos"]), 1)
+
+        # E, terminada a consulta, o host volta a poder ser consultado.
+        with vncmenu_loader.patched_global(self.app, "query_logged_users_raw",
+                                           lambda alvos: [(alvos[0]["name"], "VAZIO")]), \
+             vncmenu_loader.patched_global(self.app, "QwinstaProgressWindow", fake_progress), \
+             vncmenu_loader.patched_global(self.app, "show_text_window", fake_text), \
+             vncmenu_loader.patched_global(self.app, "show_error", fake_error):
+            self.app.App.show_host_sessions(fake, "10.104.111.6", "ANALISTA-01")
+            fake.drenar(1)
+        self.assertEqual(len(registro["textos"]), 2)
+
+    def test_another_host_is_not_blocked_by_the_first(self):
+        liberar = threading.Event()
+
+        def consulta(alvos):
+            liberar.wait(10)
+            return [(alvos[0]["name"], "VAZIO")]
+
+        fake, registro, fake_progress, fake_text, fake_error = self._pieces()
+        with vncmenu_loader.patched_global(self.app, "query_logged_users_raw", consulta), \
+             vncmenu_loader.patched_global(self.app, "QwinstaProgressWindow", fake_progress), \
+             vncmenu_loader.patched_global(self.app, "show_text_window", fake_text), \
+             vncmenu_loader.patched_global(self.app, "show_error", fake_error):
+            self.app.App.show_host_sessions(fake, "10.104.111.6", "ANALISTA-01")
+            self.app.App.show_host_sessions(fake, "10.104.111.7", "ANALISTA-02")
+            self.assertEqual(len(registro["progressos"]), 2)
+            liberar.set()
+            fake.drenar(2)
+        self.assertEqual(len(registro["textos"]), 2)
+
+    def test_an_empty_host_does_nothing_at_all(self):
+        fake, registro, fake_progress, fake_text, fake_error = self._pieces()
+        with vncmenu_loader.patched_global(self.app, "QwinstaProgressWindow", fake_progress), \
+             vncmenu_loader.patched_global(self.app, "show_text_window", fake_text):
+            self.app.App.show_host_sessions(fake, "   ", "Sem host")
+        self.assertEqual(registro["progressos"], [])
+        self.assertEqual(registro["textos"], [])
+
+    def test_the_context_menu_offers_it(self):
+        # Sem a entrada no menu o metodo existe e ninguem alcanca.
+        import ast
+
+        origem = (vncmenu_loader.PACKAGE_DIR / "ui" / "app.py").read_text(encoding="utf-8")
+        arvore = ast.parse(origem)
+        alvo = None
+        for node in ast.walk(arvore):
+            if isinstance(node, ast.FunctionDef) and node.name == "show_host_context_menu":
+                alvo = node
+        self.assertIsNotNone(alvo, "show_host_context_menu sumiu")
+        rotulos = [
+            c.value for c in ast.walk(alvo)
+            if isinstance(c, ast.Constant) and isinstance(c.value, str)
+        ]
+        self.assertIn("Sessões", rotulos)
+        chamadas = [
+            n.func.attr for n in ast.walk(alvo)
+            if isinstance(n, ast.Call) and isinstance(n.func, ast.Attribute)
+        ]
+        self.assertIn("show_host_sessions", chamadas)
+
+
+class TestModeSystemRemoved(VncMenuTestCase):
+    """Conectar/Reiniciar deixaram de ser modos.
+
+    O modo antigo armava um estado global e o clique no host fazia o que o
+    modo dissesse. Deixar em Reiniciar e voltar depois reiniciava a máquina
+    num clique de conexão. Estes testes fixam o novo contrato: clicar conecta,
+    reiniciar é ação por host.
+    """
+
+    @classmethod
+    def setUpClass(cls):
+        super().setUpClass()
+        import ast
+
+        cls.origem = (vncmenu_loader.PACKAGE_DIR / "ui" / "app.py").read_text(encoding="utf-8")
+        cls.arvore = ast.parse(cls.origem)
+        cls.classe = next(
+            n for n in ast.walk(cls.arvore)
+            if isinstance(n, ast.ClassDef) and n.name == "App"
+        )
+        cls.metodos = {
+            n.name: n for n in cls.classe.body if isinstance(n, ast.FunctionDef)
+        }
+
+    def _chamadas(self, metodo):
+        import ast
+
+        node = self.metodos.get(metodo)
+        self.assertIsNotNone(node, f"App.{metodo} sumiu")
+        return {
+            n.func.attr for n in ast.walk(node)
+            if isinstance(n, ast.Call) and isinstance(n.func, ast.Attribute)
+        } | {
+            n.func.id for n in ast.walk(node)
+            if isinstance(n, ast.Call) and isinstance(n.func, ast.Name)
+        }
+
+    def test_the_mode_machinery_is_gone_entirely(self):
+        # Não basta esconder os botões: o estado e o alternador têm de sumir,
+        # senão o clique no host ainda poderia cair no ramo de reinício.
+        # "self.mode." e "self.mode " pegam o StringVar antigo sem esbarrar em
+        # self.mode_label, que é a legenda de busca e continua viva.
+        for morto in ("def set_mode", "self.mode.", "self.mode ",
+                      'value="connect"', 'value="restart"',
+                      "self.btn_connect", "self.btn_restart"):
+            self.assertNotIn(morto, self.origem, f"resquício do sistema de modos: {morto!r}")
+
+    def test_clicking_a_host_always_connects(self):
+        chamadas = self._chamadas("run_host_action")
+        self.assertIn("launch_vnc", chamadas)
+        # Nunca mais confirmar/reiniciar a partir de um clique de host.
+        self.assertNotIn("restart_host_async", chamadas)
+        self.assertNotIn("confirm_action", chamadas)
+
+    def test_restart_is_reachable_from_the_host_context_menu(self):
+        import ast
+
+        node = self.metodos["show_host_context_menu"]
+        rotulos = [
+            c.value for c in ast.walk(node)
+            if isinstance(c, ast.Constant) and isinstance(c.value, str)
+        ]
+        self.assertIn("Reiniciar", rotulos)
+        self.assertIn("restart_host_from_menu", self._chamadas("show_host_context_menu"))
+
+    def test_the_manual_host_button_opens_the_actions_window(self):
+        self.assertIn("HostActionsWindow", self._chamadas("open_manual_host"))
+        # E o botão da tela principal chama open_manual_host, senão a janela
+        # existe e ninguém a alcança.
+        self.assertIn("command=self.open_manual_host", self.origem)
+
+    def test_the_old_custom_host_dialog_is_no_longer_wired(self):
+        # ask_custom_connection continua existindo em dialogs.py, mas a tela
+        # principal não o usa mais: quem faz host manual agora é a janela.
+        self.assertNotIn("ask_custom_connection", self.origem)
+
+
+class TestManualHostActions(VncMenuTestCase):
+    """connect_manual_host / restart_manual_host / restart_host_from_menu."""
+
+    def _fake_app(self, auto=True):
+        app = types.SimpleNamespace()
+        app.automatic_login_enabled = lambda: auto
+        app.restart_calls = []
+        app.restart_host_async = lambda *a, **k: app.restart_calls.append((a, k))
+        return app
+
+    def test_connect_passes_the_host_through_to_the_viewer(self):
+        registro = []
+
+        def fake_launch(host, viewer, name=None, sector=None, parent=None, **kw):
+            registro.append((host, viewer, kw.get("automatic_login"), kw.get("port")))
+
+        app = self._fake_app(auto=True)
+        with vncmenu_loader.patched_global(self.app, "launch_vnc", fake_launch):
+            self.app.App.connect_manual_host(app, "10.0.0.5", "realvnc", 5901)
+        self.assertEqual(registro, [("10.0.0.5", "realvnc", True, 5901)])
+
+    def test_connect_ignores_an_empty_host(self):
+        registro = []
+        with vncmenu_loader.patched_global(
+            self.app, "launch_vnc", lambda *a, **k: registro.append(a)
+        ):
+            self.app.App.connect_manual_host(self._fake_app(), "   ")
+        self.assertEqual(registro, [])
+
+    def test_connect_strips_leading_backslashes(self):
+        registro = []
+
+        def fake_launch(host, *a, **k):
+            registro.append(host)
+
+        with vncmenu_loader.patched_global(self.app, "launch_vnc", fake_launch):
+            self.app.App.connect_manual_host(self._fake_app(), "\\\\10.0.0.5", "ultravnc", None)
+        self.assertEqual(registro, ["10.0.0.5"])
+
+    def test_restart_only_fires_after_a_yes(self):
+        app = self._fake_app()
+        with vncmenu_loader.patched_global(self.app, "confirm_action", lambda *a, **k: True):
+            self.app.App.restart_manual_host(app, "10.0.0.5")
+        self.assertEqual(len(app.restart_calls), 1)
+        self.assertEqual(app.restart_calls[0][0][0], "10.0.0.5")
+
+    def test_restart_does_nothing_on_a_no(self):
+        app = self._fake_app()
+        with vncmenu_loader.patched_global(self.app, "confirm_action", lambda *a, **k: False):
+            self.app.App.restart_manual_host(app, "10.0.0.5")
+        self.assertEqual(app.restart_calls, [])
+
+    def test_restart_ignores_an_empty_host_without_even_asking(self):
+        app = self._fake_app()
+        pediu = []
+        with vncmenu_loader.patched_global(
+            self.app, "confirm_action", lambda *a, **k: pediu.append(True) or True
+        ):
+            self.app.App.restart_manual_host(app, "   ")
+        self.assertEqual(app.restart_calls, [])
+        self.assertEqual(pediu, [], "não deveria nem perguntar sem host")
+
+    def test_context_menu_restart_keeps_the_display_name(self):
+        app = self._fake_app()
+        with vncmenu_loader.patched_global(self.app, "confirm_action", lambda *a, **k: True):
+            self.app.App.restart_host_from_menu(app, "10.0.0.5", "ANALISTA-01")
+        self.assertEqual(app.restart_calls[0][0], ("10.0.0.5", "ANALISTA-01"))
+
+    def test_the_window_splits_host_and_port_before_acting(self):
+        # O campo aceita host::porta; a janela tem de separar antes de mandar.
+        janela = types.SimpleNamespace()
+        janela.current_host = lambda: "10.0.0.5::5901"
+        janela.viewer_var = types.SimpleNamespace(get=lambda: "ultravnc")
+        capturado = []
+        janela.parent = types.SimpleNamespace(
+            connect_manual_host=lambda host, viewer, port: capturado.append((host, viewer, port))
+        )
+        self.app.HostActionsWindow.do_connect(janela)
+        self.assertEqual(capturado, [("10.0.0.5", "ultravnc", 5901)])
+
+    def test_the_window_offers_every_action(self):
+        for metodo in ("do_connect", "do_restart", "do_sessions", "do_printers",
+                       "update_buttons_state"):
+            self.assertTrue(hasattr(self.app.HostActionsWindow, metodo),
+                            f"HostActionsWindow.{metodo} sumiu")
+
+
+# ------------------------------------------- executar script de inicializacao
+
+
+class TestScriptNameValidation(VncMenuTestCase):
+    def test_accepts_a_plain_file_name(self):
+        self.assertEqual(self.app.validate_script_name("  IMPRESSORAS.vbs  "),
+                         "IMPRESSORAS.vbs")
+
+    def test_strips_surrounding_quotes(self):
+        self.assertEqual(self.app.validate_script_name('"IMPRESSORAS.vbs"'),
+                         "IMPRESSORAS.vbs")
+
+    def test_rejects_an_empty_name(self):
+        with self.assertRaises(ValueError):
+            self.app.validate_script_name("   ")
+
+    def test_rejects_anything_that_carries_a_path(self):
+        # O campo e um nome; aceitar caminho viraria execucao remota de
+        # qualquer arquivo da maquina a partir de uma caixa de texto.
+        for nome in (r"..\..\Windows\System32\algo.vbs",
+                     r"C:\Windows\Temp\algo.vbs",
+                     "sub/algo.vbs",
+                     r"\\servidor\share\algo.vbs"):
+            with self.assertRaises(ValueError, msg=nome):
+                self.app.validate_script_name(nome)
+
+    def test_rejects_extensions_that_are_not_scripts(self):
+        for nome in ("IMPRESSORAS.exe", "IMPRESSORAS", "config.ini"):
+            with self.assertRaises(ValueError, msg=nome):
+                self.app.validate_script_name(nome)
+
+    def test_accepts_the_three_script_extensions_in_any_case(self):
+        for nome in ("a.vbs", "a.VBS", "a.cmd", "a.Bat"):
+            self.assertEqual(self.app.validate_script_name(nome), nome)
+
+
+class TestRunScriptPayload(VncMenuTestCase):
+    def _payload(self, nome="IMPRESSORAS.vbs"):
+        return self.app._build_run_script_payload(nome)
+
+    def test_runs_through_a_scheduled_task_with_the_interactive_token(self):
+        # E o unico jeito sem senha de usar a sessao do usuario logado.
+        # AddWindowsPrinterConnection grava no HKCU de quem chama, entao
+        # rodar direto como SYSTEM mapearia no perfil errado.
+        payload = self._payload()
+        self.assertIn("New-ScheduledTaskPrincipal", payload)
+        self.assertIn("-LogonType Interactive", payload)
+
+    def test_never_runs_the_script_directly_as_system(self):
+        payload = self._payload()
+        # O host do script so pode aparecer como acao da tarefa, nunca solto.
+        self.assertIn("New-ScheduledTaskAction -Execute 'wscript.exe'", payload)
+        self.assertEqual(payload.count("wscript.exe"), 1)
+
+    def test_a_vbs_runs_with_no_window_on_the_user_screen(self):
+        # cscript abria console na tela do usuario; fechar aquela janela
+        # matava o script, possivelmente com as impressoras ja apagadas.
+        payload = self._payload()
+        self.assertNotIn("cscript.exe", payload)
+        self.assertIn("//B", payload)
+        self.assertTrue(self.app.script_runs_hidden("IMPRESSORAS.vbs"))
+
+    def test_the_task_still_runs_on_battery(self):
+        # Padrao do New-ScheduledTaskSettingsSet e NAO iniciar na bateria: num
+        # notebook a tarefa era criada, disparada e nunca rodava.
+        self.assertIn("-AllowStartIfOnBatteries", self._payload())
+        self.assertIn("-DontStopIfGoingOnBatteries", self._payload())
+
+    def test_windows_kills_a_stuck_task_by_itself(self):
+        # O app remove a tarefa e vai embora; sem limite proprio, um script
+        # travado ficaria rodando na maquina do usuario para sempre.
+        self.assertIn("-ExecutionTimeLimit", self._payload())
+
+    def test_stops_before_creating_the_task_when_nobody_is_logged_on(self):
+        payload = self._payload()
+        self.assertIn("Send 'no_user' ''", payload)
+        antes = payload.index("Send 'no_user' ''")
+        depois = payload.index("Register-ScheduledTask")
+        self.assertLess(antes, depois, "a guarda tem de vir antes de registrar")
+
+    def test_always_removes_the_temporary_task(self):
+        payload = self._payload()
+        # Uma antes (sobra de execucao anterior), uma no start_failed, uma no
+        # fim. Sem isso a maquina acumula tarefas orfas.
+        self.assertGreaterEqual(payload.count("Unregister-ScheduledTask"), 3)
+
+    def test_the_file_name_is_quoted_as_a_powershell_literal(self):
+        payload = self._payload("nome'esquisito.vbs")
+        self.assertIn("$name='nome''esquisito.vbs'", payload)
+
+    def test_lists_the_folder_so_a_wrong_name_shows_the_real_ones(self):
+        payload = self._payload()
+        self.assertIn("$o.Available", payload)
+        self.assertIn("Send 'no_script' ''", payload)
+
+
+class TestRunScriptParsing(VncMenuTestCase):
+    def _wrap(self, data):
+        import base64 as b64
+        import json as js
+        blob = b64.b64encode(js.dumps(data).encode("utf-8")).decode("ascii")
+        return f"ruido\n__VNC_MENU_RUNVBS_BEGIN__{blob}__VNC_MENU_RUNVBS_END__\nmais ruido"
+
+    def test_reads_the_marked_payload(self):
+        data = self.app.parse_run_script_payload(
+            self._wrap({"Status": "ok", "User": "DOM\\fulano"})
+        )
+        self.assertEqual(data["Status"], "ok")
+        self.assertEqual(data["User"], "DOM\\fulano")
+
+    def test_missing_or_corrupt_payload_is_empty(self):
+        self.assertEqual(self.app.parse_run_script_payload(""), {})
+        self.assertEqual(self.app.parse_run_script_payload("sem marcador"), {})
+        self.assertEqual(
+            self.app.parse_run_script_payload(
+                "__VNC_MENU_RUNVBS_BEGIN__QQQ==__VNC_MENU_RUNVBS_END__"
+            ),
+            {},
+        )
+
+    def test_a_json_list_is_not_accepted_as_a_result(self):
+        self.assertEqual(self.app.parse_run_script_payload(self._wrap([1, 2])), {})
+
+
+class TestRunScriptReport(VncMenuTestCase):
+    def test_success_says_the_exit_code_does_not_prove_anything(self):
+        # O script da empresa nunca desliga o ON ERROR RESUME NEXT, entao ele
+        # sai 0 mesmo falhando. O relatorio nao pode dar a entender sucesso.
+        texto = self.app.format_script_run_report(
+            "PC-01", {"Status": "ok", "User": "DOM\\fulano", "LastResult": 0}
+        )
+        self.assertIn("Impressoras", texto)
+        self.assertIn("não informa sucesso", texto)
+
+    def test_missing_script_lists_what_is_in_the_folder(self):
+        texto = self.app.format_script_run_report(
+            "PC-01",
+            {"Status": "no_script", "Available": ["IMPRESSORA.vbs", "outro.vbs"]},
+        )
+        self.assertIn("IMPRESSORA.vbs", texto)
+        self.assertIn("outro.vbs", texto)
+
+    def test_empty_folder_says_so_instead_of_listing_nothing(self):
+        texto = self.app.format_script_run_report(
+            "PC-01", {"Status": "no_script", "Available": []}
+        )
+        self.assertIn("vazia", texto)
+
+    def test_no_user_explains_why_nothing_ran(self):
+        texto = self.app.format_script_run_report("PC-01", {"Status": "no_user"})
+        self.assertIn("Nenhum usuário logado", texto)
+        self.assertIn("SYSTEM", texto)
+
+    def test_windows_message_is_shown_when_the_task_could_not_be_created(self):
+        texto = self.app.format_script_run_report(
+            "PC-01", {"Status": "register_failed", "Detail": "Acesso negado"}
+        )
+        self.assertIn("Acesso negado", texto)
+
+    def test_an_unknown_status_is_not_reported_as_success(self):
+        texto = self.app.format_script_run_report("PC-01", {"Status": "vaitesaber"})
+        self.assertIn("não reconhecido", texto)
+        self.assertNotIn("não informa sucesso", texto)
+
+    def test_every_status_the_script_can_send_has_a_message(self):
+        payload = self.app._build_run_script_payload("a.vbs")
+        import re as _re
+        enviados = set(_re.findall(r"Send '([a-z_]+)'", payload))
+        self.assertTrue(enviados)
+        faltando = enviados - set(self.app.SCRIPT_RUN_STATUS)
+        self.assertEqual(faltando, set(), f"status sem texto: {faltando}")
+
+
+class TestPrintersWindowWiring(VncMenuTestCase):
+    def test_the_window_offers_every_action(self):
+        for metodo in ("open_folder", "do_query", "do_run"):
+            self.assertTrue(hasattr(self.app.PrintersWindow, metodo),
+                            f"PrintersWindow.{metodo} sumiu")
+
+    def test_opening_the_folder_reuses_the_host_menu_path(self):
+        # Um caminho so para a pasta: se o menu de contexto e a janela
+        # montassem o UNC cada um do seu jeito, um dia divergiriam.
+        abertos = []
+        janela = types.SimpleNamespace(
+            _host=lambda: "PC-01",
+            parent=types.SimpleNamespace(
+                open_host_startup_folder=lambda host: abertos.append(host)
+            ),
+        )
+        self.app.PrintersWindow.open_folder(janela)
+        self.assertEqual(abertos, ["PC-01"])
+
+    def test_opening_the_folder_without_a_host_warns_instead_of_opening(self):
+        abertos = []
+        avisos = []
+        janela = types.SimpleNamespace(
+            _host=lambda: "",
+            host_entry=types.SimpleNamespace(focus_set=lambda: None),
+            parent=types.SimpleNamespace(
+                open_host_startup_folder=lambda host: abertos.append(host)
+            ),
+        )
+        with vncmenu_loader.patched_global(
+            self.app, "show_warning", lambda *a, **k: avisos.append(a)
+        ):
+            self.app.PrintersWindow.open_folder(janela)
+        self.assertEqual(abertos, [])
+        self.assertEqual(len(avisos), 1)
+
+    def test_the_app_can_open_the_window_and_reuses_the_open_one(self):
+        # Sem guardar a referencia, o coletor pode destruir a janela com a
+        # thread trabalhadora ainda rodando.
+        criadas = []
+
+        class Fake:
+            def __init__(self, parent, host="", display_name=""):
+                criadas.append((host, display_name))
+                self.parent = parent
+
+            def winfo_exists(self):
+                return True
+
+            def lift(self):
+                pass
+
+            def focus(self):
+                pass
+
+        app = types.SimpleNamespace(_printers_window=None)
+        with vncmenu_loader.patched_global(self.app, "PrintersWindow", Fake):
+            primeira = self.app.App.open_printers_window(app, "PC-01", "RECEPCAO")
+            segunda = self.app.App.open_printers_window(app, "PC-02", "OUTRO")
+        self.assertEqual(criadas, [("PC-01", "RECEPCAO")])
+        self.assertIs(primeira, segunda)
+        self.assertIs(app._printers_window, primeira)
+
+
+# ------------------------------------------------- instalacao de drivers
+
+
+class TestPrinterPathParsing(VncMenuTestCase):
+    def test_reads_the_paths_the_company_script_maps(self):
+        vbs = (
+            'strPrinterPath = "\\\\SRV1315\\HSLN_FATURAMENTO_CENTRAL"\n'
+            'WshNetwork.AddWindowsPrinterConnection strPrinterPath\n'
+            'strPrinterPath = "\\\\SRV1315\\HSLN_FAT01"\n'
+            'WshNetwork.SetDefaultPrinter "\\\\SRV1315\\HSLN_FATURAMENTO_CENTRAL"\n'
+        )
+        self.assertEqual(
+            self.app.parse_printer_paths(vbs),
+            ["\\\\SRV1315\\HSLN_FATURAMENTO_CENTRAL", "\\\\SRV1315\\HSLN_FAT01"],
+        )
+
+    def test_keeps_the_order_of_the_script(self):
+        vbs = '"\\\\S\\B"\n"\\\\S\\A"\n'
+        self.assertEqual(self.app.parse_printer_paths(vbs), ["\\\\S\\B", "\\\\S\\A"])
+
+    def test_ignores_strings_that_are_not_a_queue(self):
+        # "." e o strComputer do WMI; \\SRV sozinho nao tem fila para instalar.
+        vbs = 'strComputer = "."\nx = "\\\\SRV1315"\ny = "winmgmts:"\n'
+        self.assertEqual(self.app.parse_printer_paths(vbs), [])
+
+    def test_empty_or_broken_input_is_an_empty_list(self):
+        for entrada in ("", None, 12345):
+            self.assertEqual(self.app.parse_printer_paths(entrada), [])
+class TestDriverInstallReport(VncMenuTestCase):
+    def test_lists_each_queue_with_its_error(self):
+        texto = self.app.format_driver_install_report("PC-01", {
+            "Status": "ok",
+            "Results": [
+                {"Path": "\\\\SRV1315\\FILA_A", "Ok": True, "Error": ""},
+                {"Path": "\\\\SRV1315\\FILA_B", "Ok": False, "Error": "Acesso negado"},
+            ],
+        })
+        self.assertIn("OK    \\\\SRV1315\\FILA_A", texto)
+        self.assertIn("FALHA \\\\SRV1315\\FILA_B", texto)
+        self.assertIn("Acesso negado", texto)
+
+    def test_failures_are_reported_even_when_the_phase_says_ok(self):
+        # "ok" e o script ter rodado ate o fim, nao toda fila ter instalado.
+        data = {"Status": "ok", "Results": [
+            {"Path": "\\\\S\\A", "Ok": False, "Error": "erro"}]}
+        self.assertEqual(self.app.driver_install_failures(data), [("\\\\S\\A", "erro")])
+        self.assertIn("falharam", self.app.format_driver_install_report("PC", data))
+
+    def test_a_clean_run_does_not_invent_failures(self):
+        data = {"Status": "ok", "Results": [{"Path": "\\\\S\\A", "Ok": True}]}
+        self.assertEqual(self.app.driver_install_failures(data), [])
+        self.assertNotIn("falharam", self.app.format_driver_install_report("PC", data))
+
+    def test_a_script_with_no_queues_explains_why(self):
+        texto = self.app.format_driver_install_report("PC", {"Status": "no_queues"})
+        self.assertIn("Nenhum caminho", texto)
+        self.assertIn("variável", texto)
+
+    def test_an_unknown_status_is_not_reported_as_success(self):
+        texto = self.app.format_driver_install_report("PC", {"Status": "vaitesaber"})
+        self.assertIn("não reconhecido", texto)
+
+    def test_every_status_the_payload_can_send_has_a_message(self):
+        import re as _re
+        payload = self.app._build_driver_install_payload("a.vbs")
+        enviados = set(_re.findall(r"Send '([a-z_]+)'", payload))
+        self.assertTrue(enviados)
+        self.assertEqual(enviados - set(self.app.DRIVER_INSTALL_STATUS), set())
+class TestScriptHostChoice(VncMenuTestCase):
+    def test_vbs_uses_the_windowless_host(self):
+        self.assertEqual(self.app.script_host_command("A.VBS"),
+                         ("wscript.exe", "//nologo //B"))
+
+    def test_batch_files_use_cmd_and_are_not_hidden(self):
+        for nome in ("x.cmd", "x.bat"):
+            self.assertEqual(self.app.script_host_command(nome)[0], "cmd.exe")
+            self.assertFalse(self.app.script_runs_hidden(nome), nome)
+
+    def test_an_unsupported_extension_raises(self):
+        with self.assertRaises(ValueError):
+            self.app.script_host_command("x.exe")
+
+    def test_the_accepted_extensions_are_exactly_the_ones_with_a_host(self):
+        # Aceitar no campo uma extensao sem host definido daria erro so na
+        # hora de montar a tarefa, no meio do atendimento.
+        for extensao in self.app.SCRIPT_HOSTS:
+            self.assertEqual(self.app.validate_script_name("a" + extensao),
+                             "a" + extensao)
+        with self.assertRaises(ValueError):
+            self.app.validate_script_name("a.ps1")
+
+class TestDriverInstallRunsAsSystem(VncMenuTestCase):
+    def _command(self):
+        capturado = {}
+
+        def fake_run(command, host, psexec_path, timeout):
+            capturado["command"] = list(command)
+            raise self.app.PsExecQueryError("parou aqui", "hint")
+
+        with vncmenu_loader.patched_global(self.app, "_run_psexec", fake_run):
+            with self.assertRaises(self.app.PsExecQueryError):
+                self.app.install_printer_drivers(
+                    "10.0.0.5", "IMPRESSORAS.vbs", "psexec.exe")
+        return capturado["command"]
+
+    def test_it_runs_as_system_and_never_sends_a_password(self):
+        # -u/-p foi tentado em producao e nao serve: o PsExec faz logon
+        # interativo no alvo e a conta nao tem esse direito nas estacoes
+        # (1385). SYSTEM nao faz logon nenhum e o servidor de impressao
+        # libera o driver para a conta de maquina.
+        command = self._command()
+        self.assertIn("-s", command)
+        self.assertNotIn("-u", command)
+        self.assertNotIn("-p", command)
+
+    def test_the_elevated_token_is_still_requested(self):
+        # Escrever no driver store precisa do token elevado.
+        self.assertIn("-h", self._command())
+
+    def test_install_takes_no_credential_argument(self):
+        import inspect
+        parametros = list(
+            inspect.signature(self.app.install_printer_drivers).parameters)
+        self.assertEqual(parametros, ["host", "script_name", "psexec_path"])
+
+    def test_the_account_never_appears_in_the_technical_details(self):
+        # Sem -u nao ha conta a reportar; a linha existia so para aquele caso.
+        detalhes = self.app._build_psexec_details("10.0.0.5", "psexec.exe", 2)
+        self.assertNotIn("Conta:", detalhes)
+
+
+class TestDriverInstallIsNotOptional(VncMenuTestCase):
+    def _source(self):
+        import inspect
+        return inspect.getsource(self.app.PrintersWindow.do_run)
+
+    def test_the_window_has_no_driver_checkbox_left(self):
+        self.assertFalse(hasattr(self.app.PrintersWindow, "install_drivers"))
+        fonte = self._source()
+        self.assertNotIn("install_drivers", fonte)
+
+    def test_the_install_is_not_behind_a_condition(self):
+        # Era "if com_drivers:". Se voltar a ser condicional, as maquinas que
+        # precisam do driver falham de novo e o operador nao tem como saber
+        # antes de rodar.
+        fonte = self._source()
+        self.assertIn("install_printer_drivers(host, script_name, psexec_path)", fonte)
+        self.assertNotIn("com_drivers", fonte)
+
+    def test_a_failed_install_still_blocks_the_script(self):
+        fonte = self._source()
+        self.assertIn('drivers.get("Status") != "ok"', fonte)
+        self.assertIn("abortado = True", fonte)
+        # O run so acontece depois da guarda.
+        self.assertLess(fonte.index("abortado = True"),
+                        fonte.index("run_startup_script("))
+
+
+class TestCredentialTypingCannotLeak(VncMenuTestCase):
+    """A credencial nunca pode sair da janela de autenticacao.
+
+    O bug real: com send_keys(), fechar o viewer ou clicar na barra de busca
+    enquanto o dialogo abria fazia usuario e senha serem digitados na janela
+    que estivesse em primeiro plano. A garantia agora e estrutural, nao uma
+    checagem a mais antes de digitar.
+    """
+
+    def test_the_module_does_not_import_the_global_keyboard(self):
+        # Se send_keys voltar ao modulo, volta o caminho que vaza.
+        import inspect
+        fonte = inspect.getsource(self.app.__modules__["vncmenu.remote"])
+        self.assertNotIn("from pywinauto.keyboard import", fonte)
+
+    def test_the_autofill_never_calls_send_keys(self):
+        import ast as _ast, inspect
+        arvore = _ast.parse(inspect.getsource(self.app.auto_enter_uvnc_credentials))
+        chamadas = {
+            n.func.id for n in _ast.walk(arvore)
+            if isinstance(n, _ast.Call) and isinstance(n.func, _ast.Name)
+        }
+        self.assertNotIn("send_keys", chamadas)
+
+    def test_the_blind_fallback_is_gone(self):
+        # Era o pior caminho: digitava a senha sem controle nenhum amarrado.
+        import inspect
+        fonte = inspect.getsource(self.app.auto_enter_uvnc_credentials)
+        self.assertIn("no_edit_controls", fonte)
+        self.assertNotIn("with_spaces", fonte)
+
+    def test_submitting_only_uses_handle_bound_calls(self):
+        import ast as _ast, inspect
+        arvore = _ast.parse(inspect.getsource(self.app._submit_auth_dialog))
+        # Pelo texto nao serve: o docstring cita send_keys para explicar por
+        # que ele nao e usado. O que importa e o que a funcao CHAMA.
+        nomes = {
+            n.func.id for n in _ast.walk(arvore)
+            if isinstance(n, _ast.Call) and isinstance(n.func, _ast.Name)
+        }
+        self.assertNotIn("send_keys", nomes)
+        metodos = {
+            n.func.attr for n in _ast.walk(arvore)
+            if isinstance(n, _ast.Call) and isinstance(n.func, _ast.Attribute)
+        }
+        self.assertIn("click", metodos)
+        self.assertIn("post_message", metodos)
+
+
+class TestCredentialAutofillCancellation(VncMenuTestCase):
+    class _Edit:
+        def __init__(self, escritos):
+            self.escritos = escritos
+
+        def set_text(self, valor):
+            self.escritos.append(valor)
+
+    class _Dialog:
+        def __init__(self, edits, fecha_apos_achar=False, cancela_ao_esperar=None):
+            self._edits = edits
+            self._achado = False
+            self._fecha_apos_achar = fecha_apos_achar
+            self._cancela_ao_esperar = cancela_ao_esperar
+            self.enviado = False
+
+        def wait(self, *_a, **_k):
+            # O operador fechando o viewer no exato instante entre achar o
+            # dialogo e preencher: e a janela em que o bug antigo digitava.
+            if self._cancela_ao_esperar is not None:
+                self._cancela_ao_esperar.set()
+            return self
+
+        def exists(self, *_a, **_k):
+            # True na busca (senao o dialogo nem seria achado) e False depois,
+            # que e o caso de a janela sumir antes de digitarmos.
+            if not self._achado:
+                self._achado = True
+                return True
+            return not self._fecha_apos_achar
+
+        def descendants(self, **_k):
+            return self._edits
+
+        def wrapper_object(self):
+            return self
+
+        def handle(self):
+            return 1
+
+    def _run(self, cancel, dialogo):
+        escritos = []
+        with vncmenu_loader.patched_global(
+            self.app, "load_creds", lambda: ("usuario", "senha")
+        ), vncmenu_loader.patched_global(
+            self.app, "_auth_dialog_candidates", lambda _pid: [({}, "process")]
+        ), vncmenu_loader.patched_global(
+            self.app, "Desktop", lambda **_k: types.SimpleNamespace(
+                window=lambda **_kk: dialogo)
+        ), vncmenu_loader.patched_global(
+            self.app, "_submit_auth_dialog",
+            lambda d: setattr(d, "enviado", True)
+        ):
+            ok = self.app.auto_enter_uvnc_credentials(
+                timeout=0.5, process_id=123, cancel=cancel)
+        return ok, escritos
+
+    def test_a_cancelled_connection_types_nothing(self):
+        escritos = []
+        dialogo = self._Dialog([self._Edit(escritos), self._Edit(escritos)])
+        cancel = threading.Event()
+        cancel.set()
+        ok, _ = self._run(cancel, dialogo)
+        self.assertFalse(ok)
+        self.assertEqual(escritos, [])
+        self.assertFalse(dialogo.enviado)
+
+    def test_a_dialog_that_closes_after_being_found_types_nothing(self):
+        # Achado, depois fechado: sem a checagem de exists() antes de escrever,
+        # a senha ia para um dialogo que o operador ja abandonou.
+        escritos = []
+        dialogo = self._Dialog(
+            [self._Edit(escritos), self._Edit(escritos)], fecha_apos_achar=True)
+        ok, _ = self._run(threading.Event(), dialogo)
+        self.assertFalse(ok)
+        self.assertEqual(escritos, [])
+        self.assertFalse(dialogo.enviado)
+
+    def test_cancelling_after_the_dialog_is_found_types_nothing(self):
+        # O cancelamento chega DEPOIS do match, que e o caso real de fechar a
+        # janela do VNC enquanto o dialogo de credenciais ja apareceu.
+        escritos = []
+        cancel = threading.Event()
+        dialogo = self._Dialog(
+            [self._Edit(escritos), self._Edit(escritos)], cancela_ao_esperar=cancel)
+        ok, _ = self._run(cancel, dialogo)
+        self.assertFalse(ok)
+        self.assertEqual(escritos, [])
+        self.assertFalse(dialogo.enviado)
+
+    def test_no_edit_controls_means_give_up_not_type_blindly(self):
+        dialogo = self._Dialog([])
+        ok, _ = self._run(threading.Event(), dialogo)
+        self.assertFalse(ok)
+        self.assertFalse(dialogo.enviado)
+
+    def test_a_normal_run_fills_both_fields_and_submits(self):
+        escritos = []
+        dialogo = self._Dialog([self._Edit(escritos), self._Edit(escritos)])
+        ok, _ = self._run(threading.Event(), dialogo)
+        self.assertTrue(ok)
+        self.assertEqual(escritos, ["usuario", "senha"])
+        self.assertTrue(dialogo.enviado)
+
+    def test_the_starter_hands_back_a_cancel_handle(self):
+        import inspect
+        assinatura = inspect.signature(self.app.start_uvnc_credential_autofill)
+        self.assertIn("process", assinatura.parameters)
+        # Sem devolver o Event, quem chama nao tem como cancelar.
+        self.assertIn("return cancel",
+                      inspect.getsource(self.app.start_uvnc_credential_autofill))
+
+    def test_a_viewer_that_exits_cancels_the_fill(self):
+        """O comportamento, nao o texto: viewer fechado para o preenchimento.
+
+        O preenchimento falso espera no Event. Com o vigia, o processo morto
+        libera essa espera em milissegundos; sem ele, a espera estoura e a
+        credencial continuaria sendo digitada ate o timeout.
+        """
+        class ViewerMorto:
+            pid = 1
+
+            def poll(self):
+                return 0
+
+        cancelado = []
+        # Esperar so no Event de cancelamento nao basta: ele e acionado pelo
+        # vigia, e a thread do preenchimento ainda pode nao ter registrado
+        # nada. A espera tem de ser no FIM do preenchimento.
+        terminou = threading.Event()
+
+        def falso_preenchimento(process_id=None, cancel=None):
+            cancelado.append(bool(cancel is not None and cancel.wait(3)))
+            terminou.set()
+            return False
+
+        with vncmenu_loader.patched_global(
+            self.app, "auto_enter_uvnc_credentials", falso_preenchimento
+        ):
+            cancel = self.app.start_uvnc_credential_autofill(1, ViewerMorto())
+            self.assertTrue(terminou.wait(5), "o preenchimento nao terminou")
+            self.assertTrue(cancel.is_set(), "o Event nunca foi acionado")
+
+        self.assertEqual(cancelado, [True],
+                         "o preenchimento nao viu o cancelamento a tempo")
+
+    def test_without_a_process_the_fill_still_runs(self):
+        # Sem processo nao ha o que vigiar; o preenchimento normal continua.
+        chamadas = []
+        terminou = threading.Event()
+
+        def falso_preenchimento(process_id=None, cancel=None):
+            chamadas.append(process_id)
+            terminou.set()
+            return False
+
+        with vncmenu_loader.patched_global(
+            self.app, "auto_enter_uvnc_credentials", falso_preenchimento
+        ):
+            self.app.start_uvnc_credential_autofill(7)
+            self.assertTrue(terminou.wait(5), "o preenchimento nao rodou")
+
+        self.assertEqual(chamadas, [7])
+
+    def test_the_viewer_launch_passes_the_process_for_cancellation(self):
+        import inspect
+        fonte = inspect.getsource(self.app.launch_vnc)
+        self.assertIn("start_uvnc_credential_autofill(viewer_process.pid, viewer_process)",
+                      fonte)
+
+
+class TestPrintersWindowNeverActsOnItsOwn(VncMenuTestCase):
+    def test_opening_the_window_does_not_query(self):
+        # Abrir pelo menu de contexto mandava PsExec para a maquina antes de
+        # qualquer clique; um menu aberto por engano virava trafego no alvo.
+        import ast as _ast, inspect
+        import textwrap
+        fonte = inspect.getsource(self.app.PrintersWindow.__init__)
+        self.assertNotIn("auto_query", fonte)
+        arvore = _ast.parse(textwrap.dedent(fonte))
+        agendados = [
+            n.args[1].attr for n in _ast.walk(arvore)
+            if isinstance(n, _ast.Call)
+            and isinstance(n.func, _ast.Attribute)
+            and n.func.attr == "after"
+            and len(n.args) > 1
+            and isinstance(n.args[1], _ast.Attribute)
+        ]
+        self.assertNotIn("do_query", agendados)
+
+    def test_the_window_takes_no_auto_query_argument(self):
+        import inspect
+        parametros = list(
+            inspect.signature(self.app.PrintersWindow.__init__).parameters)
+        self.assertEqual(parametros, ["self", "parent", "host", "display_name"])
+
+
+class TestManualHostActions(VncMenuTestCase):
+    def test_copy_ip_is_gone(self):
+        # O IP foi digitado ali mesmo; copiar dali nao serve para nada. No
+        # menu de contexto continua, que e onde o IP vem da lista.
+        self.assertFalse(hasattr(self.app.HostActionsWindow, "do_copy_ip"))
+
+    def test_the_remaining_actions_match_the_context_menu(self):
+        for metodo in ("do_connect", "do_restart", "do_sessions", "do_printers",
+                       "do_admin_share", "do_startup_folder"):
+            self.assertTrue(hasattr(self.app.HostActionsWindow, metodo),
+                            f"HostActionsWindow.{metodo} sumiu")
+
+
+class TestSidebarFitsSectorNames(VncMenuTestCase):
+    """A lateral e a largura da janela andam juntas.
+
+    Alargar a lateral sem subir a minima da janela tira o espaco da grade de
+    hosts, cujos nomes ja truncam. Estes testes fixam a relacao, que e o que
+    se esquece ao mexer em uma das duas.
+    """
+
+    def _source(self, metodo):
+        import inspect, textwrap
+        return textwrap.dedent(inspect.getsource(metodo))
+
+    def _numero(self, fonte, prefixo):
+        import re as _re
+        achado = _re.search(prefixo + r"\s*=\s*(\d+)", fonte)
+        self.assertIsNotNone(achado, f"nao achei {prefixo}")
+        return int(achado.group(1))
+
+    def test_the_sidebar_is_wide_enough_for_the_longest_sector(self):
+        # Descontando padding do frame (20x2), do botao (8x2), a barra de
+        # rolagem (~20) e o respiro do texto (~12), sobra o texto util. Em
+        # Segoe UI 13 normal, ~7px por caractere.
+        largura = self._numero(
+            self._source(self.app.App.build_sidebar), r"CTkFrame\(self, width")
+        util = largura - 40 - 16 - 20 - 12
+        self.assertGreaterEqual(util // 7, 33,
+                                "nao cabe o maior nome de setor da lista real")
+
+    def test_the_minimum_window_grew_with_the_sidebar(self):
+        fonte = self._source(self.app.App.__init__)
+        import re as _re
+        achado = _re.search(r"self\.minsize\((\d+), (\d+)\)", fonte)
+        self.assertIsNotNone(achado)
+        minima = int(achado.group(1))
+        largura = self._numero(
+            self._source(self.app.App.build_sidebar), r"CTkFrame\(self, width")
+        # Referencia: o 2.5.0 publicado (janela minima 940, lateral 300), que
+        # deixava 640px para a grade de hosts. Alargar a lateral sem subir a
+        # minima junto tira desses 640. Contra o 2.4.0 (lateral 260) a grade e
+        # 80px mais estreita na largura minima, o que foi uma escolha, nao um
+        # descuido: o nome de setor comprido valia mais.
+        self.assertGreaterEqual(minima - largura, 940 - 300)
+
+    def test_only_the_selected_sector_is_bold(self):
+        # Negrito e ~8% mais largo; usa-lo em todos custava caracteres sem
+        # marcar nada, porque a selecao e dada pela cor de fundo.
+        fonte = self._source(self.app.App.refresh_sectors)
+        self.assertIn("FONT_BOLD if selected else FONT_NORMAL", fonte)
+
+
+class TestSidebarWidthIsActuallyApplied(VncMenuTestCase):
+    """A largura declarada da lateral precisa chegar na tela.
+
+    Bug real: a barra era criada com width=, mas segurada com
+    grid_propagate(False) enquanto todos os filhos usam pack(). Como
+    grid_propagate so vale para filhos geridos por grid, ele nao segurava
+    nada: os filhos ditavam a largura e o width= era ignorado. Tres ajustes
+    seguidos de largura (260, 300, 340) nao mudaram um pixel.
+    """
+
+    def _source(self):
+        import inspect, textwrap
+        return textwrap.dedent(inspect.getsource(self.app.App.build_sidebar))
+
+    def test_the_frame_is_held_by_pack_propagate(self):
+        fonte = self._source()
+        self.assertIn("self.sidebar.pack_propagate(False)", fonte)
+        self.assertNotIn("self.sidebar.grid_propagate(", fonte)
+
+    def test_every_child_of_the_sidebar_is_packed(self):
+        # A escolha entre pack_propagate e grid_propagate depende disto. Se um
+        # filho passar a usar grid, a trava tem de mudar junto.
+        fonte = self._source()
+        # self.sidebar.grid(...) e a propria barra se colocando na raiz, nao
+        # um filho; o que importa e como os FILHOS sao geridos.
+        filhos = [
+            linha for linha in fonte.splitlines()
+            if ".grid(" in linha and "self.sidebar.grid(" not in linha
+        ]
+        self.assertEqual(filhos, [],
+                         "algum filho da lateral passou a usar grid")
+        self.assertIn(".pack(", fonte)

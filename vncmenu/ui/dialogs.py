@@ -193,7 +193,7 @@ def ask_text(parent: Any, title: str, label: str, initial: str = "") -> str | No
     entry.pack(fill="x", padx=18, pady=(0, 18))
     entry.insert(0, initial or "")
     entry.focus_set()
-    entry.select_range(0, tk.END)
+    entry.select_range(0, "end")
 
     def confirm(_event=None):
         dialog.close(entry.get().strip() or None)
@@ -356,7 +356,9 @@ def ask_host_details(parent: Any, title: str, initial: dict[str, str] | None = N
         else:
             port = typed_port
 
-        entry = {
+        # Anotado porque "port" e int e o resto e str: sem isto o dict e
+        # inferido como dict[str, str] e a linha da porta vira erro de tipo.
+        entry: dict[str, Any] = {
             "name": name,
             "host": host,
             "viewer": sanitize_viewer(viewer_var.get()),

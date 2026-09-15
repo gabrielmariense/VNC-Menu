@@ -19,22 +19,22 @@ import zipfile
 
 from ..config import APP_AUTHOR, APP_NAME, APP_VERSION, COLOR_SCHEME_BLUE, DEFAULT_VIEWER, ERROR_LOG, HOSTS_SOURCE_CUSTOM, HOSTS_SOURCE_SHARED, LOGIN_MODE_AUTO, LOGIN_MODE_MANUAL, SCRIPT_DIR, SEARCH_DEBOUNCE_MS, SEARCH_HOST_COLUMN_WIDTH, SEARCH_SECTOR_COLUMN_WIDTH, UPDATE_DOWNLOAD_DIR, UPDATE_RESULT_JSON
 from ..applog import audit_log, log_exception
-from ..storage import format_host_port, sanitize_port, bootstrap_directories, filter_unit_hosts, find_psexec, get_host_columns, get_hosts_path_for_source, get_sector_hosts, get_sector_names, get_unit_names, hosts_source_display_name, load_global_paths, load_hosts_data, load_settings, normalize_hosts_source, normalize_login_mode, save_settings, set_hosts_source
+from ..storage import format_host_port, sanitize_port, bootstrap_directories, filter_unit_hosts, get_host_columns, get_hosts_path_for_source, get_sector_hosts, get_sector_names, get_unit_names, hosts_source_display_name, load_global_paths, load_hosts_data, load_settings, normalize_hosts_source, normalize_login_mode, save_settings, set_hosts_source
 from ..theme import FONT_BOLD, FONT_NORMAL, FONT_SMALL, FONT_SMALL_BOLD, FONT_TITLE, THEME, apply_color_theme, normalize_color_scheme
 from ..helpers import bind_clickable_row, get_geometry_size, get_window_geometries, is_valid_geometry, prune_window_geometries, reset_scrollable_frame_position, restore_window_geometry, safe_filename, save_window_geometry, show_error, show_info, show_warning
 from ..updates import HTTPS_CONTEXT, calculate_sha256, current_main_entry_name, fetch_latest_release, find_release_zip_asset, get_release_asset_checksum, get_updater_launch_command, normalize_release_version, parse_version
-from .dialogs import ask_text, choose_hosts_source_dialog, confirm_action, ensure_hosts_source_selected, shared_hosts_edit_warning, show_psexec_required_dialog
-from ..remote import PsExecQueryError, format_users_output, host_responds_to_ping, launch_vnc, log_psexec_failure, query_all_logged_users, query_logged_users_raw, query_remote_printers, restart_host
-from .windows import AboutWindow, CredsWindow, HostActionsWindow, OcsConfigWindow, OcsSearchWindow, HostUnitsConfigWindow, PrinterProgressWindow, PsExecPathWindow, QwinstaProgressWindow, SettingsWindow, UpdateAvailableWindow, UpdateCheckProgressWindow, UpdateDownloadWindow, ViewerPathsWindow, show_psexec_error_dialog, show_text_window
+from .dialogs import ask_text, choose_hosts_source_dialog, confirm_action, ensure_hosts_source_selected, shared_hosts_edit_warning
+from ..remote import format_users_output, launch_vnc, query_all_logged_users, query_logged_users_raw, restart_host
+from .windows import AboutWindow, CredsWindow, HostActionsWindow, HostUnitsConfigWindow, PrintersWindow, PsExecPathWindow, QwinstaProgressWindow, SettingsWindow, UpdateAvailableWindow, UpdateCheckProgressWindow, UpdateDownloadWindow, ViewerPathsWindow, show_text_window
 
 class App(ctk.CTk):
     def __init__(self):
         super().__init__()
         self.title("VNC-Menu")
-        # 940 e nao 900: a linha de acoes tem 5 botoes (582px) e a 900 o
-        # ultimo saia cortado. Se algum botao entrar ou sair daqui, refazer
-        # a conta: largura = 582 + 36 (janela) + 260 (lateral) + 12 + 44.
-        self.minsize(940, 560)
+        # 980 acompanha a barra lateral: ela foi de 260 para 340 para caber
+        # nome de setor comprido, e sem subir a minima junto a grade de hosts
+        # e que perderia os 80px. Mexer na largura da lateral pede mexer aqui.
+        self.minsize(980, 560)
 
         self.settings = load_settings()
 
@@ -50,6 +50,9 @@ class App(ctk.CTk):
         self._main_geometry_save_after = None
         self._update_check_running = False
         self._restart_running = False
+        # Declarada aqui para o tipo ficar claro; open_printers_window() a
+        # substitui pela janela e a reusa enquanto ela existir.
+        self._printers_window = None
 
         self.dark_mode = bool(self.settings.get("dark_mode", True))
         self.color_scheme = normalize_color_scheme(
@@ -114,17 +117,17 @@ class App(ctk.CTk):
     def get_saved_main_window_size(self):
         geometry = get_window_geometries(self.settings).get("main")
         if geometry and is_valid_geometry(str(geometry)):
-            width, height = get_geometry_size(str(geometry), 980, 610)
-            return max(940, width), max(560, height)
+            width, height = get_geometry_size(str(geometry), 1020, 610)
+            return max(980, width), max(560, height)
 
-        raw = str(self.settings.get("main_window_size") or "980x610").lower().strip()
+        raw = str(self.settings.get("main_window_size") or "1020x610").lower().strip()
         try:
             width_text, height_text = raw.split("x", 1)
-            width = max(940, int(width_text))
+            width = max(980, int(width_text))
             height = max(560, int(height_text))
             return width, height
         except Exception:
-            return 980, 610
+            return 1020, 610
 
     def schedule_main_window_size_save(self, event=None):
         if event is not None and event.widget is not self:
@@ -152,9 +155,20 @@ class App(ctk.CTk):
         self.destroy()
 
     def build_sidebar(self):
-        self.sidebar = ctk.CTkFrame(self, width=260, fg_color=THEME["surface"], corner_radius=22)
+        # 340 medido em captura de tela, nao estimado: com a barra em 272px
+        # o botao de setor rendeu 184px e coube 27 caracteres, ou seja a
+        # barra perde 88px para padding e barra de rolagem antes de sobrar
+        # texto. A 340 o botao fica com 252px, ~37 caracteres; o maior nome
+        # de setor da lista real tem 33. Alargar aqui tira espaco da grade de
+        # hosts, entao a largura minima da janela subiu junto.
+        self.sidebar = ctk.CTkFrame(self, width=340, fg_color=THEME["surface"], corner_radius=22)
         self.sidebar.grid(row=0, column=0, sticky="ns", padx=(18, 12), pady=18)
-        self.sidebar.grid_propagate(False)
+        # pack_propagate e NAO grid_propagate: todos os filhos desta barra sao
+        # empacotados com pack(). grid_propagate() so governa filhos geridos
+        # por grid, entao com nenhum ali ele nao fazia nada, os filhos
+        # continuavam ditando a largura e o width= acima era ignorado. Era por
+        # isso que mudar a largura da lateral nao mudava nada na tela.
+        self.sidebar.pack_propagate(False)
 
         ctk.CTkLabel(self.sidebar, text="VNC-Menu", font=FONT_TITLE, text_color=THEME["text"]).pack(anchor="w", padx=20, pady=(22, 4))
         self.source_label = ctk.CTkLabel(self.sidebar, text="", font=FONT_SMALL, text_color=THEME["muted"])
@@ -312,18 +326,7 @@ class App(ctk.CTk):
             font=FONT_BOLD,
             text="Impressoras",
             height=38,
-            command=self.show_remote_printers,
-            fg_color=THEME["surface_3"],
-            hover_color=THEME["accent_soft"],
-            text_color=THEME["secondary_button_text"],
-        )
-
-        self.btn_ocs = ctk.CTkButton(
-            actions,
-            font=FONT_BOLD,
-            text="Inventário",
-            height=38,
-            command=self.open_ocs_search,
+            command=self.open_printers_window,
             fg_color=THEME["surface_3"],
             hover_color=THEME["accent_soft"],
             text_color=THEME["secondary_button_text"],
@@ -334,7 +337,7 @@ class App(ctk.CTk):
         # Conectar e Reiniciar sairam daqui: conectar virou o clique no host,
         # reiniciar foi para o menu de contexto. Sobram as tres ferramentas
         # que agem por conta propria.
-        botoes = (self.btn_users, self.btn_printers, self.btn_ocs)
+        botoes = (self.btn_users, self.btn_printers)
         for coluna, botao in enumerate(botoes):
             ultimo = coluna == len(botoes) - 1
             actions.grid_columnconfigure(coluna, weight=1, uniform="acoes")
@@ -532,7 +535,10 @@ class App(ctk.CTk):
             selected = (not self.search_query) and name == self.selected_sector.get()
             btn = ctk.CTkButton(
                 self.sector_frame,
-                font=FONT_BOLD,
+                # Negrito so no selecionado: ele e ~8% mais largo, e quem
+                # marca a selecao e a cor de fundo, nao o peso. Em nome de
+                # setor comprido esses 8% sao uns tres caracteres a mais.
+                font=FONT_BOLD if selected else FONT_NORMAL,
                 text=name,
                 anchor="w",
                 height=38,
@@ -857,7 +863,7 @@ class App(ctk.CTk):
 
         def open_printers():
             close_menu()
-            self.show_remote_printers(host, display_name)
+            self.open_printers_window(host, display_name)
 
         def open_sessions():
             close_menu()
@@ -887,7 +893,7 @@ class App(ctk.CTk):
         menu.add_command(label="Impressoras", command=open_printers)
         # Mesma consulta do botao Usuarios, porem em um host so. E o unico
         # caminho para ver o texto cru do qwinsta de uma maquina especifica,
-        # que e o que diz POR QUE ela aparece como "erro" na busca do OCS.
+        # que e o que diz POR QUE uma maquina aparece como "erro".
         menu.add_command(label="Sessões", command=open_sessions)
 
         # post() leaves the menu active until the user selects an item or clicks
@@ -1298,13 +1304,6 @@ class App(ctk.CTk):
 
         HostUnitsConfigWindow(self, self.hosts_data, self.on_hosts_saved, self.hosts_path)
 
-    def open_ocs_search(self):
-        """Busca de maquinas por usuario no inventario do OCS."""
-        OcsSearchWindow(self)
-
-    def open_ocs_config(self):
-        OcsConfigWindow(self)
-
     def open_creds(self):
         CredsWindow(self)
 
@@ -1401,10 +1400,10 @@ class App(ctk.CTk):
     def show_host_sessions(self, host, display_name=None):
         """Consulta as sessoes de UM host e mostra o retorno cru do qwinsta.
 
-        O botao Usuarios so consulta o setor inteiro e a busca do OCS so tem
-        espaco para "erro" na coluna. Aqui a maquina e escolhida a mao e o
-        texto do qwinsta aparece inteiro, que e o que diz se foi acesso
-        negado, nome nao resolvido ou tempo esgotado.
+        O botao Usuarios so consulta o setor inteiro e resume cada maquina em
+        uma palavra. Aqui a maquina e escolhida a mao e o texto do qwinsta
+        aparece inteiro, que e o que diz se foi acesso negado, nome nao
+        resolvido ou tempo esgotado.
         """
         host = str(host or "").strip().lstrip("\\")
         if not host:
@@ -1461,113 +1460,35 @@ class App(ctk.CTk):
 
         threading.Thread(target=worker, daemon=True).start()
 
-    def show_remote_printers(
-        self,
-        host: str | None = None,
-        display_name: str | None = None,
-    ):
-        if str(self.btn_printers.cget("state")) == "disabled":
-            return
+    def open_printers_window(self, host=None, display_name=None):
+        """Janela de impressoras do host: consulta e reexecucao do script.
 
-        if host is None:
-            display_name = None
-            host = ask_text(
-                self,
-                "Consultar impressoras",
-                "Digite o hostname ou IP do computador:",
-            )
-        if not host:
-            return
-
-        host = str(host).strip().lstrip("\\")
-        display_name = str(display_name or "").strip()
-        psexec_path = find_psexec()
-        if psexec_path is None:
-            audit_log("PSEXEC_NOT_FOUND_IN_PATH")
-            psexec_path = show_psexec_required_dialog(self)
-        if psexec_path is None:
-            return
-
-        audit_log(
-            "PRINTERS_QUERY",
-            f"name={display_name or '-'}; host={host}; psexec={psexec_path}",
-        )
-        progress = PrinterProgressWindow(self, host)
-        self.btn_printers.configure(state="disabled", text="Consultando...")
-
-        def worker():
-            status = "ok"
-            result = ""
-            error = None
-
+        A referencia fica guardada porque a janela vive entre acoes: sem ela,
+        o coletor pode destrui-la com a thread trabalhadora ainda rodando.
+        Reabrir com uma ja aberta traz a existente para frente, em vez de
+        empilhar duas janelas apontando para maquinas diferentes.
+        """
+        existing = getattr(self, "_printers_window", None)
+        if existing is not None:
             try:
-                if not host_responds_to_ping(host):
-                    status = "offline"
-                    audit_log("PRINTERS_HOST_OFFLINE", f"host={host}")
-                else:
-                    result = query_remote_printers(host, psexec_path)
-            except PsExecQueryError as exc:
-                log_psexec_failure(host, psexec_path, exc)
-                audit_log(
-                    "PRINTERS_PSEXEC_ERROR",
-                    f"host={host}; category={exc.category}; code={exc.returncode}; error={exc.summary}",
-                )
-                status = "error"
-                error = exc
-            except Exception as exc:
-                log_exception(exc)
-                audit_log("PRINTERS_QUERY_ERROR", f"host={host}; error={exc}")
-                status = "error"
-                error = exc
+                if existing.winfo_exists():
+                    existing.lift()
+                    existing.focus()
+                    return existing
+            except Exception:
+                pass
 
-            def finish():
-                try:
-                    if progress.winfo_exists():
-                        progress.close()
-                except Exception:
-                    pass
-
-                self.btn_printers.configure(
-                    state="normal",
-                    text="Impressoras",
-                )
-
-                if status == "offline":
-                    show_error(
-                        self,
-                        "Erro",
-                        "O computador está desligado ou não respondeu à rede.",
-                    )
-                    return
-
-                if error:
-                    if isinstance(error, PsExecQueryError):
-                        show_psexec_error_dialog(self, host, error)
-                    else:
-                        show_error(
-                            self,
-                            "Consultar impressoras",
-                            f"Falha ao consultar impressoras em {host}:\n\n"
-                            f"{error}\n\nLog: {ERROR_LOG}",
-                        )
-                    return
-
-                audit_log("PRINTERS_QUERY_OK", f"host={host}")
-                result_target = (
-                    f"{display_name} ({host})"
-                    if display_name
-                    else host
-                )
-                show_text_window(
-                    self,
-                    f"Impressoras - {result_target}",
-                    result,
-                    remember_geometry_key=None,
-                )
-
-            self.after(0, finish)
-
-        threading.Thread(target=worker, daemon=True).start()
+        # Nao consulta sozinha: abrir pelo menu de contexto so preenche o
+        # campo. Consultar por conta propria mandava PsExec para a maquina a
+        # cada clique torto no menu, e quem abre a janela nem sempre quer a
+        # consulta — as vezes quer reexecutar o script.
+        window = PrintersWindow(
+            self,
+            host=str(host or "").strip().lstrip("\\"),
+            display_name=str(display_name or "").strip(),
+        )
+        self._printers_window = window
+        return window
 
 
 def main():

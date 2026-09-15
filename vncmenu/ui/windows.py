@@ -15,17 +15,14 @@ import threading
 import tkinter as tk
 import webbrowser
 
-from ..config import APP_AUTHOR, APP_NAME, APP_VERSION, COLOR_SCHEME_BLUE, COLOR_SCHEME_PURPLE, DEFAULT_VIEWER, ERROR_LOG, OCS_COL_AGE, OCS_COL_DATE, OCS_COL_IP, OCS_COL_SESSION, OCS_COL_TAG, OCS_ROW_PITCH, OCS_STALE_DAYS, OCS_VISIBLE_ROWS, OCS_WINDOW_HEIGHT, OCS_WINDOW_WIDTH, GITHUB_PROFILE_URL, GITHUB_RELEASES_URL, GITHUB_URL, LICENSE_URL, LOGS_DIR, REALVNC_EXE, SHARED_HOSTS_JSON, ULTRAVNC_EXE, VIEWER_OPTIONS, VIEWER_REALVNC
+from ..config import APP_AUTHOR, APP_NAME, STARTUP_FOLDER, APP_VERSION, COLOR_SCHEME_BLUE, COLOR_SCHEME_PURPLE, DEFAULT_VIEWER, ERROR_LOG, GITHUB_PROFILE_URL, GITHUB_RELEASES_URL, GITHUB_URL, LICENSE_URL, LOGS_DIR, REALVNC_EXE, SHARED_HOSTS_JSON, ULTRAVNC_EXE, VIEWER_OPTIONS, VIEWER_REALVNC
 from ..applog import audit_log, log_exception
-from ..storage import format_host_port, load_ocs_creds, load_ocs_url, sanitize_port, split_host_port, save_ocs_creds, save_ocs_url, get_sector_by_name, get_sector_names, get_unit_by_name, get_unit_names, load_creds, load_global_paths, load_psexec_path, normalize_hosts_data, sanitize_viewer, save_creds, save_global_paths, save_json, save_psexec_path, save_settings, viewer_display_name
+from ..storage import find_psexec, format_host_port, sanitize_port, split_host_port, get_sector_by_name, get_sector_names, get_unit_by_name, get_unit_names, load_creds, load_global_paths, load_psexec_path, normalize_hosts_data, sanitize_viewer, save_creds, save_global_paths, save_json, save_psexec_path, save_settings, viewer_display_name
 from ..theme import FONT_BOLD, FONT_NORMAL, FONT_SMALL, FONT_SMALL_BOLD, FONT_SUBTITLE, THEME, color_scheme_display_name
 from ..helpers import bind_clickable_row, center_window, reset_scrollable_frame_position, fit_dialog_to_content, remember_window_geometry, rename_realvnc_profile, rename_realvnc_profiles_for_sector, safe_filename, save_window_geometry, show_error, show_warning
 from ..updates import fetch_latest_release, format_release_notes_for_display, normalize_release_version
-from .dialogs import ModalDialog, ask_host_details, ask_text, confirm_action
-from ..remote import PsExecQueryError, format_users_output, query_logged_users_raw
-from ..ocs import (OcsError, SESSION_DIFFERENT, SESSION_ERROR, SESSION_NONE, SESSION_OFFLINE,
-                   SESSION_SAME, connection_target, count_stale, format_session, is_stale,
-                   search_machines_by_user, session_status)
+from .dialogs import ModalDialog, ask_host_details, ask_text, confirm_action, show_psexec_required_dialog
+from ..remote import PsExecQueryError, driver_install_failures, script_runs_hidden, format_driver_install_report, format_script_run_report, format_users_output, host_responds_to_ping, install_printer_drivers, log_psexec_failure, query_logged_users_raw, query_remote_printers, run_startup_script, validate_script_name
 
 def show_text_window(
     parent,
@@ -274,18 +271,6 @@ class QwinstaProgressWindow(IndeterminateProgressWindow):
             heading="Consultando usuários logados",
             description=f"Executando qwinsta em {host_count} host(s): {label}",
             footer="Aguarde. A janela de resultado abrirá automaticamente.",
-            bring_to_front=True,
-        )
-
-
-class PrinterProgressWindow(IndeterminateProgressWindow):
-    def __init__(self, parent, host: str):
-        super().__init__(
-            parent,
-            title="Consultando impressoras",
-            heading="Consultando impressoras",
-            description=f"Verificando impressoras locais e de rede em: {host}",
-            footer="Aguarde. O resultado abrirá automaticamente.",
             bring_to_front=True,
         )
 
@@ -1497,107 +1482,17 @@ class UpdateAvailableWindow(ctk.CTkToplevel):
         self.destroy()
 
 
-class OcsConfigWindow(ctk.CTkToplevel):
-    """Endereco do console OCS e credencial de acesso.
-
-    O endereco vale para a instalacao inteira (data/paths.json), como os
-    viewers e o PsExec. A credencial e por usuario do Windows e vai protegida
-    por DPAPI no creds.json, junto da do UltraVNC.
-    """
-
-    def __init__(self, parent):
-        super().__init__(parent)
-        self.parent = parent
-        self.title("OCS Inventory")
-        self.geometry("620x420")
-        self.resizable(False, False)
-        self.configure(fg_color=THEME["bg"])
-        self.protocol("WM_DELETE_WINDOW", self.destroy)
-
-        box = ctk.CTkFrame(self, fg_color=THEME["surface"], corner_radius=18)
-        box.pack(fill="both", expand=True, padx=18, pady=18)
-        box.grid_columnconfigure(0, weight=1)
-
-        ctk.CTkLabel(box, text="OCS Inventory", font=FONT_SUBTITLE,
-                     text_color=THEME["text"]).grid(row=0, column=0, sticky="w",
-                                                    padx=18, pady=(18, 4))
-        ctk.CTkLabel(
-            box,
-            text=("Usado para descobrir em quais máquinas um usuário aparece.\n"
-                  "O endereço vale para todos deste computador; a senha é só sua."),
-            font=FONT_NORMAL, text_color=THEME["muted"], justify="left", anchor="w",
-        ).grid(row=1, column=0, sticky="ew", padx=18, pady=(0, 14))
-
-        usuario_salvo, senha_salva = load_ocs_creds()
-        campos = [
-            ("Endereço do servidor", load_ocs_url(), "http://ocs.suaempresa.local", False),
-            ("Usuário do console", usuario_salvo, "usuário do OCS", False),
-            ("Senha", senha_salva, "senha do OCS", True),
-        ]
-        self.entries = []
-        for indice, (rotulo, valor, dica, secreto) in enumerate(campos):
-            ctk.CTkLabel(box, text=rotulo, font=FONT_SMALL_BOLD,
-                         text_color=THEME["muted"]).grid(
-                row=2 + indice * 2, column=0, sticky="w", padx=18, pady=(8, 2))
-            entrada = ctk.CTkEntry(
-                box, height=36, font=FONT_NORMAL, placeholder_text=dica,
-                placeholder_text_color=THEME["muted"], fg_color=THEME["surface_2"],
-                border_color=THEME["border"], text_color=THEME["text"],
-                show="•" if secreto else "",
-            )
-            entrada.grid(row=3 + indice * 2, column=0, sticky="ew", padx=18)
-            if valor:
-                entrada.insert(0, valor)
-            self.entries.append(entrada)
-
-        acoes = ctk.CTkFrame(box, fg_color="transparent")
-        acoes.grid(row=9, column=0, sticky="ew", padx=18, pady=(20, 18))
-        ctk.CTkButton(acoes, font=FONT_BOLD, text="Salvar", width=120, height=38,
-                      command=self.save, fg_color=THEME["accent"],
-                      hover_color=THEME["accent_hover"],
-                      text_color=THEME["button_text"]).pack(side="right")
-        ctk.CTkButton(acoes, font=FONT_BOLD, text="Cancelar", width=110, height=38,
-                      command=self.destroy, fg_color=THEME["surface_3"],
-                      hover_color=THEME["accent_soft"],
-                      text_color=THEME["secondary_button_text"]).pack(side="right", padx=(0, 8))
-
-        center_window(self, 620, 420)
-        self.transient(parent)
-        self.grab_set()
-        self.focus_force()
-
-    def save(self):
-        url = self.entries[0].get().strip()
-        usuario = self.entries[1].get().strip()
-        senha = self.entries[2].get()
-
-        if not save_ocs_url(url):
-            show_error(self, "OCS Inventory",
-                       "Não foi possível salvar o endereço em data\\paths.json.")
-            return
-        try:
-            save_ocs_creds(usuario, senha)
-        except Exception as exc:
-            log_exception(exc)
-            show_error(self, "OCS Inventory",
-                       f"Não foi possível salvar a credencial:\n{exc}")
-            return
-
-        # A senha nunca vai para o log.
-        audit_log("OCS_CONFIG_SAVED", f"url={url}; usuario={usuario}")
-        self.destroy()
-
-
 class HostActionsWindow(ctk.CTkToplevel):
     """Um host digitado a mao, com as acoes do app reunidas num lugar.
 
     Substitui o antigo botao que alternava entre conectar e reiniciar. O host
     fica editavel no topo e cada acao age sobre ele, entao da para conectar,
-    reiniciar, ver sessoes e impressoras sem reabrir a janela. E tambem onde a
-    limpeza de perfis vai entrar depois, por isso vale mante-la organizada.
+    reiniciar, ver sessoes, impressoras, copiar o IP e abrir as pastas sem
+    reabrir a janela. Tem as mesmas acoes do menu de contexto da lista, senao
+    digitar o host a mao viraria a opcao pobre.
 
     Nao e modal: chama de volta o App (self.parent) para cada acao, do mesmo
-    jeito que a janela do OCS faz, e nao segura grab nenhum.
+    jeito que as demais janelas fazem, e nao segura grab nenhum.
     """
 
     def __init__(self, parent, initial_host=""):
@@ -1606,7 +1501,7 @@ class HostActionsWindow(ctk.CTkToplevel):
         self.title("Host manual")
         self.configure(fg_color=THEME["bg"])
         self.resizable(False, False)
-        center_window(self, 460, 384)
+        center_window(self, 460, 450)
         self.protocol("WM_DELETE_WINDOW", self.destroy)
 
         box = ctk.CTkFrame(self, fg_color=THEME["surface"], corner_radius=18)
@@ -1646,27 +1541,34 @@ class HostActionsWindow(ctk.CTkToplevel):
         acoes.grid_columnconfigure(0, weight=1, uniform="hostacoes")
         acoes.grid_columnconfigure(1, weight=1, uniform="hostacoes")
 
+        def secundario(texto, comando):
+            return ctk.CTkButton(
+                acoes, font=FONT_BOLD, text=texto, height=40, command=comando,
+                fg_color=THEME["surface_3"], hover_color=THEME["accent_soft"],
+                text_color=THEME["secondary_button_text"])
+
         self.btn_connect = ctk.CTkButton(
             acoes, font=FONT_BOLD, text="Conectar", height=40, command=self.do_connect,
             fg_color=THEME["accent"], hover_color=THEME["accent_hover"],
             text_color=THEME["button_text"])
+        self.btn_sessions = secundario("Sessões", self.do_sessions)
+        self.btn_printers = secundario("Impressoras", self.do_printers)
+        self.btn_share = secundario("Abrir c$", self.do_admin_share)
+        self.btn_startup = secundario("Menu Iniciar", self.do_startup_folder)
         self.btn_restart = ctk.CTkButton(
             acoes, font=FONT_BOLD, text="Reiniciar", height=40, command=self.do_restart,
             fg_color=THEME["warning"], hover_color=THEME["warning_hover"],
             text_color=THEME["button_text"])
-        self.btn_sessions = ctk.CTkButton(
-            acoes, font=FONT_BOLD, text="Sessões", height=40, command=self.do_sessions,
-            fg_color=THEME["surface_3"], hover_color=THEME["accent_soft"],
-            text_color=THEME["secondary_button_text"])
-        self.btn_printers = ctk.CTkButton(
-            acoes, font=FONT_BOLD, text="Impressoras", height=40, command=self.do_printers,
-            fg_color=THEME["surface_3"], hover_color=THEME["accent_soft"],
-            text_color=THEME["secondary_button_text"])
 
-        self.btn_connect.grid(row=0, column=0, sticky="ew", padx=(0, 6), pady=(0, 8))
-        self.btn_restart.grid(row=0, column=1, sticky="ew", padx=(6, 0), pady=(0, 8))
-        self.btn_sessions.grid(row=1, column=0, sticky="ew", padx=(0, 6))
-        self.btn_printers.grid(row=1, column=1, sticky="ew", padx=(6, 0))
+        # Conectar ocupa a linha inteira: e a acao de sempre. Reiniciar fica
+        # sozinho no canto inferior direito, longe do resto, porque e o unico
+        # aqui que derruba o atendimento de alguem.
+        self.btn_connect.grid(row=0, column=0, columnspan=2, sticky="ew", pady=(0, 8))
+        self.btn_sessions.grid(row=1, column=0, sticky="ew", padx=(0, 6), pady=(0, 8))
+        self.btn_printers.grid(row=1, column=1, sticky="ew", padx=(6, 0), pady=(0, 8))
+        self.btn_share.grid(row=2, column=0, sticky="ew", padx=(0, 6), pady=(0, 8))
+        self.btn_startup.grid(row=2, column=1, sticky="ew", padx=(6, 0), pady=(0, 8))
+        self.btn_restart.grid(row=3, column=1, sticky="ew", padx=(6, 0))
 
         ctk.CTkButton(
             box, font=FONT_BOLD, text="Fechar", height=36, width=110, command=self.destroy,
@@ -1687,7 +1589,8 @@ class HostActionsWindow(ctk.CTkToplevel):
     def update_buttons_state(self):
         estado = "normal" if self.current_host() else "disabled"
         for botao in (self.btn_connect, self.btn_restart,
-                      self.btn_sessions, self.btn_printers):
+                      self.btn_sessions, self.btn_printers,
+                      self.btn_share, self.btn_startup):
             try:
                 botao.configure(state=estado)
             except tk.TclError:
@@ -1719,512 +1622,21 @@ class HostActionsWindow(ctk.CTkToplevel):
         if not bruto:
             return
         host, _port = split_host_port(bruto)
-        self.parent.show_remote_printers(host, host)
+        self.parent.open_printers_window(host, host)
 
-
-class OcsSearchWindow(ctk.CTkToplevel):
-    """Em quais maquinas um usuario aparece, segundo o inventario do OCS.
-
-    O dado NAO e ao vivo: o OCS guarda o usuario da ultima coleta do agente.
-    Por isso cada linha mostra a data do inventario e as antigas ficam
-    marcadas. Sem isso alguem tenta conectar numa maquina que nao reporta ha
-    um ano achando que a informacao vale.
-    """
-
-    def __init__(self, parent):
-        super().__init__(parent)
-        self.parent = parent
-        self._buscando = False
-        self._conferindo = False
-        self._maquinas = []
-        self._conferido_em = None
-        # Linhas ja desenhadas e o recuo atual do cabecalho. Ver align_header().
-        self._linhas = []
-        self._header_pad = None
-
-        self.title("Buscar máquinas por usuário")
-        self.configure(fg_color=THEME["bg"])
-        self.resizable(True, True)
-        # 740 e o minimo em que a coluna do nome ainda cabe: as colunas fixas
-        # somam 476px com os espacamentos, e um nome tipo W04-554-045901
-        # precisa de ~180px. Abaixo disso o nome comecava a ser cortado.
-        # Com a coluna da sessao ao vivo as fixas somam ~622px com os
-        # espacamentos, e o nome ainda precisa de ~180px.
-        self.minsize(905, 430)
-        center_window(self, OCS_WINDOW_WIDTH, OCS_WINDOW_HEIGHT)
-        self.protocol("WM_DELETE_WINDOW", self.destroy)
-
-        outer = ctk.CTkFrame(self, fg_color=THEME["surface"], corner_radius=20)
-        outer.pack(fill="both", expand=True, padx=14, pady=14)
-        self.corpo = outer
-
-        ctk.CTkLabel(outer, text="Buscar máquinas por usuário",
-                     font=("Segoe UI", 20, "bold"),
-                     text_color=THEME["text"]).pack(anchor="w", padx=20, pady=(18, 2))
-        ctk.CTkLabel(
-            outer,
-            text="Inventário do OCS, de toda a empresa. Não é a sessão atual da máquina.",
-            font=FONT_NORMAL, text_color=THEME["muted"],
-        ).pack(anchor="w", padx=20, pady=(0, 12))
-
-        linha = ctk.CTkFrame(outer, fg_color="transparent")
-        linha.pack(fill="x", padx=20, pady=(0, 10))
-        linha.grid_columnconfigure(0, weight=1)
-
-        self.entry = ctk.CTkEntry(
-            linha, height=38, font=FONT_NORMAL,
-            placeholder_text="nome de usuário, por exemplo nome.sobrenome",
-            placeholder_text_color=THEME["muted"], fg_color=THEME["surface_2"],
-            border_color=THEME["border"], text_color=THEME["text"],
-        )
-        self.entry.grid(row=0, column=0, sticky="ew")
-        self.entry.bind("<Return>", lambda _e: self.start_search())
-
-        self.btn = ctk.CTkButton(
-            linha, font=FONT_BOLD, text="Buscar", width=110, height=38,
-            command=self.start_search, fg_color=THEME["accent"],
-            hover_color=THEME["accent_hover"], text_color=THEME["button_text"])
-        self.btn.grid(row=0, column=1, padx=(8, 0))
-
-        self.status = ctk.CTkLabel(outer, text="", font=FONT_SMALL,
-                                   text_color=THEME["muted"], anchor="w", justify="left")
-        self.status.pack(fill="x", padx=20, pady=(0, 8))
-
-        # O rodape e empacotado ANTES da lista, com side="bottom". No pack do
-        # Tk quem tem expand=True fica com o espaco que sobra, e ao encolher a
-        # janela os widgets empacotados DEPOIS dele sao os primeiros a sumir.
-        # Era por isso que os botoes desapareciam ao reduzir a janela. Reservar
-        # a faixa de baixo primeiro garante que eles fiquem sempre visiveis e
-        # que quem encolhe e a lista, que ja tem rolagem.
-        rodape = ctk.CTkFrame(outer, fg_color="transparent")
-        rodape.pack(side="bottom", fill="x", padx=20, pady=(0, 18))
-        ctk.CTkButton(rodape, font=FONT_BOLD, text="Fechar", width=110, height=38,
-                      command=self.destroy, fg_color=THEME["accent"],
-                      hover_color=THEME["accent_hover"],
-                      text_color=THEME["button_text"]).pack(side="right")
-        ctk.CTkButton(rodape, font=FONT_BOLD, text="Configurar OCS", width=150, height=38,
-                      command=self.open_config, fg_color=THEME["surface_3"],
-                      hover_color=THEME["accent_soft"],
-                      text_color=THEME["secondary_button_text"]).pack(side="left")
-
-        # Sob demanda, nao automatico: sao um ping e um qwinsta por maquina,
-        # e disparar isso a cada busca castigaria a rede sem necessidade.
-        self.btn_conferir = ctk.CTkButton(
-            rodape, font=FONT_BOLD, text="Confirmar sessões", width=170, height=38,
-            command=self.start_session_check, fg_color=THEME["surface_3"],
-            hover_color=THEME["accent_soft"], text_color=THEME["secondary_button_text"])
-        self.btn_conferir.pack(side="left", padx=(8, 0))
-        self.btn_conferir.configure(state="disabled")
-
-        # Sem isto, a coluna vazia da sessao e ambigua entre "ninguem logado"
-        # e "ninguem conferiu ainda", que sao coisas bem diferentes.
-        self.sessao_label = ctk.CTkLabel(rodape, text="", font=FONT_SMALL,
-                                         text_color=THEME["muted"], anchor="w")
-        self.sessao_label.pack(side="left", padx=(12, 0))
-
-        self.btn_detalhes = ctk.CTkButton(
-            rodape, font=FONT_BOLD, text="Detalhes", width=100, height=38,
-            command=self.show_session_details, fg_color=THEME["surface_3"],
-            hover_color=THEME["accent_soft"], text_color=THEME["secondary_button_text"])
-
-        # Cabecalho fora da area rolavel, para nao subir junto com as linhas.
-        # Usa as MESMAS constantes de largura que build_row, senao desalinha.
-        # O recuo lateral inicial e so um chute razoavel: quem acerta a coluna
-        # e align_header(), depois que existe uma linha para medir.
-        cabecalho = ctk.CTkFrame(outer, fg_color="transparent", height=22)
-        cabecalho.pack(fill="x", padx=28, pady=(0, 2))
-        cabecalho.pack_propagate(False)
-        self.cabecalho = cabecalho
-
-        def coluna(texto, largura, lado="right", pad=(8, 8)):
-            ctk.CTkLabel(cabecalho, text=texto, font=FONT_SMALL_BOLD,
-                         text_color=THEME["muted"], width=largura,
-                         anchor="w").pack(side=lado, padx=pad)
-
-        coluna("UNIDADE", OCS_COL_TAG, pad=(8, 14))
-        coluna("IDADE", OCS_COL_AGE)
-        coluna("ÚLTIMO INVENTÁRIO", OCS_COL_DATE)
-        coluna("LOGADO AGORA", OCS_COL_SESSION)
-        coluna("IP", OCS_COL_IP)
-        ctk.CTkLabel(cabecalho, text="MÁQUINA", font=FONT_SMALL_BOLD,
-                     text_color=THEME["muted"], anchor="w").pack(
-            side="left", fill="x", expand=True, padx=(14, 8))
-
-        self.lista = ctk.CTkScrollableFrame(outer, fg_color=THEME["bg"], corner_radius=16)
-        self.lista.pack(fill="both", expand=True, padx=20, pady=(0, 14))
-        # Redimensionar a janela pode fazer a barra de rolagem aparecer ou
-        # sumir, e isso sozinho ja move a borda direita das linhas.
-        self.lista.bind("<Configure>", lambda _e: self.align_header())
-
-        self.transient(parent)
-        self.after(120, self.entry.focus_set)
-        self.show_message("Digite um usuário e clique em Buscar.")
-
-    # ------------------------------------------------------------------ ui
-
-    def clear_list(self):
-        for filho in self.lista.winfo_children():
-            filho.destroy()
-        self._linhas = []
-
-    def align_header(self):
-        """Encosta o cabecalho nas linhas, medindo uma linha de verdade.
-
-        As linhas ficam dentro do CTkScrollableFrame, que tem recuo proprio e
-        ainda perde largura para a barra de rolagem quando ela aparece; o
-        cabecalho fica fora dele. Somar esses recuos na mao nao resolve: o
-        recuo interno e detalhe privado do customtkinter, que nao esta preso a
-        uma versao no requirements.txt, e a barra de rolagem desalinharia
-        mesmo com o numero certo, porque aparece e some conforme o resultado.
-        Medir a linha cobre os dois casos e nao depende de versao.
-        """
-        if not self._linhas:
-            return
-        referencia = self._linhas[0]
-        try:
-            if not (referencia.winfo_exists() and self.corpo.winfo_exists()):
-                return
-            self.update_idletasks()
-            base_x = self.corpo.winfo_rootx()
-            base_w = self.corpo.winfo_width()
-            linha_x = referencia.winfo_rootx()
-            linha_w = referencia.winfo_width()
-        except tk.TclError:
-            return
-
-        esquerda = linha_x - base_x
-        direita = (base_x + base_w) - (linha_x + linha_w)
-        # Janela ainda nao desenhada: as medidas vem como 1x1 e produziriam um
-        # recuo negativo, que o Tk recusa.
-        if esquerda < 0 or direita < 0:
-            return
-
-        novo = (esquerda, direita)
-        if novo == self._header_pad:
-            return
-        self._header_pad = novo
-        try:
-            self.cabecalho.pack_configure(padx=novo)
-        except tk.TclError:
-            pass
-
-    def show_message(self, texto, cor=None):
-        self.clear_list()
-        ctk.CTkLabel(self.lista, text=texto, font=FONT_NORMAL,
-                     text_color=cor or THEME["muted"], justify="left",
-                     anchor="w", wraplength=760).pack(anchor="w", padx=16, pady=16)
-
-    def open_config(self):
-        # Mesma troca de grab do Sobre: sem soltar, a filha abriria atras.
-        try:
-            self.grab_release()
-        except Exception:
-            pass
-        OcsConfigWindow(self)
-
-    # --------------------------------------------------------------- busca
-
-    def start_search(self):
-        if self._buscando:
-            return
-        termo = self.entry.get().strip()
-        if not termo:
-            self.show_message("Digite um nome de usuário para buscar.")
-            return
-
-        url = load_ocs_url()
-        usuario, senha = load_ocs_creds()
-        if not url or not usuario:
-            self.show_message(
-                "O OCS ainda não está configurado.\n\n"
-                "Clique em Configurar OCS e informe o endereço do servidor "
-                "e a sua credencial do console.",
-                THEME["warning_hover"],
-            )
-            return
-
-        # Busca nova invalida a conferencia anterior: manter "verificadas as
-        # 14:32" ao lado de resultados de OUTRA pessoa seria mentira.
-        self._conferido_em = None
-        self._maquinas = []
-        self.update_session_label()
-
-        self._buscando = True
-        self.btn.configure(state="disabled", text="Buscando...")
-        self.status.configure(text="")
-        self.show_message(f"Consultando o OCS por {termo}...")
-
-        def worker():
-            try:
-                resultado = search_machines_by_user(url, usuario, senha, termo)
-                erro = None
-            except OcsError as exc:
-                resultado, erro = None, exc
-            except Exception as exc:
-                log_exception(exc)
-                resultado, erro = None, OcsError(f"Falha inesperada ao consultar o OCS:\n{exc}")
-
-            def finish():
-                self._buscando = False
-                try:
-                    self.btn.configure(state="normal", text="Buscar")
-                except tk.TclError:
-                    # A janela foi fechada enquanto a consulta corria.
-                    return
-                if erro is not None:
-                    self.show_message(str(erro), THEME["warning_hover"])
-                    self.status.configure(text="")
-                    return
-                self.render(termo, resultado or {})
-
-            try:
-                self.after(0, finish)
-            except tk.TclError:
-                pass
-
-        threading.Thread(target=worker, name="VNC-Menu-OCS", daemon=True).start()
-
-    def render(self, termo, resultado):
-        maquinas = resultado.get("machines") or []
-        self._maquinas = maquinas
-        self._resultado = resultado
-        self._termo = termo
-        self.update_session_label()
-        try:
-            self.btn_conferir.configure(state="normal" if maquinas else "disabled")
-        except tk.TclError:
-            pass
-        self.clear_list()
-
-        if not maquinas:
-            self.show_message(
-                f'Nenhuma máquina encontrada para "{termo}".\n\n'
-                "O OCS registra o usuário da última coleta do agente, então "
-                "quem nunca fez login numa máquina inventariada não aparece."
-            )
-            self.status.configure(text="")
-            return
-
-        antigas = count_stale(maquinas)
-        partes = [f"{len(maquinas)} máquina(s)"]
-        if antigas:
-            partes.append(f"{antigas} com inventário de mais de {OCS_STALE_DAYS} dias")
-        if resultado.get("truncated"):
-            partes.append(
-                f"mostrando só as primeiras de {resultado.get('total')}, refine a busca"
-            )
-
-        divergentes = sum(1 for m in maquinas if m.get("session_status") == SESSION_DIFFERENT)
-        confirmadas = sum(1 for m in maquinas if m.get("session_status") == SESSION_SAME)
-        if confirmadas:
-            partes.append(f"{confirmadas} confirmada(s) agora")
-        if divergentes:
-            partes.append(f"{divergentes} com OUTRO usuário logado agora")
-        naoverificadas = sum(
-            1 for m in maquinas
-            if m.get("session_status") in (SESSION_ERROR, SESSION_OFFLINE)
-        )
-        if naoverificadas:
-            partes.append(f"{naoverificadas} não foi possível verificar")
-        self.status.configure(text="   ·   ".join(partes))
-
-        for maquina in maquinas:
-            self.build_row(maquina)
-
-        # A lista anterior podia estar rolada; sem isto uma busca com poucos
-        # resultados abre fora da area visivel e parece vazia.
-        reset_scrollable_frame_position(self.lista)
-
-        # Duas vezes de proposito. A primeira acerta o caso comum; a segunda
-        # cobre a barra de rolagem, que o customtkinter mostra ou esconde num
-        # callback proprio, depois que este metodo ja voltou. align_header()
-        # so mexe no layout quando o valor muda, entao a segunda chamada nao
-        # custa nada quando a primeira ja acertou.
-        self.align_header()
-        self.after(60, self.align_header)
-
-    def update_session_label(self):
-        try:
-            if self._conferido_em is None:
-                self.sessao_label.configure(text="Sessões sem confirmação",
-                                            text_color=THEME["muted"])
-                self.btn_detalhes.pack_forget()
-                return
-            self.sessao_label.configure(
-                text=f"Sessões verificadas em {self._conferido_em.strftime('%d/%m/%y %H:%M')}",
-                text_color=THEME["muted"])
-            if any(m.get("session_status") in (SESSION_ERROR, SESSION_OFFLINE)
-                   for m in self._maquinas):
-                self.btn_detalhes.pack(side="left", padx=(8, 0))
-            else:
-                self.btn_detalhes.pack_forget()
-        except tk.TclError:
-            pass
-
-    def show_session_details(self):
-        """Mostra o texto CRU que o qwinsta devolveu para cada maquina.
-
-        A coluna so cabe "erro". O motivo real, que e o que permite agir,
-        aparece aqui: acesso negado, nome nao resolvido, tempo esgotado.
-        Reaproveita o mesmo formatador da tela de Usuarios.
-        """
-        linhas = [
-            (m.get("name") or "?", m.get("session_live") or "(não verificado)")
-            for m in self._maquinas
-        ]
-        show_text_window(self, "Detalhe das sessões", format_users_output(linhas),
-                         remember_geometry_key=None)
-
-    def start_session_check(self):
-        """Roda ping + qwinsta nas maquinas achadas para saber quem esta nelas agora.
-
-        O OCS so sabe quem estava logado na ULTIMA coleta do agente, que pode
-        ser de meses atras. Esta conferencia e o que transforma um palpite
-        velho numa resposta de agora.
-        """
-        if self._conferindo or not self._maquinas:
-            return
-
-        alvos = [
-            {"name": m.get("name") or "?", "host": connection_target(m)}
-            for m in self._maquinas
-        ]
-
-        self._conferindo = True
-        self.btn_conferir.configure(state="disabled", text="Confirmando...")
-
-        def worker():
-            try:
-                linhas = query_logged_users_raw(alvos)
-                erro = None
-            except Exception as exc:
-                log_exception(exc)
-                linhas, erro = [], exc
-
-            def finish():
-                self._conferindo = False
-                try:
-                    self.btn_conferir.configure(state="normal", text="Confirmar sessões")
-                except tk.TclError:
-                    return
-                if erro is not None:
-                    show_error(self, "Confirmar sessões",
-                               f"Falha ao consultar as sessões:\n{erro}")
-                    return
-                # pool.map preserva a ordem de entrada, entao zip alinha certo.
-                for maquina, (_nome, resultado) in zip(self._maquinas, linhas):
-                    maquina["session_live"] = resultado
-                    maquina["session_status"] = session_status(maquina.get("user"), resultado)
-                self._conferido_em = datetime.now()
-                audit_log(
-                    "OCS_SESSION_CHECK",
-                    f"maquinas={len(self._maquinas)}; "
-                    f"divergentes={sum(1 for m in self._maquinas if m.get('session_status') == SESSION_DIFFERENT)}",
-                )
-                self.render(getattr(self, "_termo", ""), getattr(self, "_resultado", {}))
-
-            try:
-                self.after(0, finish)
-            except tk.TclError:
-                pass
-
-        threading.Thread(target=worker, name="VNC-Menu-OCS-Sessao", daemon=True).start()
-
-    def session_color(self, estado):
-        if estado == SESSION_DIFFERENT:
-            return THEME["accent_hover"]
-        if estado == SESSION_ERROR:
-            return THEME["warning_hover"]
-        return THEME["muted"]
-
-    def build_row(self, maquina):
-        velha = is_stale(maquina)
-        nome = maquina.get("name") or "?"
-        alvo = connection_target(maquina)
-
-        row = ctk.CTkFrame(self.lista, fg_color=THEME["surface_2"],
-                           corner_radius=12, height=46)
-        row.pack(fill="x", padx=8, pady=4)
-        row.pack_propagate(False)
-        # align_header() mede a primeira linha para achar o recuo do cabecalho.
-        self._linhas.append(row)
-
-        tag = ctk.CTkLabel(
-            row, text=(maquina.get("tag") or "-")[:12], font=FONT_SMALL_BOLD,
-            text_color=THEME["secondary_button_text"], fg_color=THEME["surface_3"],
-            corner_radius=999, width=OCS_COL_TAG, anchor="center")
-        tag.pack(side="right", padx=(8, 14), pady=8)
-
-        # Idade separada da data: e ela que impede alguem de confiar num
-        # registro de um ano atras, entao fica curta e sempre visivel.
-        idade = ctk.CTkLabel(
-            row, text=self.format_age(maquina), font=("Segoe UI", 12, "bold"),
-            text_color=THEME["warning_hover"] if velha else THEME["muted"],
-            width=OCS_COL_AGE, anchor="w")
-        idade.pack(side="right", padx=(8, 8))
-
-        data = ctk.CTkLabel(
-            row, text=self.format_date(maquina), font=("Segoe UI", 12),
-            text_color=THEME["warning_hover"] if velha else THEME["muted"],
-            width=OCS_COL_DATE, anchor="w")
-        data.pack(side="right", padx=(8, 8))
-
-        estado = maquina.get("session_status")
-        sessao = ctk.CTkLabel(
-            row, text=format_session(maquina.get("session_live")),
-            font=("Segoe UI", 12, "bold") if estado == SESSION_DIFFERENT else ("Segoe UI", 12),
-            text_color=self.session_color(estado), width=OCS_COL_SESSION, anchor="w")
-        sessao.pack(side="right", padx=(8, 8))
-
-        endereco = ctk.CTkLabel(row, text=(maquina.get("ip") or "sem IP"),
-                                font=("Segoe UI", 12), text_color=THEME["muted"],
-                                width=OCS_COL_IP, anchor="w")
-        endereco.pack(side="right", padx=(8, 8))
-
-        etiqueta = ctk.CTkLabel(
-            row, text=nome if len(nome) <= 40 else nome[:39] + "…",
-            font=("Segoe UI", 13, "bold"),
-            text_color=THEME["muted"] if velha else THEME["text"], anchor="w")
-        etiqueta.pack(side="left", fill="x", expand=True, padx=(14, 8))
-
-        def clicar(_event=None):
-            if not alvo:
-                show_warning(self, "OCS", f'"{nome}" não tem IP nem nome utilizável.')
-                return
-            # sector="" de proposito: estas maquinas nao estao no hosts.json,
-            # entao nao existe perfil RealVNC <Setor>_<Nome>.vnc para elas.
-            self.parent.run_host_action(nome, alvo, DEFAULT_VIEWER, None, sector="")
-
-        def menu(event):
-            if alvo:
-                self.parent.show_host_context_menu(event, alvo, nome, None)
-
-        bind_clickable_row(row, (etiqueta, endereco, sessao, data, idade, tag), clicar, menu,
-                           THEME["surface_2"], THEME["accent_soft"])
-
-    @staticmethod
-    def format_date(maquina):
-        """Data curta, sempre com ano: um registro de 448 dias sem ano engana."""
-        bruto = str(maquina.get("lastdate") or "").strip()
+    def do_admin_share(self):
+        bruto = self.current_host()
         if not bruto:
-            return "sem data"
-        try:
-            quando = datetime.strptime(bruto, "%Y-%m-%d %H:%M:%S")
-        except ValueError:
-            return bruto[:16]
-        return quando.strftime("%d/%m/%y %H:%M")
+            return
+        host, _port = split_host_port(bruto)
+        self.parent.open_host_admin_share(host)
 
-    @staticmethod
-    def format_age(maquina):
-        """Idade curta, para caber ao lado da data sem empurrar o nome."""
-        idade = maquina.get("age_days")
-        if not isinstance(idade, int):
-            return ""
-        if idade == 0:
-            return "hoje"
-        if idade == 1:
-            return "1 dia"
-        return f"{idade} d"
+    def do_startup_folder(self):
+        bruto = self.current_host()
+        if not bruto:
+            return
+        host, _port = split_host_port(bruto)
+        self.parent.open_host_startup_folder(host)
 
 
 class ChangelogWindow(ctk.CTkToplevel):
@@ -2726,8 +2138,7 @@ class SettingsWindow(ctk.CTkToplevel):
 
         paths = self._section(content, "CAMINHOS")
         self._nav_button(paths, "Viewers VNC", self.parent.open_viewer_paths)
-        self._nav_button(paths, "PsExec", self.parent.open_psexec_path)
-        self._nav_button(paths, "OCS Inventory", self.parent.open_ocs_config, last=True)
+        self._nav_button(paths, "PsExec", self.parent.open_psexec_path, last=True)
 
         appearance = self._section(content, "APARÊNCIA")
         self.dark_var = tk.BooleanVar(value=bool(self.parent.dark_mode))
@@ -2863,3 +2274,373 @@ class SettingsWindow(ctk.CTkToplevel):
 
         self.parent.after(100, command)
         self.parent.after(1000, safe_destroy)
+
+
+class PrintersWindow(ctk.CTkToplevel):
+    """Impressoras de um host: consultar e reexecutar o script de mapeamento.
+
+    As duas coisas moram juntas porque sao o mesmo atendimento: consulta,
+    executa, consulta de novo para conferir. A saida e uma so, para dar para
+    comparar antes e depois sem trocar de janela.
+    """
+
+    DEFAULT_SCRIPT = "IMPRESSORAS.vbs"
+
+    def __init__(self, parent, host: str = "", display_name: str = ""):
+        super().__init__(parent)
+        self.parent = parent
+        self.display_name = str(display_name or "").strip()
+        self._busy = False
+
+        alvo = self.display_name or str(host or "").strip()
+        self.title(f"Impressoras - {alvo}" if alvo else "Impressoras")
+        self.geometry("680x700")
+        self.minsize(600, 620)
+        self.configure(fg_color=THEME["bg"])
+
+        box = ctk.CTkFrame(self, fg_color=THEME["surface"], corner_radius=18)
+        box.pack(fill="both", expand=True, padx=16, pady=16)
+
+        ctk.CTkLabel(box, text="Impressoras", font=FONT_SUBTITLE,
+                     text_color=THEME["text"]).pack(anchor="w", padx=18, pady=(18, 2))
+        ctk.CTkLabel(
+            box,
+            text="Consulta as impressoras do computador e reexecuta o script "
+                 "de mapeamento na sessão do usuário logado.",
+            font=FONT_NORMAL, text_color=THEME["muted"],
+            wraplength=580, justify="left", anchor="w",
+        ).pack(fill="x", padx=18, pady=(0, 14))
+
+        # ---------------------------------------------------------- consulta
+        ctk.CTkLabel(box, text="Computador (hostname ou IP)", font=FONT_SMALL_BOLD,
+                     text_color=THEME["muted"]).pack(anchor="w", padx=18, pady=(0, 4))
+        self.host_entry = ctk.CTkEntry(
+            box, height=38, font=FONT_NORMAL,
+            placeholder_text="hostname ou IP", placeholder_text_color=THEME["muted"],
+            fg_color=THEME["surface_2"], border_color=THEME["border"],
+            text_color=THEME["text"])
+        self.host_entry.pack(fill="x", padx=18, pady=(0, 10))
+        if str(host or "").strip():
+            self.host_entry.insert(0, str(host).strip().lstrip("\\"))
+        self.host_entry.bind("<Return>", lambda _e: self.do_query())
+
+        self.btn_query = ctk.CTkButton(
+            box, font=FONT_BOLD, text="Consultar impressoras", height=40,
+            command=self.do_query,
+            fg_color=THEME["accent"], hover_color=THEME["accent_hover"],
+            text_color=THEME["button_text"])
+        self.btn_query.pack(fill="x", padx=18, pady=(0, 16))
+
+        ctk.CTkFrame(box, height=1, fg_color=THEME["border"]).pack(
+            fill="x", padx=18, pady=(0, 14))
+
+        # ------------------------------------------------------------ script
+        ctk.CTkLabel(box, text="Script de inicialização", font=FONT_SMALL_BOLD,
+                     text_color=THEME["muted"]).pack(anchor="w", padx=18, pady=(0, 4))
+
+        linha = ctk.CTkFrame(box, fg_color="transparent")
+        linha.pack(fill="x", padx=18, pady=(0, 6))
+        linha.grid_columnconfigure(0, weight=1)
+
+        self.script_entry = ctk.CTkEntry(
+            linha, height=38, font=FONT_NORMAL,
+            fg_color=THEME["surface_2"], border_color=THEME["border"],
+            text_color=THEME["text"], placeholder_text_color=THEME["muted"])
+        self.script_entry.grid(row=0, column=0, sticky="ew")
+        self.script_entry.insert(0, self.DEFAULT_SCRIPT)
+
+        self.btn_folder = ctk.CTkButton(
+            linha, font=FONT_BOLD, text="Abrir pasta", width=140, height=38,
+            command=self.open_folder,
+            fg_color=THEME["surface_3"], hover_color=THEME["accent_soft"],
+            text_color=THEME["secondary_button_text"])
+        self.btn_folder.grid(row=0, column=1, sticky="e", padx=(8, 0))
+
+        ctk.CTkLabel(box, text=STARTUP_FOLDER, font=FONT_SMALL,
+                     text_color=THEME["muted"], justify="left", anchor="w",
+                     ).pack(fill="x", padx=18, pady=(0, 10))
+
+        # A instalacao dos drivers nao e opcional: e barata (ja instalada
+        # conta como sucesso), nao pede credencial nenhuma, e sem ela o
+        # mapeamento falha justamente nas maquinas onde o operador nao tinha
+        # como saber de antemao que precisava marcar uma caixa.
+        ctk.CTkLabel(
+            box,
+            text="Antes de executar, os drivers das filas citadas no script "
+                 "são instalados na máquina. Sem isso, o usuário comum não "
+                 "consegue puxar a impressora do servidor nem manualmente.",
+            font=FONT_SMALL, text_color=THEME["muted"],
+            wraplength=580, justify="left", anchor="w",
+        ).pack(fill="x", padx=18, pady=(0, 12))
+
+        self.btn_run = ctk.CTkButton(
+            box, font=FONT_BOLD, text="Executar script", height=40,
+            command=self.do_run,
+            fg_color=THEME["warning"], hover_color=THEME["warning_hover"],
+            text_color=THEME["button_text"])
+        self.btn_run.pack(fill="x", padx=18, pady=(0, 14))
+
+        # ------------------------------------------------------------- saida
+        self.output = ctk.CTkTextbox(
+            box, fg_color=THEME["surface_2"], border_color=THEME["border"],
+            text_color=THEME["text"], font=FONT_SMALL, wrap="none")
+        self.output.pack(fill="both", expand=True, padx=18, pady=(0, 14))
+
+        ctk.CTkButton(
+            box, font=FONT_BOLD, text="Fechar", height=36, width=110,
+            command=self.destroy,
+            fg_color=THEME["surface_3"], hover_color=THEME["accent_soft"],
+            text_color=THEME["secondary_button_text"]).pack(
+                anchor="e", padx=18, pady=(0, 18))
+
+        self._set_output(
+            "Consultar impressoras: só lê, não altera nada.\n"
+            "Executar script: derruba as impressoras do usuário e remapeia.\n"
+            "O script roda pela sessão do usuário logado, não como SYSTEM."
+        )
+
+        center_window(self, 680, 700)
+        self.lift()
+        self.focus()
+
+        # Nada roda sozinho: a janela abre com o campo preenchido e espera a
+        # acao. Consultar e reexecutar tem custos diferentes na maquina do
+        # usuario, entao a escolha e sempre explicita.
+        self.after(120, self.host_entry.focus_set)
+
+    # ------------------------------------------------------------- helpers
+
+    def _set_output(self, text: str):
+        self.output.configure(state="normal")
+        self.output.delete("1.0", "end")
+        self.output.insert("1.0", str(text or ""))
+        self.output.configure(state="disabled")
+
+    def _host(self) -> str:
+        bruto = self.host_entry.get().strip().lstrip("\\")
+        host, _port = split_host_port(bruto)
+        return host
+
+    def _set_busy(self, busy: bool, texto_query="", texto_run=""):
+        """Trava as duas acoes juntas: elas agem sobre a mesma maquina."""
+        self._busy = bool(busy)
+        estado = "disabled" if busy else "normal"
+        try:
+            self.btn_query.configure(
+                state=estado, text=texto_query or "Consultar impressoras")
+            self.btn_run.configure(
+                state=estado, text=texto_run or "Executar script")
+        except tk.TclError:
+            pass
+
+    def _psexec_or_none(self):
+        psexec_path = find_psexec()
+        if psexec_path is None:
+            audit_log("PSEXEC_NOT_FOUND_IN_PATH")
+            psexec_path = show_psexec_required_dialog(self)
+        return psexec_path
+
+    def _finish(self, callback):
+        """Volta para o Tk so se a janela ainda existir."""
+        def wrapper():
+            try:
+                if not self.winfo_exists():
+                    return
+            except Exception:
+                return
+            callback()
+        self.after(0, wrapper)
+
+    # ------------------------------------------------------------- actions
+
+    def open_folder(self):
+        host = self._host()
+        if not host:
+            show_warning(self, "Abrir pasta", "Digite o hostname ou IP do computador.")
+            self.host_entry.focus_set()
+            return
+        self.parent.open_host_startup_folder(host)
+
+    def do_query(self):
+        if self._busy:
+            return
+        host = self._host()
+        if not host:
+            show_warning(self, "Impressoras", "Digite o hostname ou IP do computador.")
+            self.host_entry.focus_set()
+            return
+
+        psexec_path = self._psexec_or_none()
+        if psexec_path is None:
+            return
+
+        audit_log("PRINTERS_QUERY",
+                  f"name={self.display_name or '-'}; host={host}; psexec={psexec_path}")
+        self._set_busy(True, texto_query="Consultando...")
+        self._set_output(f"Consultando impressoras em {host}...")
+
+        def worker():
+            resultado = ""
+            erro = None
+            offline = False
+            try:
+                if not host_responds_to_ping(host):
+                    offline = True
+                    audit_log("PRINTERS_HOST_OFFLINE", f"host={host}")
+                else:
+                    resultado = query_remote_printers(host, psexec_path)
+            except PsExecQueryError as exc:
+                log_psexec_failure(host, psexec_path, exc)
+                audit_log("PRINTERS_PSEXEC_ERROR",
+                          f"host={host}; category={exc.category}; code={exc.returncode}")
+                erro = exc
+            except Exception as exc:
+                log_exception(exc)
+                audit_log("PRINTERS_QUERY_ERROR", f"host={host}; error={exc}")
+                erro = exc
+
+            def finish():
+                self._set_busy(False)
+                if offline:
+                    self._set_output(
+                        "O computador está desligado ou não respondeu à rede.")
+                    return
+                if isinstance(erro, PsExecQueryError):
+                    self._set_output(f"{erro.summary}\n\n{erro.hint}")
+                    show_psexec_error_dialog(self, host, erro)
+                    return
+                if erro is not None:
+                    self._set_output(f"Falha ao consultar {host}:\n\n{erro}")
+                    show_error(self, "Impressoras",
+                               f"Falha ao consultar impressoras em {host}:\n\n"
+                               f"{erro}\n\nLog: {ERROR_LOG}")
+                    return
+                audit_log("PRINTERS_QUERY_OK", f"host={host}")
+                self._set_output(f"Impressoras em {host}\n\n{resultado}")
+
+            self._finish(finish)
+
+        threading.Thread(target=worker, name="VNC-Menu-Printers",
+                         daemon=True).start()
+
+    def do_run(self):
+        if self._busy:
+            return
+        host = self._host()
+        if not host:
+            show_warning(self, "Executar script", "Digite o hostname ou IP do computador.")
+            self.host_entry.focus_set()
+            return
+
+        try:
+            script_name = validate_script_name(self.script_entry.get())
+        except ValueError as exc:
+            show_warning(self, "Executar script", str(exc))
+            self.script_entry.focus_set()
+            return
+
+        extra = ("\n\nOs drivers das filas citadas no script são instalados "
+                 "antes, na máquina.")
+        if not script_runs_hidden(script_name):
+            # .cmd e .bat rodam pelo cmd.exe, que abre console na tela do
+            # usuario. Se ele fechar a janela, o script morre no meio.
+            extra += ("\n\nEste tipo de arquivo abre uma janela de prompt na "
+                      "tela do usuário enquanto roda, e fechá-la interrompe o "
+                      "script. Arquivos .vbs rodam sem janela nenhuma.")
+
+        # Erro de digitacao no host roda o script na maquina errada, e num
+        # hospital isso derruba as impressoras de quem esta atendendo.
+        if not confirm_action(
+            self, "Executar script",
+            f"Executar {script_name} em {host}?\n\n"
+            "O script roda na sessão do usuário logado e, enquanto roda, as "
+            "impressoras dele ficam indisponíveis." + extra,
+        ):
+            return
+
+        psexec_path = self._psexec_or_none()
+        if psexec_path is None:
+            return
+
+        audit_log("STARTUP_SCRIPT_RUN",
+                  f"name={self.display_name or '-'}; host={host}; "
+                  f"script={script_name}")
+
+        self._set_busy(True, texto_run="Executando...")
+        self._set_output(
+            f"Executando {script_name} em {host}...\n\n"
+            "Pode levar até um minuto: o script tem pausas próprias e o "
+            "resultado só aparece quando ele termina."
+        )
+
+        def worker():
+            partes = []
+            erro = None
+            offline = False
+            abortado = False
+
+            try:
+                if not host_responds_to_ping(host):
+                    offline = True
+                    audit_log("STARTUP_SCRIPT_HOST_OFFLINE", f"host={host}")
+                else:
+                    drivers = install_printer_drivers(host, script_name, psexec_path)
+                    audit_log(
+                        "DRIVER_INSTALL_RESULT",
+                        f"host={host}; status={drivers.get('Status')}; "
+                        f"falhas={len(driver_install_failures(drivers))}",
+                    )
+                    partes.append(format_driver_install_report(host, drivers))
+                    if drivers.get("Status") != "ok":
+                        # Sem driver nenhum instalado, rodar o script apaga as
+                        # impressoras do usuario e pode nao conseguir remapear.
+                        # Melhor parar antes de estragar.
+                        partes.append(
+                            "O script NÃO foi executado: a instalação de "
+                            "drivers não chegou a rodar, e executar assim "
+                            "apagaria as impressoras do usuário sem "
+                            "garantia de remapear."
+                        )
+                        abortado = True
+
+                    if not abortado:
+                        data = run_startup_script(host, script_name, psexec_path)
+                        audit_log(
+                            "STARTUP_SCRIPT_RESULT",
+                            f"host={host}; script={script_name}; "
+                            f"status={data.get('Status')}; user={data.get('User') or '-'}",
+                        )
+                        partes.append(format_script_run_report(host, data))
+            except PsExecQueryError as exc:
+                log_psexec_failure(host, psexec_path, exc)
+                audit_log("STARTUP_SCRIPT_PSEXEC_ERROR",
+                          f"host={host}; category={exc.category}; code={exc.returncode}")
+                erro = exc
+            except Exception as exc:
+                log_exception(exc)
+                audit_log("STARTUP_SCRIPT_ERROR", f"host={host}; error={exc}")
+                erro = exc
+
+            def finish():
+                self._set_busy(False)
+                if offline:
+                    self._set_output(
+                        "O computador está desligado ou não respondeu à rede.\n"
+                        "Nada foi executado.")
+                    return
+                if isinstance(erro, PsExecQueryError):
+                    self._set_output(f"{erro.summary}\n\n{erro.hint}")
+                    show_psexec_error_dialog(self, host, erro)
+                    return
+                if erro is not None:
+                    self._set_output(f"Falha ao executar em {host}:\n\n{erro}")
+                    show_error(self, "Executar script",
+                               f"Falha ao executar em {host}:\n\n{erro}\n\n"
+                               f"Log: {ERROR_LOG}")
+                    return
+                self._set_output(("\n\n" + ("-" * 60) + "\n\n").join(partes))
+
+            self._finish(finish)
+
+        threading.Thread(target=worker, name="VNC-Menu-StartupScript",
+                         daemon=True).start()

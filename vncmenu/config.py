@@ -23,7 +23,7 @@ PORT = 5900
 APP_NAME = "VNC-Menu"
 
 
-APP_VERSION = "2.4.0"
+APP_VERSION = "2.5.0"
 
 
 APP_AUTHOR = 'Gabriel "GMErebos" Mariense'
@@ -59,6 +59,26 @@ PSEXEC_DOWNLOAD_URL = "https://learn.microsoft.com/sysinternals/downloads/psexec
 PSEXEC_TIMEOUT_SECONDS = 35
 
 
+# Pasta de inicializacao comum a todos os usuarios: e onde fica o script de
+# impressoras. O nome do arquivo varia por maquina, entao so a pasta e fixa.
+STARTUP_FOLDER = r"C:\ProgramData\Microsoft\Windows\Start Menu\Programs\Startup"
+
+# Nome da tarefa agendada temporaria que roda o script no contexto do usuario
+# logado. Fixo de proposito: se uma execucao anterior morreu no meio, a
+# proxima acha a sobra pelo nome e remove antes de recriar.
+STARTUP_TASK_NAME = "VNCMenu_Script"
+
+# Quanto o PowerShell remoto espera a tarefa terminar. O script de impressoras
+# tem 12s de Sleep fixo mais as consultas WMI, entao um limite curto cortaria
+# uma execucao saudavel.
+SCRIPT_RUN_WAIT_SECONDS = 120
+
+# Limite do processo PsExec inteiro. Maior que SCRIPT_RUN_WAIT_SECONDS para
+# que o estouro seja reportado pelo PowerShell (com diagnostico) e nao pelo
+# PsExec sendo morto aqui (sem diagnostico nenhum).
+SCRIPT_RUN_TIMEOUT_SECONDS = 180
+
+
 HOST_PING_TIMEOUT_MS = 1000
 
 
@@ -86,60 +106,6 @@ SEARCH_HOST_COLUMN_WIDTH = 150
 
 
 SEARCH_SECTOR_COLUMN_WIDTH = 130
-
-
-# --- OCS Inventory -------------------------------------------------------
-# Consulta o console web, nao a REST API: a REST esta instalada no servidor
-# mas responde 500. Enquanto isso nao for corrigido, o console e o unico
-# caminho de leitura disponivel.
-
-# Vazio de proposito: cada instalacao aponta para o proprio servidor em
-# Configuracoes > OCS Inventory. Nao existe padrao razoavel para chutar.
-OCS_URL = ""
-
-
-OCS_TIMEOUT_SECONDS = 25
-
-
-# Quantas linhas pedir por busca. Contas de servico (painel.*) devolvem
-# dezenas; o cliente compara com recordsFiltered e avisa se truncou, entao
-# este numero limita o trafego sem esconder resultado.
-OCS_SEARCH_LIMIT = 200
-
-
-# A partir de quantos dias o ultimo inventario e considerado velho. O OCS
-# guarda o usuario da ULTIMA coleta, entao uma linha antiga pode apontar
-# para quem nao usa mais aquela maquina.
-OCS_STALE_DAYS = 30
-
-
-# Larguras das colunas do resultado do OCS. Ficam aqui porque o CABECALHO e as
-# LINHAS precisam usar exatamente os mesmos valores; com numeros soltos nos
-# dois lugares, mexer em um deles desalinha a tabela sem ninguem perceber.
-OCS_COL_IP = 120
-OCS_COL_SESSION = 135
-OCS_COL_DATE = 115
-OCS_COL_AGE = 66
-OCS_COL_TAG = 100
-
-
-# Altura ocupada por UMA linha do resultado: 46 do widget mais 4 de pady em
-# cima e 4 embaixo. Se build_row mudar a altura da linha, mudar aqui junto.
-OCS_ROW_PITCH = 54
-
-
-# Quantas linhas inteiras a janela mostra ao abrir.
-OCS_VISIBLE_ROWS = 5
-
-
-# Altura da janela na abertura. A 520 a lista tinha 220px uteis, ou seja
-# exatamente 4 linhas, e a quinta abria cortada ao meio, o que faz parecer
-# que o resultado terminou ali. 5 linhas pedem 270px, entao +50, mais folga
-# para a ultima nao encostar na borda de baixo.
-OCS_WINDOW_HEIGHT = 580
-
-
-OCS_WINDOW_WIDTH = 960
 
 
 VIEWER_ULTRAVNC = "ultravnc"

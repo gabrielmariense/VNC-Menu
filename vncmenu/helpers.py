@@ -281,7 +281,7 @@ def modal_window(win, parent=None):
 def bind_clickable_row(row, labels, on_click, on_context, normal_color, hover_color):
     """Faz um frame cheio de labels se comportar como uma linha clicavel.
 
-    Usado pela lista da busca de hosts e pela do inventario OCS. Fica aqui
+    Usado pela lista da busca de hosts. Fica aqui
     porque a parte chata nao e o clique, e o hover: entrar num label filho
     dispara <Leave> no proprio frame, entao a cor so pode voltar quando o
     ponteiro tiver saido da linha INTEIRA, nao de um pedaco dela.

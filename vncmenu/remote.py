@@ -8,13 +8,16 @@ Depende de config, applog, storage, helpers e ui.dialogs.
 """
 
 from pywinauto import Desktop
+# send_keys NAO e importado de proposito: ele digita na janela em primeiro
+# plano, nao na que encontramos. A credencial so e escrita com set_text(),
+# amarrado ao handle do controle. Nao reintroduzir sem ler o comentario de
+# auto_enter_uvnc_credentials().
 from pathlib import Path
 import base64
 import ctypes
 import json
 import os
 import re
-from pywinauto.keyboard import send_keys
 import shutil
 import subprocess
 import tempfile
@@ -24,7 +27,7 @@ from ctypes import wintypes
 
 from concurrent.futures import ThreadPoolExecutor
 
-from .config import QWINSTA_MAX_WORKERS, AUTH_TIMEOUT, AUTH_TITLE_RE, DEFAULT_VIEWER, ERROR_LOG, ERROR_LOG_MAX_BYTES, HOST_PING_PROCESS_TIMEOUT_SECONDS, HOST_PING_TIMEOUT_MS, PSEXEC_TIMEOUT_SECONDS, REALVNC_DIR, REALVNC_EXE, RESTART_TIMEOUT_SECONDS, TEMPLATE_VNC, ULTRAVNC_EXE, VIEWER_REALVNC
+from .config import QWINSTA_MAX_WORKERS, AUTH_TIMEOUT, AUTH_TITLE_RE, DEFAULT_VIEWER, ERROR_LOG, ERROR_LOG_MAX_BYTES, HOST_PING_PROCESS_TIMEOUT_SECONDS, HOST_PING_TIMEOUT_MS, PSEXEC_TIMEOUT_SECONDS, REALVNC_DIR, REALVNC_EXE, RESTART_TIMEOUT_SECONDS, SCRIPT_RUN_TIMEOUT_SECONDS, SCRIPT_RUN_WAIT_SECONDS, STARTUP_FOLDER, STARTUP_TASK_NAME, TEMPLATE_VNC, ULTRAVNC_EXE, VIEWER_REALVNC
 from .applog import audit_log, log_exception, rotate_log_if_needed
 from .storage import format_host_port, sanitize_port, split_host_port, get_realvnc_exe, get_ultravnc_exe, load_creds, resolve_existing_exe, sanitize_viewer, viewer_display_name
 from .helpers import realvnc_profile_name, safe_filename, show_error, show_info
@@ -77,10 +80,58 @@ def _auth_dialog_candidates(process_id):
     return candidates
 
 
-def auto_enter_uvnc_credentials(timeout=AUTH_TIMEOUT, process_id=None) -> bool:
+def _submit_auth_dialog(dlg) -> bool:
+    """Confirma o dialogo sem usar o teclado global.
+
+    send_keys() digita na janela que estiver em PRIMEIRO PLANO, nao na que
+    encontramos: se o operador clicar em outro lugar no instante errado, o
+    ENTER (e antes a senha) vai para la. Aqui so se usa o que e amarrado ao
+    HANDLE da janela: clicar o botao pelo controle, e em ultimo caso postar
+    VK_RETURN para o dialogo. Nenhum dos dois alcanca outra janela.
+    """
+    for titulo in ("OK", "&OK", "Conectar", "Logon", "Log On", "Entrar"):
+        try:
+            botao = dlg.child_window(title=titulo, control_type="Button")
+            if botao.exists(timeout=0.2):
+                botao.click()
+                return True
+        except Exception:
+            continue
+
+    try:
+        # 0x0100 WM_KEYDOWN / 0x0101 WM_KEYUP, 0x0D VK_RETURN.
+        alvo = dlg.wrapper_object()
+        alvo.post_message(0x0100, 0x0D, 0)
+        alvo.post_message(0x0101, 0x0D, 0)
+        return True
+    except Exception:
+        return False
+
+
+def auto_enter_uvnc_credentials(timeout=AUTH_TIMEOUT, process_id=None,
+                                cancel: threading.Event | None = None) -> bool:
+    """Preenche o dialogo de autenticacao do UltraVNC.
+
+    Regra que sustenta o resto: a senha e escrita SOMENTE com set_text(), que
+    grava no controle pelo handle dele. Ao contrario de send_keys(), isso nao
+    depende de quem esta em primeiro plano, entao a credencial nao tem como
+    cair na barra de busca, num chat ou em qualquer campo que o operador
+    clique enquanto o viewer abre.
+
+    Nao existe mais caminho "as cegas": se os campos do dialogo nao forem
+    encontrados, a funcao desiste e o operador digita. Perder esse fallback e
+    o objetivo, nao um efeito colateral.
+
+    `cancel` e checado no laco e imediatamente antes de cada escrita, para
+    fechar o viewer realmente parar o preenchimento em vez de deixar a thread
+    viva ate o timeout.
+    """
     user, pwd = load_creds()
     if not user and not pwd:
         return False
+
+    def cancelado() -> bool:
+        return cancel is not None and cancel.is_set()
 
     deadline = time.time() + timeout
     # Give the process-scoped match the first half of the window before allowing
@@ -90,6 +141,9 @@ def auto_enter_uvnc_credentials(timeout=AUTH_TIMEOUT, process_id=None) -> bool:
     matched_by = ""
 
     while time.time() < deadline and dlg is None:
+        if cancelado():
+            audit_log("VNC_AUTO_LOGIN_ABORTED", "reason=cancelled_before_match")
+            return False
         for criteria, label in _auth_dialog_candidates(process_id):
             if label == "title" and time.time() < title_fallback_at:
                 continue
@@ -112,60 +166,101 @@ def auto_enter_uvnc_credentials(timeout=AUTH_TIMEOUT, process_id=None) -> bool:
 
     try:
         dlg.wait("visible", timeout=2)
-        dlg.set_focus()
 
-        # A title-only match is not proof that this window belongs to the viewer,
-        # so it must also be the window in front before anything is typed.
+        # Ultima checagem antes de escrever: a janela ainda existe e ninguem
+        # cancelou. Fechar o viewer entre encontrar o dialogo e preencher era
+        # o caso que deixava a credencial ser digitada depois do cancelamento.
+        if cancelado():
+            audit_log("VNC_AUTO_LOGIN_ABORTED", "reason=cancelled_before_typing")
+            return False
+        if not dlg.exists():
+            audit_log("VNC_AUTO_LOGIN_ABORTED", "reason=dialog_closed")
+            return False
+
+        # Um match so por titulo nao prova que a janela e do viewer que
+        # iniciamos, entao ela tambem precisa estar em primeiro plano.
         if matched_by != "process" and not dialog_owns_foreground(dlg):
             audit_log("VNC_AUTO_LOGIN_ABORTED", "reason=untrusted_match_not_foreground")
             return False
 
         edits = dlg.descendants(control_type="Edit")
 
-        if len(edits) == 1:
-            edits[0].set_text(pwd)
-            send_keys("{ENTER}")
-            return True
-
-        if len(edits) >= 2:
-            if user:
-                edits[0].set_text(user)
-            edits[1].set_text(pwd)
-            send_keys("{ENTER}")
-            return True
-
-        # Blind fallback: send_keys() types into whatever window currently holds
-        # the foreground. Only type the password while the auth dialog is still
-        # in front, otherwise it would leak into another application.
-        if not dialog_owns_foreground(dlg):
-            audit_log("VNC_AUTO_LOGIN_ABORTED", "reason=foreground_changed")
+        if not edits:
+            # Sem campos identificados nao ha onde escrever com seguranca.
+            audit_log("VNC_AUTO_LOGIN_ABORTED", "reason=no_edit_controls")
             return False
 
-        if user:
-            send_keys(user + "{TAB}" + pwd + "{ENTER}", with_spaces=True)
+        if len(edits) == 1:
+            edits[0].set_text(pwd)
         else:
-            send_keys(pwd + "{ENTER}", with_spaces=True)
+            if user:
+                edits[0].set_text(user)
+            if cancelado():
+                audit_log("VNC_AUTO_LOGIN_ABORTED", "reason=cancelled_mid_fill")
+                return False
+            edits[1].set_text(pwd)
+
+        if cancelado():
+            audit_log("VNC_AUTO_LOGIN_ABORTED", "reason=cancelled_before_submit")
+            return False
+
+        _submit_auth_dialog(dlg)
         return True
 
     except Exception:
         return False
 
 
-def start_uvnc_credential_autofill(process_id=None) -> None:
-    """Wait for the UltraVNC authentication dialog without blocking Tkinter."""
+def start_uvnc_credential_autofill(
+    process_id=None,
+    process: subprocess.Popen | None = None,
+):
+    """Espera o dialogo de autenticacao sem travar o Tkinter.
+
+    Devolve o Event de cancelamento. Quem chama guarda e aciona quando a
+    conexao deixa de fazer sentido; o proprio worker aciona quando o processo
+    do viewer morre, que e o que acontece quando o operador fecha a janela do
+    VNC ou a de credenciais antes do preenchimento.
+    """
+    cancel = threading.Event()
 
     def worker():
         try:
-            auto_enter_uvnc_credentials(process_id=process_id)
+            auto_enter_uvnc_credentials(process_id=process_id, cancel=cancel)
         except Exception as exc:
             log_exception(exc)
             audit_log("VNC_AUTO_LOGIN_ERROR", f"error={exc}")
+        finally:
+            cancel.set()
+
+    if process is not None:
+        # O watcher e definido aqui dentro, sobre uma variavel atribuida uma
+        # vez so, para que o tipo dele seja o processo e nao "processo ou
+        # None": a thread ja so nasce dentro desta guarda.
+        viewer = process
+
+        def watcher():
+            """Cancela assim que o viewer sai, sem esperar o timeout."""
+            while not cancel.wait(0.2):
+                try:
+                    if viewer.poll() is not None:
+                        cancel.set()
+                        return
+                except Exception:
+                    return
+
+        threading.Thread(
+            target=watcher,
+            name="VNC-Credential-Watcher",
+            daemon=True,
+        ).start()
 
     threading.Thread(
         target=worker,
         name="VNC-Credential-Autofill",
         daemon=True,
     ).start()
+    return cancel
 
 
 def launch_vnc(
@@ -283,8 +378,10 @@ def launch_vnc(
         audit_log("CONNECTION_STARTED", f"viewer=UltraVNC; name={target_name}; host={host}; porta={port}; template={TEMPLATE_VNC}")
 
         if automatic_login:
-            # The PID scopes the auth-dialog search to this viewer instance.
-            start_uvnc_credential_autofill(viewer_process.pid)
+            # O PID restringe a busca do dialogo a esta instancia do viewer, e
+            # o processo em si serve de sinal de cancelamento: fechar o viewer
+            # para o preenchimento na hora.
+            start_uvnc_credential_autofill(viewer_process.pid, viewer_process)
 
     except Exception as e:
         audit_log("CONNECTION_ERROR", f"viewer={viewer_display_name(viewer)}; host={host}; error={e}")
@@ -512,6 +609,56 @@ def log_psexec_failure(host, psexec_path, error: PsExecQueryError):
         pass
 
 
+def _run_psexec(command, host, psexec_path, timeout_seconds):
+    """Executa o PsExec e traduz as falhas locais em PsExecQueryError.
+
+    Extraido de query_remote_printers para que a execucao de script use as
+    mesmas mensagens: o que muda entre os dois e so o payload e o limite de
+    tempo, nunca o diagnostico de "PsExec nao abriu".
+    """
+    try:
+        return subprocess.run(
+            command,
+            capture_output=True,
+            timeout=timeout_seconds,
+            creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
+        )
+    except FileNotFoundError as exc:
+        details = _build_psexec_details(host, psexec_path, None, stderr=str(exc))
+        raise PsExecQueryError(
+            "PsExec não foi encontrado.",
+            "Confira o caminho configurado em Configurações > PsExec.",
+            details,
+            category="local_not_found",
+        ) from exc
+    except PermissionError as exc:
+        details = _build_psexec_details(host, psexec_path, None, stderr=str(exc))
+        raise PsExecQueryError(
+            "O Windows bloqueou a execução do PsExec.",
+            "Verifique permissões do arquivo, antivírus/EDR e tente novamente.",
+            details,
+            category="local_permission",
+        ) from exc
+    except subprocess.TimeoutExpired as exc:
+        stdout = _decode_process_output(exc.stdout)
+        stderr = _decode_process_output(exc.stderr)
+        details = _build_psexec_details(host, psexec_path, None, stdout, stderr)
+        raise PsExecQueryError(
+            f"A operação excedeu {timeout_seconds} segundos.",
+            "O host pode estar lento, o PsExec pode estar bloqueado ou a comunicação SMB pode ter travado.",
+            details,
+            category="timeout",
+        ) from exc
+    except OSError as exc:
+        details = _build_psexec_details(host, psexec_path, None, stderr=str(exc))
+        raise PsExecQueryError(
+            "Não foi possível iniciar o PsExec.",
+            "Confira o executável configurado e as permissões locais do arquivo.",
+            details,
+            category="local_launch",
+        ) from exc
+
+
 def query_remote_printers(host: str, psexec_path: Path) -> str:
     host = str(host or "").strip().lstrip("\\")
     if not host:
@@ -577,47 +724,7 @@ $payload=[Convert]::ToBase64String([Text.Encoding]::UTF8.GetBytes($json))
         encoded_command,
     ]
 
-    try:
-        completed = subprocess.run(
-            command,
-            capture_output=True,
-            timeout=PSEXEC_TIMEOUT_SECONDS,
-            creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
-        )
-    except FileNotFoundError as exc:
-        details = _build_psexec_details(host, psexec_path, None, stderr=str(exc))
-        raise PsExecQueryError(
-            "PsExec não foi encontrado.",
-            "Confira o caminho configurado em Configurações > PsExec.",
-            details,
-            category="local_not_found",
-        ) from exc
-    except PermissionError as exc:
-        details = _build_psexec_details(host, psexec_path, None, stderr=str(exc))
-        raise PsExecQueryError(
-            "O Windows bloqueou a execução do PsExec.",
-            "Verifique permissões do arquivo, antivírus/EDR e tente novamente.",
-            details,
-            category="local_permission",
-        ) from exc
-    except subprocess.TimeoutExpired as exc:
-        stdout = _decode_process_output(exc.stdout)
-        stderr = _decode_process_output(exc.stderr)
-        details = _build_psexec_details(host, psexec_path, None, stdout, stderr)
-        raise PsExecQueryError(
-            f"A consulta excedeu {PSEXEC_TIMEOUT_SECONDS} segundos.",
-            "O host pode estar lento, o PsExec pode estar bloqueado ou a comunicação SMB pode ter travado.",
-            details,
-            category="timeout",
-        ) from exc
-    except OSError as exc:
-        details = _build_psexec_details(host, psexec_path, None, stderr=str(exc))
-        raise PsExecQueryError(
-            "Não foi possível iniciar o PsExec.",
-            "Confira o executável configurado e as permissões locais do arquivo.",
-            details,
-            category="local_launch",
-        ) from exc
+    completed = _run_psexec(command, host, psexec_path, PSEXEC_TIMEOUT_SECONDS)
 
     stdout = _decode_process_output(completed.stdout)
     stderr = _decode_process_output(completed.stderr)
@@ -777,8 +884,8 @@ def query_all_logged_users(hosts, max_workers=QWINSTA_MAX_WORKERS):
 def query_logged_users_raw(hosts, max_workers=QWINSTA_MAX_WORKERS):
     """Mesma consulta, devolvendo os pares (nome, resultado) sem formatar.
 
-    A janela do OCS precisa comparar o usuario de cada maquina, nao exibir um
-    relatorio de texto, entao consome esta versao. format_users_output() fica
+    A janela de sessoes precisa comparar o usuario de cada maquina, nao
+    exibir um relatorio de texto, entao consome esta versao. format_users_output() fica
     para quem quer o texto pronto.
     """
     items = list(hosts)
@@ -806,3 +913,535 @@ def format_users_output(rows):
         lines.append(f"{host:<{host_w}}  {user}")
 
     return "\n".join(lines)
+
+
+
+# --------------------------------------------------------------- run script
+
+# Caracteres que o Windows nao aceita em nome de arquivo. Barra e dois-pontos
+# entram aqui de proposito: o campo e um NOME, nao um caminho, para ninguem
+# apontar a execucao para fora da pasta de inicializacao.
+_INVALID_NAME_CHARS = set('\\/:*?"<>|')
+
+# Cada valor de Status que o PowerShell remoto pode devolver, com o texto
+# mostrado ao operador. A chave vem do script; o texto fica aqui, em um lugar
+# so, para a janela nao montar mensagem por conta propria.
+SCRIPT_RUN_STATUS = {
+    "ok": "Script executado no contexto do usuário logado.",
+    "no_folder": "A pasta de inicialização não existe no computador remoto.",
+    "no_script": "O arquivo não foi encontrado na pasta de inicialização.",
+    "no_user": "Nenhum usuário logado no computador remoto.",
+    "register_failed": "Não foi possível criar a tarefa agendada no computador remoto.",
+    "start_failed": "A tarefa agendada foi criada, mas não iniciou.",
+    "not_started": "A tarefa foi criada e disparada, mas nunca entrou em execução.",
+    "timeout": "O script começou a rodar, mas não terminou dentro do tempo de espera.",
+}
+
+SCRIPT_RUN_HINT = {
+    "no_folder": "Confirme o caminho no computador remoto abrindo a pasta pelo botão ao lado.",
+    "no_script": "Use o botão de abrir a pasta e confira o nome exato do arquivo.",
+    "no_user": "Com a sessão vazia não há token de usuário para usar. "
+               "Rodar como SYSTEM mapearia as impressoras no perfil errado, "
+               "então nada foi executado.",
+    "register_failed": "A política de tarefas agendadas pode estar bloqueando "
+                       "o logon interativo. Veja a mensagem do Windows abaixo.",
+    "start_failed": "Veja a mensagem do Windows abaixo.",
+    "not_started": "Normalmente é o usuário ter deslogado entre a consulta e a "
+                   "execução, ou política bloqueando a tarefa.",
+    "timeout": f"A espera é de {SCRIPT_RUN_WAIT_SECONDS}s. A tarefa foi removida, "
+               "mas o script pode continuar rodando na máquina.",
+}
+
+
+def validate_script_name(name: str) -> str:
+    """Valida o nome do arquivo digitado. Devolve o nome limpo ou levanta.
+
+    So o nome, sem caminho: o script roda sempre dentro da pasta de
+    inicializacao, entao aceitar "..\\..\\algo.vbs" abriria execucao remota de
+    qualquer arquivo da maquina a partir de um campo de texto.
+    """
+    name = str(name or "").strip().strip('"')
+    if not name:
+        raise ValueError("Digite o nome do arquivo do script.")
+    if any(char in _INVALID_NAME_CHARS for char in name):
+        raise ValueError(
+            "Digite apenas o nome do arquivo, sem caminho "
+            "(por exemplo: IMPRESSORAS.vbs)."
+        )
+    if name in (".", ".."):
+        raise ValueError("Nome de arquivo inválido.")
+    # A lista de extensoes vem de SCRIPT_HOSTS: aceitar aqui uma extensao que
+    # nao tem host definido la daria erro so na hora de montar a tarefa.
+    if not name.casefold().endswith(tuple(SCRIPT_HOSTS)):
+        raise ValueError("O arquivo precisa terminar em .vbs, .cmd ou .bat.")
+    return name
+
+
+def _powershell_single_quoted(value: str) -> str:
+    """Literal PowerShell entre aspas simples (aspas simples dobram)."""
+    return "'" + str(value).replace("'", "''") + "'"
+
+
+# Qual host de script usar para cada extensao, e com quais chaves.
+#
+# wscript e o host SEM console: o .vbs roda invisivel, e o usuario nao tem
+# janela para fechar no meio (fechar o console do cscript matava o script,
+# possivelmente depois de apagar as impressoras e antes de remapear).
+# //B e o modo batch: sem banner e sem caixa de dialogo de erro na tela dele.
+#
+# .cmd e .bat nao tem equivalente: o cmd.exe abre console e nao ha chave que
+# esconda. Fica documentado em vez de fingir que some.
+SCRIPT_HOSTS = {
+    ".vbs": ("wscript.exe", "//nologo //B"),
+    ".cmd": ("cmd.exe", "/c"),
+    ".bat": ("cmd.exe", "/c"),
+}
+
+
+def script_host_command(script_name: str):
+    """Devolve (executavel, argumentos) para rodar o script informado."""
+    nome = str(script_name or "").strip()
+    for extensao, comando in SCRIPT_HOSTS.items():
+        if nome.casefold().endswith(extensao):
+            return comando
+    raise ValueError("O arquivo precisa terminar em .vbs, .cmd ou .bat.")
+
+
+def script_runs_hidden(script_name: str) -> bool:
+    """True quando a execucao nao abre janela nenhuma na tela do usuario."""
+    try:
+        executavel, _args = script_host_command(script_name)
+    except ValueError:
+        return False
+    return executavel == "wscript.exe"
+
+
+def _build_run_script_payload(script_name: str) -> str:
+    """Monta o PowerShell que roda como SYSTEM no computador remoto.
+
+    Ele NAO executa o script diretamente: AddWindowsPrinterConnection e
+    SetDefaultPrinter gravam no HKCU de quem chama, entao rodar como SYSTEM
+    mapearia as impressoras no perfil do SYSTEM e o usuario nao veria nada
+    mudar. O caminho e uma tarefa agendada com LogonType Interactive, que usa
+    o token da sessao ja aberta e por isso nao precisa da senha do usuario.
+    """
+    name = _powershell_single_quoted(script_name)
+    folder = _powershell_single_quoted(STARTUP_FOLDER)
+    task = _powershell_single_quoted(STARTUP_TASK_NAME)
+    wait = int(SCRIPT_RUN_WAIT_SECONDS)
+    executavel, argumento = script_host_command(script_name)
+    exe = _powershell_single_quoted(executavel)
+    # Um pouco acima da espera: se a tarefa travar, quem a mata e o Windows,
+    # nao o app, que ja terá removido a tarefa e ido embora.
+    limite = int(SCRIPT_RUN_WAIT_SECONDS) + 120
+
+    return f"""$ErrorActionPreference='SilentlyContinue'
+$m1='__VNC_MENU_RUNVBS_BEGIN__';$m2='__VNC_MENU_RUNVBS_END__'
+$folder={folder};$name={name};$task={task}
+$o=[ordered]@{{Status='';User='';Script='';Available=@();LastResult=$null;Detail=''}}
+function Send($s,$d){{
+ $o.Status=$s;$o.Detail=[string]$d
+ $j=ConvertTo-Json -InputObject $o -Compress -Depth 4
+ [Console]::Out.WriteLine($m1+[Convert]::ToBase64String([Text.Encoding]::UTF8.GetBytes($j))+$m2)
+ exit
+}}
+if(-not (Test-Path -LiteralPath $folder -PathType Container)){{Send 'no_folder' $folder}}
+$o.Available=@(Get-ChildItem -LiteralPath $folder -File | ForEach-Object{{$_.Name}})
+$file=Join-Path $folder $name
+$o.Script=$file
+if(-not (Test-Path -LiteralPath $file -PathType Leaf)){{Send 'no_script' ''}}
+$u=''
+try{{$u=[string](Get-CimInstance -ClassName Win32_ComputerSystem -ErrorAction Stop).UserName}}catch{{$u=''}}
+if(-not $u){{
+ foreach($proc in @(Get-CimInstance -ClassName Win32_Process -Filter "Name='explorer.exe'")){{
+  $ow=Invoke-CimMethod -InputObject $proc -MethodName GetOwner
+  if($ow -and $ow.User){{
+   if($ow.Domain){{$u="$($ow.Domain)\\$($ow.User)"}}else{{$u=[string]$ow.User}}
+   break
+  }}
+ }}
+}}
+$o.User=$u
+if(-not $u){{Send 'no_user' ''}}
+Unregister-ScheduledTask -TaskName $task -Confirm:$false
+$act=New-ScheduledTaskAction -Execute {exe} -Argument ('{argumento} "'+$file+'"') -WorkingDirectory $folder
+$pri=New-ScheduledTaskPrincipal -UserId $u -LogonType Interactive
+$cfg=New-ScheduledTaskSettingsSet -AllowStartIfOnBatteries -DontStopIfGoingOnBatteries -ExecutionTimeLimit (New-TimeSpan -Seconds {limite})
+$def=New-ScheduledTask -Action $act -Principal $pri -Settings $cfg
+try{{Register-ScheduledTask -TaskName $task -InputObject $def -Force -ErrorAction Stop|Out-Null}}
+catch{{Send 'register_failed' $_.Exception.Message}}
+try{{Start-ScheduledTask -TaskName $task -ErrorAction Stop}}
+catch{{
+ Unregister-ScheduledTask -TaskName $task -Confirm:$false
+ Send 'start_failed' $_.Exception.Message
+}}
+$ran=$false
+$end=(Get-Date).AddSeconds(20)
+while((Get-Date) -lt $end){{
+ if((Get-ScheduledTask -TaskName $task).State -eq 'Running'){{$ran=$true;break}}
+ Start-Sleep -Milliseconds 400
+}}
+$end=(Get-Date).AddSeconds({wait})
+while($ran -and (Get-Date) -lt $end){{
+ if((Get-ScheduledTask -TaskName $task).State -ne 'Running'){{break}}
+ Start-Sleep -Milliseconds 1000
+}}
+$info=Get-ScheduledTaskInfo -TaskName $task
+if($info){{$o.LastResult=[int]$info.LastTaskResult}}
+$still=[string](Get-ScheduledTask -TaskName $task).State
+Unregister-ScheduledTask -TaskName $task -Confirm:$false
+if(-not $ran){{Send 'not_started' ''}}
+if($still -eq 'Running'){{Send 'timeout' ''}}
+Send 'ok' ''"""
+
+
+def parse_run_script_payload(output: str) -> dict:
+    """Extrai o JSON marcado da saida do PsExec. Devolve {} se nao achar."""
+    match = re.search(
+        r"__VNC_MENU_RUNVBS_BEGIN__\s*([A-Za-z0-9+/=\r\n]+?)\s*__VNC_MENU_RUNVBS_END__",
+        str(output or ""),
+    )
+    if not match:
+        return {}
+    try:
+        payload = re.sub(r"\s+", "", match.group(1))
+        data = json.loads(base64.b64decode(payload).decode("utf-8-sig"))
+    except Exception:
+        return {}
+    return data if isinstance(data, dict) else {}
+
+
+def format_script_run_report(host: str, data: dict) -> str:
+    """Relatorio em texto do que aconteceu na maquina."""
+    status = str((data or {}).get("Status") or "")
+    lines = [
+        SCRIPT_RUN_STATUS.get(status, f"Resultado não reconhecido: {status or '(vazio)'}"),
+        "",
+        f"Computador: {host}",
+    ]
+
+    user = str((data or {}).get("User") or "").strip()
+    lines.append(f"Usuário logado: {user or '-'}")
+
+    script = str((data or {}).get("Script") or "").strip()
+    if script:
+        lines.append(f"Arquivo: {script}")
+
+    last = (data or {}).get("LastResult")
+    if isinstance(last, int):
+        # O script da empresa nunca limpa o ON ERROR RESUME NEXT, entao 0 aqui
+        # significa "o cscript iniciou e saiu", nao "as impressoras voltaram".
+        lines.append(f"Código da tarefa: {last}")
+
+    hint = SCRIPT_RUN_HINT.get(status, "")
+    if hint:
+        lines.extend(["", hint])
+
+    detail = str((data or {}).get("Detail") or "").strip()
+    if detail:
+        lines.extend(["", f"Mensagem do Windows: {detail}"])
+
+    available = (data or {}).get("Available")
+    if status == "no_script" and isinstance(available, list):
+        nomes = [str(item) for item in available if str(item).strip()]
+        lines.append("")
+        if nomes:
+            lines.append("Arquivos na pasta de inicialização:")
+            lines.extend(f"  {nome}" for nome in nomes)
+        else:
+            lines.append("A pasta de inicialização está vazia.")
+
+    if status == "ok":
+        lines.extend([
+            "",
+            "O script não informa sucesso pelo código de saída (ele suprime "
+            "todos os erros internos). Confirme pelo botão Impressoras.",
+        ])
+
+    return "\n".join(lines)
+
+
+def run_startup_script(host: str, script_name: str, psexec_path: Path) -> dict:
+    """Roda um script da pasta de inicializacao como o usuario logado.
+
+    Devolve o dicionario cru do computador remoto. Levanta PsExecQueryError
+    quando o PsExec nem chegou a entregar um resultado.
+    """
+    host = str(host or "").strip().lstrip("\\")
+    if not host:
+        raise ValueError("Hostname ou IP não informado.")
+
+    script_name = validate_script_name(script_name)
+    payload = _build_run_script_payload(script_name)
+    encoded_command = base64.b64encode(payload.encode("utf-16-le")).decode("ascii")
+
+    command = [
+        str(psexec_path),
+        rf"\\{host}",
+        "-s",
+        "-h",
+        "-accepteula",
+        "-nobanner",
+        "-n",
+        "5",
+        "powershell.exe",
+        "-NoLogo",
+        "-NoProfile",
+        "-NonInteractive",
+        "-ExecutionPolicy",
+        "Bypass",
+        "-EncodedCommand",
+        encoded_command,
+    ]
+
+    completed = _run_psexec(command, host, psexec_path, SCRIPT_RUN_TIMEOUT_SECONDS)
+
+    stdout = _decode_process_output(completed.stdout)
+    stderr = _decode_process_output(completed.stderr)
+    data = parse_run_script_payload(f"{stdout}\n{stderr}")
+
+    if not data:
+        summary, hint, category = _diagnose_psexec_failure(
+            f"{stdout}\n{stderr}", completed.returncode
+        )
+        details = _build_psexec_details(
+            host, psexec_path, completed.returncode, stdout, stderr
+        )
+        raise PsExecQueryError(
+            summary,
+            hint,
+            details,
+            returncode=completed.returncode,
+            category=category,
+        )
+
+    return data
+
+
+# ------------------------------------------------- instalar drivers (admin)
+
+DRIVER_INSTALL_STATUS = {
+    "ok": "Instalação de drivers concluída.",
+    "no_script": "O arquivo não foi encontrado na pasta de inicialização.",
+    "no_queues": "Nenhum caminho de impressora foi encontrado dentro do script.",
+}
+
+DRIVER_INSTALL_HINT = {
+    "no_script": "Use o botão de abrir a pasta e confira o nome exato do arquivo.",
+    "no_queues": "O script pode montar o caminho por variável ou laço, em vez de "
+                 "escrever \\\\servidor\\fila entre aspas. Nesse caso a instalação "
+                 "de drivers não tem como saber quais filas usar.",
+}
+
+
+def parse_printer_paths(script_text: str) -> list:
+    r"""Extrai os \\servidor\fila escritos entre aspas no script.
+
+    O script da empresa escreve cada caminho como literal
+    (strPrinterPath = "\\SRV1315\FILA"), entao le-los e o suficiente para
+    saber quais drivers precisam ser instalados antes. Nomes repetidos saem
+    uma vez so, na ordem em que aparecem: a ordem do script e a ordem em que
+    o suporte espera ver as filas.
+    """
+    encontrados = []
+    for bruto in re.findall(r'"(\\\\[^"\r\n]+)"', str(script_text or "")):
+        caminho = bruto.strip().rstrip("\\")
+        # Precisa ser \\servidor\fila: so o servidor, sem fila, nao instala
+        # driver nenhum e viraria uma chamada perdida.
+        if not re.match(r"^\\\\[^\\]+\\.+", caminho):
+            continue
+        if caminho.casefold() not in {item.casefold() for item in encontrados}:
+            encontrados.append(caminho)
+    return encontrados
+
+
+def _build_driver_install_payload(script_name: str) -> str:
+    """PowerShell que instala os drivers das filas citadas no script.
+
+    Roda como SYSTEM. SYSTEM se autentica no servidor de impressao como a
+    conta de maquina (DOMINIO\\PC$), entao nao precisa de senha nenhuma; se o
+    servidor recusar a conta de maquina, o erro volta por fila e a decisao de
+    usar credencial nominal deixa de ser chute.
+
+    A conexao criada fica no perfil do SYSTEM de proposito: o que interessa e
+    o driver, que vai para o driver store da MAQUINA. Remover a conexao depois
+    so acrescentaria um jeito de falhar depois do objetivo ja alcancado.
+    """
+    name = _powershell_single_quoted(script_name)
+    folder = _powershell_single_quoted(STARTUP_FOLDER)
+
+    return rf"""$ErrorActionPreference='SilentlyContinue'
+$m1='__VNC_MENU_DRIVERS_BEGIN__';$m2='__VNC_MENU_DRIVERS_END__'
+$folder={folder};$name={name}
+$o=[ordered]@{{Status='';Script='';Queues=@();Results=@();Detail=''}}
+function Send($s,$d){{
+ $o.Status=$s;$o.Detail=[string]$d
+ $j=ConvertTo-Json -InputObject $o -Compress -Depth 5
+ [Console]::Out.WriteLine($m1+[Convert]::ToBase64String([Text.Encoding]::UTF8.GetBytes($j))+$m2)
+ exit
+}}
+$file=Join-Path $folder $name
+$o.Script=$file
+if(-not (Test-Path -LiteralPath $file -PathType Leaf)){{Send 'no_script' ''}}
+$txt=Get-Content -LiteralPath $file -Raw
+$achados=@()
+foreach($mm in [regex]::Matches([string]$txt,'"(\\\\[^"\r\n]+)"')){{
+ $p=([string]$mm.Groups[1].Value).Trim().TrimEnd('\')
+ if($p -match '^\\\\[^\\]+\\.+' -and $achados -notcontains $p){{$achados+=$p}}
+}}
+$o.Queues=$achados
+if($achados.Count -eq 0){{Send 'no_queues' ''}}
+foreach($path in $achados){{
+ $r=[ordered]@{{Path=$path;Ok=$false;Error=''}}
+ try{{
+  Add-Printer -ConnectionName $path -ErrorAction Stop
+  $r.Ok=$true
+ }}catch{{
+  $msg=[string]$_.Exception.Message
+  # Ja instalada e sucesso: o driver que interessa ja esta no driver store.
+  if($msg -match '(?i)already exists|ja existe|já existe'){{$r.Ok=$true}}
+  else{{$r.Error=$msg}}
+ }}
+ $o.Results+=,$r
+}}
+Send 'ok' ''"""
+
+
+def parse_driver_install_payload(output: str) -> dict:
+    """Extrai o JSON marcado da instalacao de drivers. {} se nao achar."""
+    match = re.search(
+        r"__VNC_MENU_DRIVERS_BEGIN__\s*([A-Za-z0-9+/=\r\n]+?)\s*__VNC_MENU_DRIVERS_END__",
+        str(output or ""),
+    )
+    if not match:
+        return {}
+    try:
+        payload = re.sub(r"\s+", "", match.group(1))
+        data = json.loads(base64.b64decode(payload).decode("utf-8-sig"))
+    except Exception:
+        return {}
+    return data if isinstance(data, dict) else {}
+
+
+def driver_install_failures(data: dict) -> list:
+    """Filas que nao instalaram, como (caminho, erro)."""
+    resultados = (data or {}).get("Results")
+    if not isinstance(resultados, list):
+        return []
+    falhas = []
+    for item in resultados:
+        if not isinstance(item, dict):
+            continue
+        if not item.get("Ok"):
+            falhas.append((str(item.get("Path") or "?"), str(item.get("Error") or "")))
+    return falhas
+
+
+def format_driver_install_report(host: str, data: dict) -> str:
+    """Relatorio da instalacao de drivers, fila por fila."""
+    status = str((data or {}).get("Status") or "")
+    linhas = [
+        DRIVER_INSTALL_STATUS.get(
+            status, f"Resultado não reconhecido: {status or '(vazio)'}"
+        ),
+        "",
+        f"Computador: {host}",
+    ]
+
+    script = str((data or {}).get("Script") or "").strip()
+    if script:
+        linhas.append(f"Arquivo lido: {script}")
+
+    resultados = (data or {}).get("Results")
+    if isinstance(resultados, list) and resultados:
+        linhas.append("")
+        for item in resultados:
+            if not isinstance(item, dict):
+                continue
+            caminho = str(item.get("Path") or "?")
+            if item.get("Ok"):
+                linhas.append(f"  OK    {caminho}")
+            else:
+                linhas.append(f"  FALHA {caminho}")
+                erro = str(item.get("Error") or "").strip()
+                if erro:
+                    linhas.append(f"        {erro}")
+
+    hint = DRIVER_INSTALL_HINT.get(status, "")
+    if hint:
+        linhas.extend(["", hint])
+
+    falhas = driver_install_failures(data)
+    if status == "ok" and falhas:
+        linhas.extend([
+            "",
+            "As filas acima falharam. Se o erro for de acesso, o servidor não "
+            "está liberando o driver para a conta de máquina deste computador; "
+            "se for de driver, a fila pode estar publicando um driver que esta "
+            "máquina não aceita.",
+        ])
+
+    return "\n".join(linhas)
+
+
+def install_printer_drivers(host: str, script_name: str, psexec_path: Path) -> dict:
+    """Instala, com privilegio, os drivers das filas citadas no script.
+
+    Separada de run_startup_script de proposito: instalar driver e operacao de
+    MAQUINA (vai para o driver store) e mapear impressora e operacao de
+    USUARIO (vai para o HKCU). Sao dois contextos diferentes, entao sao duas
+    chamadas diferentes.
+
+    Roda como SYSTEM, que se apresenta ao servidor de impressao como a conta
+    de maquina (DOMINIO\\PC$). Foi testado em producao: o servidor libera o
+    driver para a conta de maquina, o mesmo caminho que a consulta de
+    impressoras ja usava para ler as filas do SRV. Rodar com -u/-p foi
+    tentado e nao serve: o PsExec faz logon interativo no computador remoto,
+    e a conta administrativa nao tem esse direito nas estacoes (erro 1385).
+    """
+    host = str(host or "").strip().lstrip("\\")
+    if not host:
+        raise ValueError("Hostname ou IP não informado.")
+
+    script_name = validate_script_name(script_name)
+    payload = _build_driver_install_payload(script_name)
+    encoded_command = base64.b64encode(payload.encode("utf-16-le")).decode("ascii")
+
+    command = [
+        str(psexec_path),
+        rf"\\{host}",
+        "-s",
+        "-h",
+        "-accepteula",
+        "-nobanner",
+        "-n",
+        "5",
+        "powershell.exe",
+        "-NoLogo",
+        "-NoProfile",
+        "-NonInteractive",
+        "-ExecutionPolicy",
+        "Bypass",
+        "-EncodedCommand",
+        encoded_command,
+    ]
+
+    completed = _run_psexec(command, host, psexec_path, SCRIPT_RUN_TIMEOUT_SECONDS)
+
+    stdout = _decode_process_output(completed.stdout)
+    stderr = _decode_process_output(completed.stderr)
+    data = parse_driver_install_payload(f"{stdout}\n{stderr}")
+
+    if not data:
+        summary, hint, category = _diagnose_psexec_failure(
+            f"{stdout}\n{stderr}", completed.returncode
+        )
+        details = _build_psexec_details(
+            host, psexec_path, completed.returncode, stdout, stderr
+        )
+        raise PsExecQueryError(
+            summary, hint, details,
+            returncode=completed.returncode, category=category,
+        )
+
+    return data

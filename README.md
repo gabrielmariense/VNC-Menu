@@ -19,10 +19,29 @@ O projeto foi criado para agilizar o acesso a várias máquinas, reduzir tarefas
 - Modos de ação para **Conectar** e **Reiniciar** hosts.
 - Consulta de sessões remotas com `qwinsta`, executada em paralelo e em segundo plano.
 - Listagem de impressoras remotas via **PsExec** + PowerShell.
-- Menu de contexto por host com **Copiar IP**, **Abrir c$**, **Abrir Menu Iniciar** e **Impressoras**.
+- Reexecução do script de mapeamento de impressoras **na sessão do usuário logado**, com instalação prévia dos drivers na máquina.
+- Menu de contexto por host com **Copiar IP**, **Abrir c$**, **Abrir Menu Iniciar**, **Impressoras** e **Sessões**; a janela de host manual tem as mesmas ações, menos **Copiar IP** (ali o endereço acabou de ser digitado).
 - Configuração de hosts, viewers, PsExec, colunas, tema e posicionamento das janelas.
 - Verificação e instalação de atualizações a partir das releases do GitHub.
 - Logs de auditoria e erros por usuário, com rotação automática.
+
+## Credenciais e digitação automática
+
+Com o login automático ligado, o app espera o diálogo de autenticação do
+UltraVNC e preenche a credencial salva. Duas regras sustentam isso:
+
+- A credencial é escrita **somente** com `set_text()`, que grava no controle
+  pelo handle dele. Diferente de `send_keys()`, não depende de qual janela está
+  em primeiro plano, então a senha não tem como cair na barra de busca, num
+  chat ou em qualquer campo que você clique enquanto o viewer abre. O módulo
+  nem importa `send_keys`, de propósito.
+- Fechar o viewer (ou a janela de credenciais) **cancela** o preenchimento na
+  hora. O processo do viewer é o sinal: quando ele sai, a thread para, em vez
+  de continuar viva até o tempo limite e digitar no que aparecer.
+
+Se os campos do diálogo não forem identificados, o app **desiste** e você
+digita. Não existe caminho "às cegas" — ele foi removido justamente por ser o
+único que digitava sem um controle amarrado.
 
 ## Requisitos
 
@@ -117,7 +136,7 @@ Na tela principal:
 - **Conectar**: modo de ação. Um clique no host abre o viewer configurado.
 - **Reiniciar**: modo de ação. Um clique no host pede confirmação e envia o reinício.
 - **Usuários**: consulta as sessões remotas dos hosts do setor com `qwinsta`.
-- **Impressoras**: lista as impressoras instaladas no host.
+- **Impressoras**: abre a janela de impressoras do host.
 
 **Conectar** e **Reiniciar** também aceitam duplo clique no próprio botão para agir sobre um host digitado na hora.
 
@@ -170,7 +189,9 @@ Clique com o botão direito sobre um host para acessar:
 \\HOST\c$\ProgramData\Microsoft\Windows\Start Menu\Programs\Startup
 ```
 
-- **Impressoras**: lista as impressoras instaladas no host.
+- **Impressoras**: abre a janela de impressoras já com o host preenchido. Nada
+  é consultado sozinho: um menu aberto por engano não dispara PsExec contra a
+  máquina.
 
 O acesso a `C$` depende das permissões do usuário, disponibilidade do SMB, firewall e políticas da rede.
 
@@ -330,6 +351,112 @@ Support_Workstation 01.vnc
 ```
 
 Se o perfil não existir ou estiver vazio, o aplicativo informa o arquivo esperado.
+
+## Janela de Impressoras
+
+Uma janela só para o atendimento inteiro de impressora: consultar o que está
+mapeado, reexecutar o script e consultar de novo para conferir. A saída é
+compartilhada pelas duas ações, para dar para comparar antes e depois sem
+trocar de janela.
+
+Abrindo pela lista de hosts ou pelo menu de contexto, o campo já vem
+preenchido; pelo botão da barra, vem vazio. Em nenhum dos casos algo roda
+sozinho — consultar e reexecutar têm custos diferentes na máquina do usuário,
+então a escolha é sempre explícita.
+
+A parte de script tem o nome do arquivo (varia por máquina), um botão que abre
+a pasta pelo `c$` para conferir o nome, e a caixa de instalação de drivers:
+
+```text
+C:\ProgramData\Microsoft\Windows\Start Menu\Programs\Startup
+```
+
+### Por que o script não roda como SYSTEM
+
+O script usa `AddWindowsPrinterConnection` e `SetDefaultPrinter`, que gravam no
+`HKCU` de **quem chama**. Rodando como SYSTEM — ou com a conta do analista — as
+impressoras seriam mapeadas no perfil errado e o usuário na máquina não veria
+diferença nenhuma.
+
+Por isso a execução é assim:
+
+1. PsExec roda um PowerShell como SYSTEM na máquina.
+2. Esse PowerShell descobre o usuário logado (`Win32_ComputerSystem.UserName`,
+   com o dono do `explorer.exe` como reserva).
+3. Cria uma tarefa agendada temporária com `LogonType Interactive`, que usa o
+   **token da sessão já aberta** e por isso não pede a senha do usuário.
+4. Dispara a tarefa, espera terminar e remove a tarefa.
+
+O `.vbs` roda pelo **wscript** em modo batch (`//nologo //B`), que não tem
+console: nada aparece na tela do usuário e não há janela para ele fechar no
+meio — fechar o console do `cscript` matava o script, possivelmente depois de
+apagar as impressoras e antes de remapear. Arquivos `.cmd` e `.bat` não têm
+equivalente: o `cmd.exe` abre prompt, e a confirmação avisa isso antes.
+
+A tarefa é criada com `-AllowStartIfOnBatteries` (o padrão do Windows é não
+iniciar tarefa com a máquina na bateria, o que fazia um notebook reportar
+"nunca entrou em execução") e com limite de execução próprio, para o Windows
+matar um script travado depois que o app já removeu a tarefa e foi embora.
+
+Sem ninguém logado, nada é executado: sem token de usuário, rodar como SYSTEM
+deixaria a máquina pior do que estava.
+
+### Instalação dos drivers
+
+`AddWindowsPrinterConnection` faz duas coisas com exigências diferentes:
+
+| Etapa | Onde grava | Exige |
+|---|---|---|
+| Instalar o driver vindo do servidor | driver store da **máquina** | privilégio administrativo |
+| Criar a conexão da impressora | `HKCU` do **usuário** | o token dele |
+
+Desde o patch do PrintNightmare (KB5005652), `RestrictDriverInstallationToAdministrators`
+vem ligado por padrão: usuário comum não instala driver de impressora, nem
+manualmente. É isso que faz uma máquina ficar sem puxar a fila do servidor por
+mais que o script rode.
+
+Por isso, **antes** de executar o script, o app lê os caminhos
+`\\servidor\fila` escritos no próprio `.vbs` e roda `Add-Printer -ConnectionName`
+para cada um, como SYSTEM. O driver vai para o driver store da máquina; depois
+disso, o mapeamento no contexto do usuário não precisa mais de administrador.
+
+Não é opcional e não tem caixa de seleção: é barato (fila já instalada conta
+como sucesso), não pede credencial nenhuma, e deixar a cargo do operador só
+funcionaria se ele soubesse de antemão quais máquinas precisam — que é
+justamente o que ele não sabe antes de tentar.
+
+Notas:
+
+- Roda como **SYSTEM**, que se apresenta ao servidor de impressão como a conta
+  de máquina (`DOMÍNIO\NOME-DO-PC$`). É o mesmo caminho que a consulta de
+  impressoras já usa para ler as filas do servidor.
+- Rodar com credencial nominal (`psexec -u/-p`) foi tentado e **não serve**: o
+  PsExec faz logon interativo no computador remoto, e a conta administrativa
+  não tem esse direito nas estações — logon 1385, com a senha correta.
+- `Add-Printer` lança erro de verdade, então a janela mostra **qual fila**
+  falhou e **por quê** — que é o diagnóstico que o `.vbs` não dá.
+- A conexão criada fica no perfil do SYSTEM. É de propósito: o que interessa é
+  o driver, e removê-la depois só acrescentaria um jeito de falhar depois do
+  objetivo já alcançado.
+- Se a instalação não chega a rodar, o script **não** é executado: apagar as
+  impressoras do usuário sem garantia de remapear deixaria a máquina pior.
+
+### Limites
+
+- O resultado da execução **não prova** que as impressoras voltaram. O script
+  mantém `ON ERROR RESUME NEXT` ligado do início ao fim, então sai com código 0
+  mesmo falhando. A confirmação é consultar de novo, no mesmo lugar.
+- Enquanto o script roda, as impressoras do usuário ficam indisponíveis: ele
+  apaga todas as filas e conexões de rede antes de remapear.
+- A instalação de drivers só encontra as filas escritas como literal entre
+  aspas no `.vbs`. Um script que monte o caminho por variável ou laço é
+  reportado como "nenhum caminho encontrado", não silenciosamente ignorado.
+- `Register-ScheduledTask` com logon interativo depende da política de tarefas
+  agendadas do domínio. Quando ela recusa, a janela mostra a mensagem do
+  Windows em vez de tentar outro caminho por conta própria.
+- O campo do script aceita apenas um **nome de arquivo** `.vbs`, `.cmd` ou
+  `.bat`, sem caminho, para o campo não virar execução remota de qualquer
+  arquivo.
 
 ## PsExec e impressoras remotas
 
