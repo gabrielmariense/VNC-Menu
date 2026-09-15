@@ -538,9 +538,13 @@ class HostUnitsConfigWindow(ctk.CTkToplevel):
         self.grid_columnconfigure(1, weight=1)
         self.grid_rowconfigure(0, weight=1)
 
-        self.left = ctk.CTkFrame(self, width=270, fg_color=THEME["surface"], corner_radius=18)
+        # 340 e pack_propagate pelo mesmo motivo da barra lateral principal:
+        # esta lista mostra os MESMOS nomes de setor, e grid_propagate nao
+        # segurava nada aqui (todos os filhos usam pack), entao o width=270
+        # declarado antes nunca chegou a valer.
+        self.left = ctk.CTkFrame(self, width=340, fg_color=THEME["surface"], corner_radius=18)
         self.left.grid(row=0, column=0, sticky="ns", padx=(18, 12), pady=18)
-        self.left.grid_propagate(False)
+        self.left.pack_propagate(False)
 
         self.right = ctk.CTkFrame(self, fg_color=THEME["surface"], corner_radius=18)
         self.right.grid(row=0, column=1, sticky="nsew", padx=(0, 18), pady=18)

@@ -16,7 +16,7 @@ O projeto foi criado para agilizar o acesso a várias máquinas, reduzir tarefas
 - Credenciais UltraVNC por usuário protegidas com **Windows DPAPI**.
 - Preenchimento automático da autenticação UltraVNC, com alternância entre **Login automático** e **Login manual**.
 - Listas de hosts compartilhadas ou pessoais.
-- Modos de ação para **Conectar** e **Reiniciar** hosts.
+- Conexão em um clique no host; reinício pelo menu de contexto, com confirmação.
 - Consulta de sessões remotas com `qwinsta`, executada em paralelo e em segundo plano.
 - Listagem de impressoras remotas via **PsExec** + PowerShell.
 - Reexecução do script de mapeamento de impressoras **na sessão do usuário logado**, com instalação prévia dos drivers na máquina.
@@ -35,13 +35,19 @@ UltraVNC e preenche a credencial salva. Duas regras sustentam isso:
   em primeiro plano, então a senha não tem como cair na barra de busca, num
   chat ou em qualquer campo que você clique enquanto o viewer abre. O módulo
   nem importa `send_keys`, de propósito.
-- Fechar o viewer (ou a janela de credenciais) **cancela** o preenchimento na
-  hora. O processo do viewer é o sinal: quando ele sai, a thread para, em vez
-  de continuar viva até o tempo limite e digitar no que aparecer.
+- Uma conexão nova **cancela** o preenchimento anterior, para duas tentativas
+  não disputarem o mesmo diálogo. O diálogo também é conferido com `exists()`
+  imediatamente antes de escrever.
 
 Se os campos do diálogo não forem identificados, o app **desiste** e você
 digita. Não existe caminho "às cegas" — ele foi removido justamente por ser o
 único que digitava sem um controle amarrado.
+
+A busca dos campos usa `class_name`, que é o critério do backend `win32` em
+uso, com `control_type` como segunda tentativa. O log de auditoria registra
+qual critério funcionou (`VNC_AUTO_LOGIN_FIELDS`) e, quando nenhum funciona,
+lista as classes dos controles do diálogo (`VNC_AUTO_LOGIN_ABORTED` com
+`controles=`).
 
 ## Requisitos
 
@@ -49,7 +55,10 @@ digita. Não existe caminho "às cegas" — ele foi removido justamente por ser 
 - Python 3.12 ou superior.
 - UltraVNC Viewer para conexões UltraVNC.
 - RealVNC Viewer para conexões RealVNC.
-- PsExec (Sysinternals) para a consulta de impressoras remotas.
+- PsExec (Sysinternals) v2.43 para as funções de impressora (consulta,
+  instalação de drivers e execução do script).
+- Windows 8 ou superior nas máquinas alvo: as funções de impressora usam
+  `Get-Printer`, `Add-Printer` e o módulo `ScheduledTasks`.
 - Dependências listadas em `requirements.txt`.
 
 Dependências de execução:
@@ -98,7 +107,7 @@ vncmenu\              Pacote da aplicação.
 ├─ theme.py           Paleta e fontes.
 ├─ helpers.py         Utilitários de janela, arquivos e viewers.
 ├─ updates.py         Consulta e download de releases.
-├─ remote.py          VNC, reinício remoto, qwinsta, PsExec, impressoras.
+├─ remote.py          VNC, reinício remoto, qwinsta, PsExec, impressoras, execução de script.
 └─ ui\
    ├─ dialogs.py      Diálogos modais compartilhados.
    ├─ windows.py      Janelas de configuração, progresso e atualização.
@@ -133,14 +142,21 @@ Cada host possui:
 
 Na tela principal:
 
-- **Conectar**: modo de ação. Um clique no host abre o viewer configurado.
-- **Reiniciar**: modo de ação. Um clique no host pede confirmação e envia o reinício.
-- **Usuários**: consulta as sessões remotas dos hosts do setor com `qwinsta`.
-- **Impressoras**: abre a janela de impressoras do host.
+- **um clique no host**: abre o viewer configurado para ele;
+- **botão direito no host**: menu de contexto com reiniciar, copiar IP, abrir
+  `c$`, abrir a pasta de inicialização, impressoras e sessões;
+- **Usuários**: consulta as sessões remotas dos hosts do setor com `qwinsta`;
+- **Impressoras**: abre a janela de impressoras;
+- **Host manual**: abre a janela de ações para um host digitado na hora.
 
-**Conectar** e **Reiniciar** também aceitam duplo clique no próprio botão para agir sobre um host digitado na hora.
+Conectar e Reiniciar já foram *modos*: um estado global decidia o que o clique
+no host fazia. Deixar em Reiniciar e voltar depois reiniciava uma máquina num
+clique de conexão, então o modo saiu — clicar conecta, e reiniciar é uma ação
+por host, com confirmação.
 
-As consultas de usuários e de impressoras são executadas em segundo plano, com janela de progresso, para manter a interface responsiva. A consulta `qwinsta` é feita em paralelo.
+A consulta de usuários roda em segundo plano com janela de progresso e é feita
+em paralelo entre os hosts. A de impressoras roda dentro da própria janela de
+Impressoras, que mostra o andamento na área de saída.
 
 ### Login automático e login manual
 
@@ -153,12 +169,15 @@ Conexões manuais nunca usam o preenchimento automático.
 
 ### Host manual
 
-O botão **Host manual** segue o modo atualmente selecionado:
+O botão **Host manual** abre uma janela com o campo do host, a escolha do
+viewer e as mesmas ações do menu de contexto: **Conectar**, **Sessões**,
+**Impressoras**, **Abrir c$**, **Menu Iniciar** e **Reiniciar**.
 
-- em **Conectar**, solicita hostname/IP e viewer;
-- em **Reiniciar**, solicita hostname/IP e confirmação.
+**Copiar IP** não aparece ali: o endereço acabou de ser digitado no campo.
+**Reiniciar** fica sozinho no canto inferior direito, longe das demais, por ser
+a única que derruba o atendimento de alguém.
 
-Em **Conectar**, o campo aceita porta explícita no formato `HOST::5901`.
+O campo aceita porta explícita no formato `HOST::5901`.
 
 ### Busca
 
@@ -172,7 +191,7 @@ Enquanto há uma busca ativa:
 - a área acima da lista mostra `Buscando em: <unidade>`;
 - clicar em um setor, trocar de unidade, pressionar `Esc` ou usar o botão `✕` volta à navegação normal.
 
-O modo selecionado continua valendo: clicar em um resultado conecta ou reinicia, conforme **Conectar** ou **Reiniciar** estiver ativo. O clique com o botão direito abre o mesmo menu de contexto da lista normal.
+Clicar em um resultado conecta, como na lista normal. O clique com o botão direito abre o mesmo menu de contexto.
 
 A busca não é salva. Ao reabrir o aplicativo, a lista volta ao setor selecionado.
 
@@ -181,6 +200,7 @@ A busca não é salva. Ao reabrir o aplicativo, a lista volta ao setor seleciona
 Clique com o botão direito sobre um host para acessar:
 
 - **Host/IP**: mostra o valor configurado em `host` (apenas informativo);
+- **Reiniciar**: pede confirmação e envia o reinício;
 - **Copiar IP**: copia esse valor;
 - **Abrir c$**: tenta abrir `\\HOST\c$`;
 - **Abrir Menu Iniciar**: abre a pasta de inicialização de todos os usuários da máquina remota:
@@ -191,7 +211,9 @@ Clique com o botão direito sobre um host para acessar:
 
 - **Impressoras**: abre a janela de impressoras já com o host preenchido. Nada
   é consultado sozinho: um menu aberto por engano não dispara PsExec contra a
-  máquina.
+  máquina;
+- **Sessões**: mostra o texto cru do `qwinsta` daquela máquina, que é o que diz
+  se foi acesso negado, nome não resolvido ou tempo esgotado.
 
 O acesso a `C$` depende das permissões do usuário, disponibilidade do SMB, firewall e políticas da rede.
 

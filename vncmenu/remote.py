@@ -80,6 +80,38 @@ def _auth_dialog_candidates(process_id):
     return candidates
 
 
+def _describe_dialog(dlg) -> str:
+    """Classes dos controles do dialogo, para o log quando nada casa.
+
+    Sem isto, "nao achei os campos" e um beco sem saida: nao da para saber se
+    o dialogo mudou, se o backend e outro ou se a janela nem era a certa.
+    """
+    try:
+        classes = sorted({str(c.class_name()) for c in dlg.descendants()})
+    except Exception:
+        return "(nao foi possivel listar)"
+    return ", ".join(classes)[:300] or "(sem filhos)"
+
+
+def _find_credential_fields(dlg):
+    """Campos de texto do dialogo. Devolve (campos, criterio_que_funcionou).
+
+    O app usa backend="win32", onde o criterio e class_name="Edit".
+    control_type e criterio de UIA e nao casa nada no win32 — era isso que a
+    busca antiga usava, entao ela nunca achava campo nenhum e o preenchimento
+    so acontecia pelo caminho "as cegas", que digitava no primeiro plano.
+    Ou seja: o fallback inseguro era o unico que funcionava de verdade.
+    """
+    for criterio in ({"class_name": "Edit"}, {"control_type": "Edit"}):
+        try:
+            achados = list(dlg.descendants(**criterio))
+        except Exception:
+            continue
+        if achados:
+            return achados, next(iter(criterio))
+    return [], ""
+
+
 def _submit_auth_dialog(dlg) -> bool:
     """Confirma o dialogo sem usar o teclado global.
 
@@ -90,13 +122,16 @@ def _submit_auth_dialog(dlg) -> bool:
     VK_RETURN para o dialogo. Nenhum dos dois alcanca outra janela.
     """
     for titulo in ("OK", "&OK", "Conectar", "Logon", "Log On", "Entrar"):
-        try:
-            botao = dlg.child_window(title=titulo, control_type="Button")
-            if botao.exists(timeout=0.2):
-                botao.click()
-                return True
-        except Exception:
-            continue
+        # class_name para o backend win32; control_type fica como segunda
+        # tentativa, caso o backend mude um dia.
+        for criterio in ({"class_name": "Button"}, {"control_type": "Button"}):
+            try:
+                botao = dlg.child_window(title=titulo, **criterio)
+                if botao.exists(timeout=0.2):
+                    botao.click()
+                    return True
+            except Exception:
+                continue
 
     try:
         # 0x0100 WM_KEYDOWN / 0x0101 WM_KEYUP, 0x0D VK_RETURN.
@@ -183,12 +218,21 @@ def auto_enter_uvnc_credentials(timeout=AUTH_TIMEOUT, process_id=None,
             audit_log("VNC_AUTO_LOGIN_ABORTED", "reason=untrusted_match_not_foreground")
             return False
 
-        edits = dlg.descendants(control_type="Edit")
+        edits, criterio = _find_credential_fields(dlg)
 
         if not edits:
-            # Sem campos identificados nao ha onde escrever com seguranca.
-            audit_log("VNC_AUTO_LOGIN_ABORTED", "reason=no_edit_controls")
+            # Sem campos identificados nao ha onde escrever com seguranca. As
+            # classes vao no log para o proximo diagnostico nao ser chute.
+            audit_log(
+                "VNC_AUTO_LOGIN_ABORTED",
+                f"reason=no_edit_controls; controles={_describe_dialog(dlg)}",
+            )
             return False
+
+        audit_log(
+            "VNC_AUTO_LOGIN_FIELDS",
+            f"criterio={criterio}; campos={len(edits)}",
+        )
 
         if len(edits) == 1:
             edits[0].set_text(pwd)
@@ -211,20 +255,43 @@ def auto_enter_uvnc_credentials(timeout=AUTH_TIMEOUT, process_id=None,
         return False
 
 
-def start_uvnc_credential_autofill(
-    process_id=None,
-    process: subprocess.Popen | None = None,
-):
+# Cancelamento do preenchimento em andamento. Uma conexao nova cancela a
+# anterior: duas tentativas vivas ao mesmo tempo disputariam o mesmo dialogo.
+_autofill_cancel: threading.Event | None = None
+_autofill_lock = threading.Lock()
+
+
+def cancel_uvnc_credential_autofill() -> None:
+    """Cancela o preenchimento em andamento, se houver."""
+    global _autofill_cancel
+    with _autofill_lock:
+        if _autofill_cancel is not None:
+            _autofill_cancel.set()
+            _autofill_cancel = None
+
+
+def start_uvnc_credential_autofill(process_id=None):
     """Espera o dialogo de autenticacao sem travar o Tkinter.
 
-    Devolve o Event de cancelamento. Quem chama guarda e aciona quando a
-    conexao deixa de fazer sentido; o proprio worker aciona quando o processo
-    do viewer morre, que e o que acontece quando o operador fecha a janela do
-    VNC ou a de credenciais antes do preenchimento.
+    Devolve o Event de cancelamento, que tambem fica guardado no modulo: a
+    proxima conexao cancela esta antes de comecar a sua.
+
+    NAO existe mais vigia do processo do viewer. Ele foi tentado e quebrou o
+    preenchimento: alguns builds do UltraVNC se relancam sob um PID novo (e o
+    que _auth_dialog_candidates ja documentava), entao o processo original
+    morre em milissegundos e "processo saiu" nao significa "o operador
+    desistiu". O que protege a credencial e escrever so com set_text(), preso
+    ao handle do controle, mais a checagem de dlg.exists() antes de digitar.
     """
+    global _autofill_cancel
+
+    cancel_uvnc_credential_autofill()
     cancel = threading.Event()
+    with _autofill_lock:
+        _autofill_cancel = cancel
 
     def worker():
+        global _autofill_cancel
         try:
             auto_enter_uvnc_credentials(process_id=process_id, cancel=cancel)
         except Exception as exc:
@@ -232,28 +299,9 @@ def start_uvnc_credential_autofill(
             audit_log("VNC_AUTO_LOGIN_ERROR", f"error={exc}")
         finally:
             cancel.set()
-
-    if process is not None:
-        # O watcher e definido aqui dentro, sobre uma variavel atribuida uma
-        # vez so, para que o tipo dele seja o processo e nao "processo ou
-        # None": a thread ja so nasce dentro desta guarda.
-        viewer = process
-
-        def watcher():
-            """Cancela assim que o viewer sai, sem esperar o timeout."""
-            while not cancel.wait(0.2):
-                try:
-                    if viewer.poll() is not None:
-                        cancel.set()
-                        return
-                except Exception:
-                    return
-
-        threading.Thread(
-            target=watcher,
-            name="VNC-Credential-Watcher",
-            daemon=True,
-        ).start()
+            with _autofill_lock:
+                if _autofill_cancel is cancel:
+                    _autofill_cancel = None
 
     threading.Thread(
         target=worker,
@@ -378,10 +426,8 @@ def launch_vnc(
         audit_log("CONNECTION_STARTED", f"viewer=UltraVNC; name={target_name}; host={host}; porta={port}; template={TEMPLATE_VNC}")
 
         if automatic_login:
-            # O PID restringe a busca do dialogo a esta instancia do viewer, e
-            # o processo em si serve de sinal de cancelamento: fechar o viewer
-            # para o preenchimento na hora.
-            start_uvnc_credential_autofill(viewer_process.pid, viewer_process)
+            # O PID restringe a busca do dialogo a esta instancia do viewer.
+            start_uvnc_credential_autofill(viewer_process.pid)
 
     except Exception as e:
         audit_log("CONNECTION_ERROR", f"viewer={viewer_display_name(viewer)}; host={host}; error={e}")

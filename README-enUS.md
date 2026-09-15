@@ -18,13 +18,38 @@ The project was created to speed up access to multiple machines, reduce repetiti
 - Per-user UltraVNC credentials protected with **Windows DPAPI**.
 - Automatic UltraVNC authentication, toggleable between **Login automático** and **Login manual**.
 - Shared or personal host lists.
-- **Connect** and **Restart** action modes.
+- One-click connect on a host; restart from the context menu, with confirmation.
 - Remote session checks with `qwinsta`, run in parallel in the background.
 - Remote printer listing through **PsExec** + PowerShell.
-- Per-host context menu with **Copy IP**, **Open c$**, **Open Startup folder**, and **Printers**.
+- Re-running the printer mapping script **in the logged-on user's session**, with the queue drivers installed on the machine first.
+- Per-host context menu with **Copy IP**, **Open c$**, **Open Startup folder**, **Printers** and **Sessions**; the manual host window offers the same actions minus **Copy IP** (the address was just typed there).
 - Configuration for hosts, viewers, PsExec, columns, theme, and window placement.
 - Update checks and installation from GitHub releases.
 - Per-user audit and error logs, with automatic rotation.
+
+
+## Credentials and automatic typing
+
+With automatic login enabled, the app waits for the UltraVNC authentication
+dialog and fills in the stored credential. Two rules hold it together:
+
+- The credential is written **only** with `set_text()`, which writes into the
+  control by its handle. Unlike `send_keys()`, it does not depend on which
+  window holds the foreground, so the password cannot land in the search bar, a
+  chat, or any field you click while the viewer opens. The module does not even
+  import `send_keys`, deliberately.
+- A new connection **cancels** the previous fill, so two attempts never compete
+  for the same dialog. The dialog is also checked with `exists()` immediately
+  before writing.
+
+If the dialog's fields cannot be identified, the app **gives up** and you type.
+There is no "blind" path — it was removed precisely because it was the only one
+that typed without a bound control.
+
+Field lookup uses `class_name`, the criterion for the `win32` backend in use,
+with `control_type` as a second attempt. The audit log records which criterion
+worked (`VNC_AUTO_LOGIN_FIELDS`) and, when none does, lists the class names of
+the dialog's controls (`VNC_AUTO_LOGIN_ABORTED` with `controles=`).
 
 ## Requirements
 
@@ -32,7 +57,10 @@ The project was created to speed up access to multiple machines, reduce repetiti
 - Python 3.12 or newer.
 - UltraVNC Viewer for UltraVNC connections.
 - RealVNC Viewer for RealVNC connections.
-- PsExec (Sysinternals) for the remote printer query.
+- PsExec (Sysinternals) v2.43 for the printer features (query, driver
+  installation and script execution).
+- Windows 8 or newer on the target machines: the printer features use
+  `Get-Printer`, `Add-Printer` and the `ScheduledTasks` module.
 - Dependencies listed in `requirements.txt`.
 
 Runtime dependencies:
@@ -81,7 +109,7 @@ vncmenu\              Application package.
 ├─ theme.py           Palette and fonts.
 ├─ helpers.py         Window, file, and viewer utilities.
 ├─ updates.py         Release lookup and download.
-├─ remote.py          VNC, remote restart, qwinsta, PsExec, printers.
+├─ remote.py          VNC, remote restart, qwinsta, PsExec, printers, script execution.
 └─ ui\
    ├─ dialogs.py      Shared modal dialogs.
    ├─ windows.py      Configuration, progress, and update windows.
@@ -116,14 +144,21 @@ Each host contains:
 
 On the main screen:
 
-- **Conectar** (Connect): action mode. Clicking a host opens the configured viewer.
-- **Reiniciar** (Restart): action mode. Clicking a host asks for confirmation and sends the restart.
-- **Usuários** (Users): queries remote sessions for the sector's hosts with `qwinsta`.
-- **Impressoras** (Printers): lists the printers installed on the host.
+- **clicking a host**: opens the viewer configured for it;
+- **right-clicking a host**: context menu with restart, copy IP, open `c$`, open
+  the startup folder, printers and sessions;
+- **Usuários** (Users): queries remote sessions for the sector's hosts with `qwinsta`;
+- **Impressoras** (Printers): opens the printers window;
+- **Host manual**: opens the actions window for a host typed in on the spot.
 
-**Conectar** and **Reiniciar** also accept a double-click on the button itself to act on a host typed in on the spot.
+Connect and Restart used to be *modes*: a global state decided what clicking a
+host did. Leaving it on Restart and coming back later restarted a machine on
+what felt like a connection click, so the mode was removed — clicking connects,
+and restarting is a per-host action with confirmation.
 
-The user and printer queries run in the background, with a progress window, to keep the interface responsive. The `qwinsta` query runs in parallel.
+The user query runs in the background with a progress window and in parallel
+across hosts. The printer query runs inside the printers window itself, which
+shows progress in its output area.
 
 ### Automatic and manual login
 
@@ -155,7 +190,7 @@ While a search is active:
 - the area above the list shows `Buscando em: <unit>`;
 - clicking a sector, switching unit, pressing `Esc`, or using the `✕` button returns to normal browsing.
 
-The selected mode still applies: clicking a result connects or restarts it, depending on whether **Conectar** or **Reiniciar** is active. Right-clicking opens the same context menu as the normal list.
+Clicking a result connects, as in the normal list. Right-clicking opens the same context menu.
 
 The query is not persisted. Reopening the application returns to the selected sector.
 
@@ -164,6 +199,7 @@ The query is not persisted. Reopening the application returns to the selected se
 Right-click a host to access:
 
 - **Host/IP**: shows the configured `host` value (informational only);
+- **Reiniciar** (Restart): asks for confirmation and sends the restart;
 - **Copiar IP** (Copy IP): copies that value;
 - **Abrir c$** (Open c$): attempts to open `\\HOST\c$`;
 - **Abrir Menu Iniciar** (Open Startup folder): opens the all-users startup folder on the remote machine:
@@ -172,7 +208,12 @@ Right-click a host to access:
 \\HOST\c$\ProgramData\Microsoft\Windows\Start Menu\Programs\Startup
 ```
 
-- **Impressoras** (Printers): lists the printers installed on the host.
+- **Impressoras** (Printers): opens the printers window with the host already
+  filled in. Nothing is queried on its own: a context menu opened by mistake
+  does not fire PsExec at the machine;
+- **Sessões** (Sessions): shows the raw `qwinsta` text for that machine, which
+  is what tells you whether it was access denied, an unresolved name, or a
+  timeout.
 
 Access to `C$` depends on user permissions, SMB availability, firewall rules, and network policies.
 
@@ -341,6 +382,116 @@ Support_Workstation 01.vnc
 ```
 
 If a profile is missing or empty, the application displays the expected filename.
+
+## Printers window
+
+One window for the whole printer call: check what is mapped, re-run the script,
+and check again to confirm. The output area is shared by both actions, so you
+can compare before and after without switching windows.
+
+Opened from the host list or the context menu, the field is already filled in;
+from the toolbar button it comes up empty. Nothing runs on its own in either
+case — querying and re-running have different costs on the user's machine, so
+the choice is always explicit.
+
+The script side has the file name (which varies per machine), a button that
+opens the folder over `c$` so you can check the name, and the startup folder
+path:
+
+```text
+C:\ProgramData\Microsoft\Windows\Start Menu\Programs\Startup
+```
+
+### Why the script is not run as SYSTEM
+
+The script uses `AddWindowsPrinterConnection` and `SetDefaultPrinter`, which
+write to the **caller's** `HKCU`. Run as SYSTEM — or as the technician's own
+account — the printers would be mapped into the wrong profile and the user at
+the machine would see no difference at all.
+
+So execution works like this:
+
+1. PsExec runs a PowerShell as SYSTEM on the machine.
+2. That PowerShell resolves the logged-on user
+   (`Win32_ComputerSystem.UserName`, falling back to the owner of
+   `explorer.exe`).
+3. It creates a temporary scheduled task with `LogonType Interactive`, which
+   uses the **token of the already-open session** and therefore needs no
+   password from the user.
+4. It starts the task, waits for it to finish, and removes the task.
+
+With nobody logged on, nothing is executed: without a user token, running as
+SYSTEM would leave the machine worse off than before.
+
+The `.vbs` runs through **wscript** in batch mode (`//nologo //B`), which has no
+console: nothing appears on the user's screen and there is no window for them to
+close mid-run — closing the `cscript` console used to kill the script, possibly
+after the printers had been deleted and before they were remapped. `.cmd` and
+`.bat` have no equivalent: `cmd.exe` opens a prompt, and the confirmation says
+so beforehand.
+
+The task is created with `-AllowStartIfOnBatteries` (Windows defaults to not
+starting a task on battery, which made a laptop report "never entered
+execution") and with its own execution time limit, so Windows kills a stuck
+script after the app has already removed the task and moved on.
+
+### Driver installation
+
+`AddWindowsPrinterConnection` does two things with different requirements:
+
+| Step | Writes to | Requires |
+|---|---|---|
+| Installing the driver from the server | the **machine's** driver store | administrative privilege |
+| Creating the printer connection | the **user's** `HKCU` | their token |
+
+Since the PrintNightmare patch (KB5005652),
+`RestrictDriverInstallationToAdministrators` is on by default: a standard user
+cannot install a printer driver, not even by hand. That is what leaves a machine
+unable to pull the queue from the server no matter how often the script runs.
+
+So **before** running the script, the app reads the `\\server\queue` paths
+written in the `.vbs` itself and runs `Add-Printer -ConnectionName` for each
+one, as SYSTEM. The driver goes into the machine's driver store; after that, the
+mapping in the user's context no longer needs an administrator.
+
+It is not optional and there is no checkbox: it is cheap (an already-installed
+queue counts as success), requires no credentials, and leaving it to the
+operator would only work if they knew in advance which machines need it — which
+is exactly what they cannot know before trying.
+
+Notes:
+
+- It runs as **SYSTEM**, which presents itself to the print server as the
+  machine account (`DOMAIN\PC-NAME$`). This is the same path the printer query
+  already uses to read the server's queues.
+- Running with a named credential (`psexec -u/-p`) was tried and **does not
+  work**: PsExec performs an interactive logon on the remote computer, and the
+  administrative account does not hold that right on workstations — logon 1385,
+  with the correct password.
+- `Add-Printer` raises real errors, so the window shows **which queue** failed
+  and **why** — the diagnosis the `.vbs` never gives.
+- The connection it creates stays in SYSTEM's profile. That is deliberate: what
+  matters is the driver, and removing it afterwards would only add a way to fail
+  after the goal was already reached.
+- If the installation does not run at all, the script is **not** executed:
+  deleting the user's printers with no guarantee of remapping would leave the
+  machine worse off.
+
+### Limits
+
+- The run result **does not prove** the printers came back. The script keeps
+  `ON ERROR RESUME NEXT` on from start to finish, so it exits 0 even when it
+  fails. Confirmation is querying again, in the same place.
+- While the script runs, the user's printers are unavailable: it deletes every
+  queue and network connection before remapping.
+- Driver installation only finds queues written as quoted literals in the
+  `.vbs`. A script that builds the path from a variable or a loop is reported as
+  "no path found", not silently ignored.
+- `Register-ScheduledTask` with an interactive logon depends on the domain's
+  scheduled-task policy. When it refuses, the window shows the Windows message
+  instead of trying another path on its own.
+- The script field accepts only a **file name** ending in `.vbs`, `.cmd` or
+  `.bat`, with no path, so the field cannot become remote execution of any file.
 
 ## PsExec and remote printers
 

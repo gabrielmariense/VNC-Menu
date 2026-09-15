@@ -2285,48 +2285,48 @@ class TestCredentialAutofillCancellation(VncMenuTestCase):
 
     def test_the_starter_hands_back_a_cancel_handle(self):
         import inspect
-        assinatura = inspect.signature(self.app.start_uvnc_credential_autofill)
-        self.assertIn("process", assinatura.parameters)
         # Sem devolver o Event, quem chama nao tem como cancelar.
         self.assertIn("return cancel",
                       inspect.getsource(self.app.start_uvnc_credential_autofill))
 
-    def test_a_viewer_that_exits_cancels_the_fill(self):
-        """O comportamento, nao o texto: viewer fechado para o preenchimento.
-
-        O preenchimento falso espera no Event. Com o vigia, o processo morto
-        libera essa espera em milissegundos; sem ele, a espera estoura e a
-        credencial continuaria sendo digitada ate o timeout.
-        """
-        class ViewerMorto:
-            pid = 1
-
-            def poll(self):
-                return 0
-
-        cancelado = []
-        # Esperar so no Event de cancelamento nao basta: ele e acionado pelo
-        # vigia, e a thread do preenchimento ainda pode nao ter registrado
-        # nada. A espera tem de ser no FIM do preenchimento.
+    def test_a_new_connection_cancels_the_previous_fill(self):
+        """Duas conexoes seguidas nao podem disputar o mesmo dialogo."""
+        primeiro_viu = []
+        comecou = threading.Event()
         terminou = threading.Event()
 
         def falso_preenchimento(process_id=None, cancel=None):
-            cancelado.append(bool(cancel is not None and cancel.wait(3)))
+            comecou.set()
+            primeiro_viu.append(bool(cancel is not None and cancel.wait(3)))
             terminou.set()
             return False
 
         with vncmenu_loader.patched_global(
             self.app, "auto_enter_uvnc_credentials", falso_preenchimento
         ):
-            cancel = self.app.start_uvnc_credential_autofill(1, ViewerMorto())
-            self.assertTrue(terminou.wait(5), "o preenchimento nao terminou")
-            self.assertTrue(cancel.is_set(), "o Event nunca foi acionado")
+            primeiro = self.app.start_uvnc_credential_autofill(1)
+            self.assertTrue(comecou.wait(3), "o primeiro nem comecou")
+            self.app.cancel_uvnc_credential_autofill()
+            self.assertTrue(terminou.wait(4), "o primeiro nao terminou")
 
-        self.assertEqual(cancelado, [True],
-                         "o preenchimento nao viu o cancelamento a tempo")
+        self.assertTrue(primeiro.is_set())
+        self.assertEqual(primeiro_viu, [True],
+                         "o primeiro preenchimento nao viu o cancelamento")
 
-    def test_without_a_process_the_fill_still_runs(self):
-        # Sem processo nao ha o que vigiar; o preenchimento normal continua.
+    def test_the_viewer_process_is_not_watched(self):
+        """O vigia do processo quebrava o preenchimento.
+
+        Alguns builds do UltraVNC se relancam sob um PID novo, entao o
+        processo original morre em milissegundos. Tratar isso como "o
+        operador desistiu" cancelava tudo antes de o dialogo aparecer.
+        """
+        import inspect
+        assinatura = inspect.signature(self.app.start_uvnc_credential_autofill)
+        self.assertEqual(list(assinatura.parameters), ["process_id"])
+        fonte = inspect.getsource(self.app.start_uvnc_credential_autofill)
+        self.assertNotIn(".poll()", fonte)
+
+    def test_the_fill_runs_with_the_pid_it_was_given(self):
         chamadas = []
         terminou = threading.Event()
 
@@ -2343,11 +2343,10 @@ class TestCredentialAutofillCancellation(VncMenuTestCase):
 
         self.assertEqual(chamadas, [7])
 
-    def test_the_viewer_launch_passes_the_process_for_cancellation(self):
+    def test_the_viewer_launch_scopes_the_search_to_its_pid(self):
         import inspect
         fonte = inspect.getsource(self.app.launch_vnc)
-        self.assertIn("start_uvnc_credential_autofill(viewer_process.pid, viewer_process)",
-                      fonte)
+        self.assertIn("start_uvnc_credential_autofill(viewer_process.pid)", fonte)
 
 
 class TestPrintersWindowNeverActsOnItsOwn(VncMenuTestCase):
@@ -2471,3 +2470,78 @@ class TestSidebarWidthIsActuallyApplied(VncMenuTestCase):
         self.assertEqual(filhos, [],
                          "algum filho da lateral passou a usar grid")
         self.assertIn(".pack(", fonte)
+
+
+class TestCredentialFieldLookup(VncMenuTestCase):
+    """Os campos precisam ser achados com o criterio do backend em uso.
+
+    Regressao real: o app usa backend="win32", onde o criterio e
+    class_name="Edit". A busca usava control_type="Edit", que e criterio de
+    UIA e nao casa nada no win32 — ou seja, nunca achava campo. Isso passou
+    despercebido por anos porque o caminho "as cegas" (send_keys no primeiro
+    plano) cobria a falha. Removido o fallback, o preenchimento parou de vez.
+    """
+
+    class _Dialog:
+        def __init__(self, por_criterio):
+            self._por_criterio = por_criterio
+            self.consultas = []
+
+        def descendants(self, **criterio):
+            chave = next(iter(criterio)) if criterio else ""
+            self.consultas.append(chave)
+            return self._por_criterio.get(chave, [])
+
+    def test_the_win32_criterion_is_tried_first(self):
+        dlg = self._Dialog({"class_name": ["a", "b"]})
+        campos, criterio = self.app._find_credential_fields(dlg)
+        self.assertEqual(campos, ["a", "b"])
+        self.assertEqual(criterio, "class_name")
+        self.assertEqual(dlg.consultas[0], "class_name")
+
+    def test_it_falls_back_to_the_uia_criterion(self):
+        # Se o backend mudar um dia, continua achando.
+        dlg = self._Dialog({"control_type": ["a"]})
+        campos, criterio = self.app._find_credential_fields(dlg)
+        self.assertEqual(campos, ["a"])
+        self.assertEqual(criterio, "control_type")
+
+    def test_nothing_found_returns_empty_without_raising(self):
+        campos, criterio = self.app._find_credential_fields(self._Dialog({}))
+        self.assertEqual(campos, [])
+        self.assertEqual(criterio, "")
+
+    def test_a_backend_that_rejects_a_criterion_does_not_abort_the_search(self):
+        class Recusa:
+            def descendants(self, **criterio):
+                if "control_type" in criterio:
+                    raise ValueError("criterio invalido neste backend")
+                return ["campo"]
+
+        campos, criterio = self.app._find_credential_fields(Recusa())
+        self.assertEqual(campos, ["campo"])
+        self.assertEqual(criterio, "class_name")
+
+    def test_the_submit_button_also_uses_the_win32_criterion(self):
+        import ast as _ast, inspect, textwrap
+        fonte = textwrap.dedent(inspect.getsource(self.app._submit_auth_dialog))
+        self.assertIn('"class_name": "Button"', fonte)
+        # E continua sem teclado global.
+        nomes = {
+            n.func.id for n in _ast.walk(_ast.parse(fonte))
+            if isinstance(n, _ast.Call) and isinstance(n.func, _ast.Name)
+        }
+        self.assertNotIn("send_keys", nomes)
+
+    def test_a_dialog_with_no_fields_logs_what_it_did_see(self):
+        # Sem isso, "nao achei os campos" e um beco sem saida no diagnostico.
+        import inspect
+        fonte = inspect.getsource(self.app.auto_enter_uvnc_credentials)
+        self.assertIn("_describe_dialog(dlg)", fonte)
+
+    def test_describing_a_broken_dialog_does_not_raise(self):
+        class Quebrado:
+            def descendants(self, **_k):
+                raise RuntimeError("sumiu")
+
+        self.assertIsInstance(self.app._describe_dialog(Quebrado()), str)
