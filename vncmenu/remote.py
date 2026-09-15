@@ -705,26 +705,76 @@ def _run_psexec(command, host, psexec_path, timeout_seconds):
         ) from exc
 
 
+def _truncated_output(output, begin_marker, end_marker):
+    """True quando a saida comecou a chegar e foi cortada no meio.
+
+    O marcador de abertura presente sem o de fechamento e a assinatura de
+    saida truncada: o script remoto rodou e escreveu, mas o texto nao chegou
+    inteiro. Sem distinguir isso, a falha aparecia como "o PsExec nao
+    retornou o resultado esperado", que manda investigar o lado errado.
+    """
+    texto = str(output or "")
+    return begin_marker in texto and end_marker not in texto
+
+
+def _truncation_error(host, psexec_path, returncode, stdout, stderr):
+    """Erro especifico de saida cortada, com o diagnostico certo."""
+    return PsExecQueryError(
+        "A resposta do computador remoto chegou incompleta.",
+        "O comando rodou e comecou a responder, mas a saida foi cortada no "
+        "meio. Costuma ser a saida do PowerShell sendo fechada antes de "
+        "esvaziar o buffer. Tente novamente; se repetir sempre nessa "
+        "máquina, os detalhes técnicos mostram o quanto chegou.",
+        _build_psexec_details(host, psexec_path, returncode, stdout, stderr),
+        returncode=returncode,
+        category="truncated_output",
+    )
+
+
 def query_remote_printers(host: str, psexec_path: Path) -> str:
     host = str(host or "").strip().lstrip("\\")
     if not host:
         raise ValueError("Hostname ou IP não informado.")
 
-    collector = r'''$ErrorActionPreference='SilentlyContinue'
+    # O coletor resolve o endereco de cada fila compartilhada consultando o
+    # SERVIDOR de impressao. Antes fazia isso fila a fila: duas chamadas RPC
+    # remotas por fila, repetidas para cada perfil de usuario da maquina. Numa
+    # estacao com dez perfis isso passava de quarenta idas e voltas em serie.
+    # Agora cada servidor e lido UMA vez para um hashtable e o resto e busca
+    # local. O caminho fila a fila continua existindo como reserva, para o
+    # servidor que permite consultar uma fila mas nao enumerar o conjunto.
+    collector = r'''$ErrorActionPreference='SilentlyContinue';$ProgressPreference='SilentlyContinue'
 $m1='__VNC_MENU_PRINTERS_BEGIN__';$m2='__VNC_MENU_PRINTERS_END__';$r=@();$ports=@{}
+$dnsCache=@{};$serverCache=@{}
 function Get-IP($value){
  $value=[string]$value
  if([string]::IsNullOrWhiteSpace($value)){return ''}
  if($value-match'(?<!\d)(?:\d{1,3}\.){3}\d{1,3}(?!\d)'){return $Matches[0]}
- try{return ([Net.Dns]::GetHostAddresses($value)|Where-Object{$_.AddressFamily-eq'InterNetwork'}|Select-Object -First 1).IPAddressToString}catch{return ''}
+ if($dnsCache.ContainsKey($value)){return $dnsCache[$value]}
+ $ip=''
+ try{$ip=([Net.Dns]::GetHostAddresses($value)|Where-Object{$_.AddressFamily-eq'InterNetwork'}|Select-Object -First 1).IPAddressToString}catch{$ip=''}
+ $dnsCache[$value]=$ip
+ return $ip
 }
 function Get-Address($port){
  if(!$port){return ''};$name=[string]$port.Name
  if($name-match'(?i)^USB'){return 'USB'}
  $ip=Get-IP $port.PrinterHostAddress;if(!$ip){$ip=Get-IP $name};return $ip
 }
+function Get-ServerMap($server){
+ if($serverCache.ContainsKey($server)){return $serverCache[$server]}
+ $portas=@{};$mapa=@{}
+ foreach($p in @(Get-PrinterPort -ComputerName $server)){$portas[[string]$p.Name]=$p}
+ foreach($q in @(Get-Printer -ComputerName $server)){$mapa[[string]$q.Name]=$portas[[string]$q.PortName]}
+ $serverCache[$server]=$mapa
+ return $mapa
+}
 function Get-SharedAddress($server,$queue){
  if(!$server-or!$queue){return ''}
+ $mapa=Get-ServerMap $server
+ if($null -ne $mapa -and $mapa.ContainsKey($queue) -and $null -ne $mapa[$queue]){
+  return (Get-Address $mapa[$queue])
+ }
  $printer=Get-Printer -ComputerName $server -Name $queue
  if(!$printer){return ''}
  return (Get-Address (Get-PrinterPort -ComputerName $server -Name ([string]$printer.PortName)))
@@ -738,16 +788,23 @@ Get-Printer|ForEach-Object{
  if($name){$r+=[pscustomobject]@{Name=$name;IP=$address}}
 }
 if(!(Get-PSDrive HKU -ErrorAction SilentlyContinue)){New-PSDrive HKU Registry HKEY_USERS|Out-Null;$newHku=$true}
+$conexoes=@{}
 Get-ChildItem HKU:\|Where-Object{$_.PSChildName-match'^S-1-5-21-(?:\d+-){3}\d+$'}|ForEach-Object{
  Get-ChildItem "HKU:\$($_.PSChildName)\Printers\Connections"|ForEach-Object{
   $parts=@(($_.PSChildName-replace'^,,','')-split',')
-  if($parts.Count-ge2){$server=[string]$parts[0];$queue=[string]($parts[1..($parts.Count-1)]-join',');$address=Get-SharedAddress $server $queue;if(!$address){$address='NÃO IDENTIFICADO'};$r+=[pscustomobject]@{Name="\\$server\$queue";IP=$address}}
+  if($parts.Count-ge2){$server=[string]$parts[0];$queue=[string]($parts[1..($parts.Count-1)]-join',');$chave="\\$server\$queue";if(!$conexoes.ContainsKey($chave)){$conexoes[$chave]=@($server,$queue)}}
  }
 }
 if($newHku){Remove-PSDrive HKU}
+foreach($chave in @($conexoes.Keys)){
+ $par=$conexoes[$chave];$address=Get-SharedAddress $par[0] $par[1]
+ if(!$address){$address='NÃO IDENTIFICADO'}
+ $r+=[pscustomobject]@{Name=$chave;IP=$address}
+}
 $json=ConvertTo-Json -InputObject @($r|Sort-Object Name,IP -Unique)-Compress
 $payload=[Convert]::ToBase64String([Text.Encoding]::UTF8.GetBytes($json))
-[Console]::Out.WriteLine($m1+$payload+$m2)'''
+[Console]::Out.WriteLine($m1+$payload+$m2)
+[Console]::Out.Flush()'''
 
     encoded_command = base64.b64encode(collector.encode("utf-16-le")).decode("ascii")
 
@@ -784,6 +841,9 @@ $payload=[Convert]::ToBase64String([Text.Encoding]::UTF8.GetBytes($json))
     )
 
     if not match:
+        if _truncated_output(combined_output, start_marker, end_marker):
+            raise _truncation_error(
+                host, psexec_path, completed.returncode, stdout, stderr)
         summary, hint, category = _diagnose_psexec_failure(combined_output, completed.returncode)
         details = _build_psexec_details(
             host,
@@ -1081,7 +1141,7 @@ def _build_run_script_payload(script_name: str) -> str:
     # nao o app, que ja terá removido a tarefa e ido embora.
     limite = int(SCRIPT_RUN_WAIT_SECONDS) + 120
 
-    return f"""$ErrorActionPreference='SilentlyContinue'
+    return f"""$ErrorActionPreference='SilentlyContinue';$ProgressPreference='SilentlyContinue'
 $m1='__VNC_MENU_RUNVBS_BEGIN__';$m2='__VNC_MENU_RUNVBS_END__'
 $folder={folder};$name={name};$task={task}
 $o=[ordered]@{{Status='';User='';Script='';Available=@();LastResult=$null;Detail=''}}
@@ -1089,6 +1149,7 @@ function Send($s,$d){{
  $o.Status=$s;$o.Detail=[string]$d
  $j=ConvertTo-Json -InputObject $o -Compress -Depth 4
  [Console]::Out.WriteLine($m1+[Convert]::ToBase64String([Text.Encoding]::UTF8.GetBytes($j))+$m2)
+ [Console]::Out.Flush()
  exit
 }}
 if(-not (Test-Path -LiteralPath $folder -PathType Container)){{Send 'no_folder' $folder}}
@@ -1247,6 +1308,10 @@ def run_startup_script(host: str, script_name: str, psexec_path: Path) -> dict:
     data = parse_run_script_payload(f"{stdout}\n{stderr}")
 
     if not data:
+        if _truncated_output(f"{stdout}\n{stderr}",
+                             "__VNC_MENU_RUNVBS_BEGIN__", "__VNC_MENU_RUNVBS_END__"):
+            raise _truncation_error(
+                host, psexec_path, completed.returncode, stdout, stderr)
         summary, hint, category = _diagnose_psexec_failure(
             f"{stdout}\n{stderr}", completed.returncode
         )
@@ -1316,7 +1381,7 @@ def _build_driver_install_payload(script_name: str) -> str:
     name = _powershell_single_quoted(script_name)
     folder = _powershell_single_quoted(STARTUP_FOLDER)
 
-    return rf"""$ErrorActionPreference='SilentlyContinue'
+    return rf"""$ErrorActionPreference='SilentlyContinue';$ProgressPreference='SilentlyContinue'
 $m1='__VNC_MENU_DRIVERS_BEGIN__';$m2='__VNC_MENU_DRIVERS_END__'
 $folder={folder};$name={name}
 $o=[ordered]@{{Status='';Script='';Queues=@();Results=@();Detail=''}}
@@ -1324,6 +1389,7 @@ function Send($s,$d){{
  $o.Status=$s;$o.Detail=[string]$d
  $j=ConvertTo-Json -InputObject $o -Compress -Depth 5
  [Console]::Out.WriteLine($m1+[Convert]::ToBase64String([Text.Encoding]::UTF8.GetBytes($j))+$m2)
+ [Console]::Out.Flush()
  exit
 }}
 $file=Join-Path $folder $name
@@ -1479,6 +1545,10 @@ def install_printer_drivers(host: str, script_name: str, psexec_path: Path) -> d
     data = parse_driver_install_payload(f"{stdout}\n{stderr}")
 
     if not data:
+        if _truncated_output(f"{stdout}\n{stderr}",
+                             "__VNC_MENU_DRIVERS_BEGIN__", "__VNC_MENU_DRIVERS_END__"):
+            raise _truncation_error(
+                host, psexec_path, completed.returncode, stdout, stderr)
         summary, hint, category = _diagnose_psexec_failure(
             f"{stdout}\n{stderr}", completed.returncode
         )

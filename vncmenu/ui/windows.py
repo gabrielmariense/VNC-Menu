@@ -2444,7 +2444,12 @@ class PrintersWindow(ctk.CTkToplevel):
         # ------------------------------------------------------------- saida
         self.output = ctk.CTkTextbox(
             box, fg_color=THEME["surface_2"], border_color=THEME["border"],
-            text_color=THEME["text"], font=FONT_MONO, wrap="none")
+            # wrap="word" e nao "none": o relatorio mistura a tabela de filas
+            # com paragrafos de texto, e sem quebra as linhas compridas
+            # ficavam escondidas atras da rolagem horizontal. A tabela nao
+            # desalinha por isso — cada linha comeca na coluna zero, e a
+            # quebra so ocorre em linha que nao caberia de qualquer jeito.
+            text_color=THEME["text"], font=FONT_MONO, wrap="word")
         self.output.pack(fill="both", expand=True, padx=18, pady=(0, 14))
 
         ctk.CTkButton(

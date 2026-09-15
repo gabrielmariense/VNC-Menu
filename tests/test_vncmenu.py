@@ -2849,3 +2849,201 @@ class TestHostsEditorTableIsReadable(VncMenuTestCase):
             self.app.HostUnitsConfigWindow.refresh_sectors)
         self.assertNotIn("FONT_BOLD if selected", fonte)
         self.assertIn("font=FONT_BOLD", fonte)
+
+
+class TestPrinterCollectorIsBatched(VncMenuTestCase):
+    """A consulta resolvia cada fila individualmente contra o servidor.
+
+    Get-SharedAddress fazia duas chamadas RPC remotas por fila, repetidas para
+    cada perfil de usuario da maquina — dezenas de idas e voltas em serie.
+    Agora cada servidor e lido uma vez para um hashtable.
+    """
+
+    def _collector(self):
+        import inspect
+        fonte = inspect.getsource(self.app.query_remote_printers)
+        ini = fonte.index("collector = r'''")
+        fim = fonte.index("encoded_command")
+        return fonte[ini:fim]
+
+    def test_each_server_is_enumerated_once_into_a_cache(self):
+        c = self._collector()
+        self.assertIn("function Get-ServerMap", c)
+        self.assertIn("$serverCache", c)
+        self.assertIn("if($serverCache.ContainsKey($server)){return $serverCache[$server]}", c)
+
+    def test_the_per_queue_path_survives_as_a_fallback(self):
+        # Servidor que deixa consultar uma fila mas nao enumerar o conjunto
+        # continua funcionando, so que devagar, como antes.
+        c = self._collector()
+        self.assertIn("Get-Printer -ComputerName $server -Name $queue", c)
+
+    def test_the_bulk_lookup_is_preferred_over_the_fallback(self):
+        c = self._collector()
+        rapido = c.index("$mapa.ContainsKey($queue)")
+        lento = c.index("Get-Printer -ComputerName $server -Name $queue")
+        self.assertLess(rapido, lento, "o caminho lento vem antes do cache")
+
+    def test_a_missing_port_falls_back_instead_of_reporting_nothing(self):
+        # Se a enumeracao de portas nao trouxe a porta daquela fila, resolver
+        # fila a fila ainda pode achar. Sem esta guarda o endereco sumiria.
+        self.assertIn("$null -ne $mapa[$queue]", self._collector())
+
+    def test_registry_connections_are_deduplicated_before_resolving(self):
+        # Dez perfis com as mesmas duas filas resolviam vinte vezes.
+        c = self._collector()
+        self.assertIn("$conexoes", c)
+        self.assertIn("if(!$conexoes.ContainsKey($chave))", c)
+
+    def test_name_resolution_is_cached(self):
+        c = self._collector()
+        self.assertIn("$dnsCache", c)
+        self.assertIn("if($dnsCache.ContainsKey($value)){return $dnsCache[$value]}", c)
+
+    def test_the_output_contract_is_unchanged(self):
+        # O texto que o suporte le tem de sair igual: mesmas colunas, mesma
+        # ordenacao, mesmo marcador de nao identificado.
+        c = self._collector()
+        self.assertIn("Sort-Object Name,IP -Unique", c)
+        self.assertIn("'NÃO IDENTIFICADO'", c)
+        self.assertIn("@{Name=$name;IP=$address}", c)
+        self.assertIn("@{Name=$chave;IP=$address}", c)
+
+    def test_the_registry_drive_is_still_cleaned_up(self):
+        c = self._collector()
+        self.assertIn("New-PSDrive HKU", c)
+        self.assertIn("if($newHku){Remove-PSDrive HKU}", c)
+
+
+class TestCollectorParsesAsPowerShell(VncMenuTestCase):
+    """Valida o PowerShell do coletor com o parser de verdade.
+
+    Este e o codigo que quebrou duas vezes (1.5.4 e 1.5.5) e que nao roda em
+    nenhum teste: ele so executa numa maquina remota. Um erro de sintaxe so
+    aparecia em producao. Onde existir um PowerShell, agora aparece aqui.
+
+    Pula quando nao ha PowerShell instalado — no Windows sempre ha.
+    """
+
+    def _powershell(self):
+        import shutil
+        # powershell.exe (5.1) primeiro: e o que roda nas maquinas alvo.
+        for nome in ("powershell", "pwsh"):
+            caminho = shutil.which(nome)
+            if caminho:
+                return caminho
+        return None
+
+    def _script(self, funcao):
+        import inspect
+        fonte = inspect.getsource(funcao)
+        ini = fonte.index("r'''") + 4
+        fim = fonte.index("'''", ini)
+        return fonte[ini:fim]
+
+    def _parse(self, texto, rotulo):
+        import subprocess, tempfile, os
+        shell = self._powershell()
+        if not shell:
+            self.skipTest("PowerShell nao encontrado neste ambiente")
+
+        caminho = os.path.join(tempfile.mkdtemp(), "collector.ps1")
+        with open(caminho, "w", encoding="utf-8") as arquivo:
+            arquivo.write(texto)
+
+        comando = (
+            "$e=$null;"
+            f"$null=[System.Management.Automation.Language.Parser]::ParseFile('{caminho}',"
+            "[ref]$null,[ref]$e);"
+            "if($e -and $e.Count){$e|ForEach-Object{"
+            "Write-Output \"linha $($_.Extent.StartLineNumber): $($_.Message)\"};exit 1}"
+        )
+        resultado = subprocess.run(
+            [shell, "-NoProfile", "-Command", comando],
+            capture_output=True, text=True, timeout=90,
+        )
+        self.assertEqual(
+            resultado.returncode, 0,
+            f"{rotulo} nao compila:\n{resultado.stdout}\n{resultado.stderr}")
+
+    def test_the_printer_collector_compiles(self):
+        self._parse(self._script(self.app.query_remote_printers), "coletor de impressoras")
+
+    def test_the_script_runner_payload_compiles(self):
+        self._parse(self.app._build_run_script_payload("IMPRESSORAS.vbs"),
+                    "payload de execucao de script")
+
+    def test_the_driver_install_payload_compiles(self):
+        self._parse(self.app._build_driver_install_payload("IMPRESSORAS.vbs"),
+                    "payload de instalacao de drivers")
+
+
+class TestTruncatedRemoteOutput(VncMenuTestCase):
+    """Saida que comeca a chegar e e cortada no meio.
+
+    Caso real: a instalacao de drivers rodou, devolveu Status ok, e a saida
+    veio sem o marcador de fechamento. Sem distinguir isso do "nao veio nada",
+    a mensagem mandava investigar o PsExec, quando o problema era o buffer da
+    saida do PowerShell sendo fechado antes de esvaziar.
+    """
+
+    class _Completed:
+        def __init__(self, stdout=b"", stderr=b"", returncode=0):
+            self.stdout = stdout
+            self.stderr = stderr
+            self.returncode = returncode
+
+    def test_a_begin_without_an_end_is_truncation(self):
+        self.assertTrue(self.app._truncated_output(
+            "ruido __VNC_MENU_DRIVERS_BEGIN__eyJTdGF0",
+            "__VNC_MENU_DRIVERS_BEGIN__", "__VNC_MENU_DRIVERS_END__"))
+
+    def test_a_complete_payload_is_not_truncation(self):
+        self.assertFalse(self.app._truncated_output(
+            "__VNC_MENU_DRIVERS_BEGIN__eyJ__VNC_MENU_DRIVERS_END__",
+            "__VNC_MENU_DRIVERS_BEGIN__", "__VNC_MENU_DRIVERS_END__"))
+
+    def test_no_output_at_all_is_not_truncation(self):
+        # Sem nada, o problema e outro e o diagnostico generico e o certo.
+        for saida in ("", "Access is denied.", None):
+            self.assertFalse(self.app._truncated_output(
+                saida, "__VNC_MENU_DRIVERS_BEGIN__", "__VNC_MENU_DRIVERS_END__"))
+
+    def _erro_da_instalacao(self, stdout):
+        def fake_run(command, host, psexec_path, timeout):
+            return self._Completed(stdout=stdout.encode("utf-8"))
+
+        with vncmenu_loader.patched_global(self.app, "_run_psexec", fake_run):
+            with self.assertRaises(self.app.PsExecQueryError) as capturado:
+                self.app.install_printer_drivers(
+                    "W04-328-005087", "IMPRESSORAS.vbs", "psexec.exe")
+        return capturado.exception
+
+    def test_the_driver_install_reports_truncation_specifically(self):
+        erro = self._erro_da_instalacao(
+            "__VNC_MENU_DRIVERS_BEGIN__eyJTdGF0dXMiOiJvayIsIlNjcmlwdCI6")
+        self.assertEqual(erro.category, "truncated_output")
+        self.assertIn("incompleta", erro.summary)
+        self.assertIn("buffer", erro.hint)
+
+    def test_a_real_failure_keeps_the_generic_diagnosis(self):
+        erro = self._erro_da_instalacao("Access is denied.")
+        self.assertEqual(erro.category, "access_denied")
+
+    def test_every_payload_flushes_before_exiting(self):
+        # Sem o flush, a ultima escrita pode morrer no buffer quando o
+        # processo sai — foi exatamente o que cortou a resposta.
+        import inspect
+        coletor = inspect.getsource(self.app.query_remote_printers)
+        for fonte, rotulo in (
+            (coletor, "coletor de impressoras"),
+            (self.app._build_run_script_payload("a.vbs"), "execucao de script"),
+            (self.app._build_driver_install_payload("a.vbs"), "instalacao de drivers"),
+        ):
+            self.assertIn("[Console]::Out.Flush()", fonte, rotulo)
+
+    def test_progress_records_do_not_pollute_stderr(self):
+        # Progresso vira CLIXML no stderr quando a saida e redirecionada.
+        for fonte in (self.app._build_run_script_payload("a.vbs"),
+                      self.app._build_driver_install_payload("a.vbs")):
+            self.assertIn("$ProgressPreference='SilentlyContinue'", fonte)
