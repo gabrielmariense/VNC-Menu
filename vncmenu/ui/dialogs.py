@@ -15,14 +15,12 @@ import webbrowser
 from ..config import PORT, DEFAULT_VIEWER, ERROR_LOG, HOSTS_SOURCE_CUSTOM, HOSTS_SOURCE_EMPTY, HOSTS_SOURCE_SHARED, PSEXEC_DOWNLOAD_URL, USER_HOSTS_JSON, VIEWER_OPTIONS
 from ..applog import audit_log, log_exception
 from ..storage import sanitize_port, split_host_port, get_hosts_path_for_source, hosts_source_display_name, normalize_hosts_source, sanitize_viewer, save_psexec_path, set_hosts_source, update_hosts_file_setting
-from ..theme import FONT_BOLD, FONT_NORMAL, FONT_SMALL, FONT_SUBTITLE, THEME
+from ..theme import BUTTON_STYLES, FONT_BOLD, FONT_NORMAL, FONT_SMALL, FONT_SUBTITLE, THEME
 from ..helpers import center_window, fit_dialog_to_content, modal_window, show_error, show_info, show_warning
 
-DIALOG_BUTTON_STYLES = {
-    "primary": ("accent", "accent_hover", "button_text"),
-    "secondary": ("surface_3", "accent_soft", "secondary_button_text"),
-    "danger": ("danger", "danger_hover", "button_text"),
-}
+# Mantido como nome local: a definicao vive em theme.py, junto das cores que
+# ela referencia.
+DIALOG_BUTTON_STYLES = BUTTON_STYLES
 
 
 class ModalDialog:
@@ -377,65 +375,6 @@ def ask_host_details(parent: Any, title: str, initial: dict[str, str] | None = N
     dialog.win.protocol("WM_DELETE_WINDOW", dialog.close)
     dialog.win.bind("<Escape>", lambda _event: dialog.close())
     name_entry.focus_set()
-    modal_window(dialog.win, parent)
-    return dialog.result
-
-
-def ask_custom_connection(parent: Any) -> tuple[str, str, int] | None:
-    dialog = ModalDialog(parent, "Conexão manual", heading="Conexão manual")
-
-    ctk.CTkLabel(
-        dialog.box,
-        text="Digite o hostname ou IP e selecione o viewer.",
-        font=FONT_NORMAL,
-        text_color=THEME["muted"],
-    ).pack(anchor="w", padx=18, pady=(0, 14))
-
-    entry = ctk.CTkEntry(
-        dialog.box,
-        width=380,
-        height=38,
-        placeholder_text="hostname ou IP (ou host::5901)",
-        fg_color=THEME["surface_2"],
-        border_color=THEME["border"],
-        text_color=THEME["text"],
-        placeholder_text_color=THEME["muted"],
-    )
-    entry.pack(fill="x", padx=18, pady=(0, 14))
-    entry.focus_set()
-
-    viewer_var = tk.StringVar(value=DEFAULT_VIEWER)
-    ctk.CTkOptionMenu(
-        dialog.box,
-        font=FONT_BOLD,
-        values=VIEWER_OPTIONS,
-        variable=viewer_var,
-        width=180,
-        fg_color=THEME["surface_3"],
-        button_color=THEME["accent_soft"],
-        button_hover_color=THEME["accent_hover"],
-        text_color=THEME["secondary_button_text"],
-        dropdown_fg_color=THEME["surface"],
-        dropdown_hover_color=THEME["accent_soft"],
-        dropdown_text_color=THEME["text"],
-    ).pack(anchor="w", padx=18, pady=(0, 18))
-
-    def confirm(_event=None):
-        host, port = split_host_port(entry.get())
-        if not host:
-            show_warning(dialog.win, "Campo obrigatório", "Digite um hostname ou IP.")
-            return
-        dialog.close((host, sanitize_viewer(viewer_var.get()), port))
-
-    dialog.add_buttons([
-        {"text": "Cancelar", "command": dialog.close},
-        {"text": "Conectar", "command": confirm, "style": "primary"},
-    ])
-    dialog.win.bind("<Return>", confirm)
-
-    center_window(dialog.win, 460, 310)
-    dialog.win.protocol("WM_DELETE_WINDOW", dialog.close)
-    dialog.win.bind("<Escape>", lambda _event: dialog.close())
     modal_window(dialog.win, parent)
     return dialog.result
 

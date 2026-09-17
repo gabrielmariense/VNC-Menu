@@ -20,8 +20,27 @@ PRESERVED_PREFIXES = (
 )
 
 
+# Arquivos que o repositorio PUBLICA dentro de data\. Eles nao sao dados do
+# usuario: o template.vnc.example e a semente que o bootstrap usa para criar o
+# template.vnc na primeira execucao, e o LEIA-ME e documentacao. Com data\
+# preservada inteira, uma correcao em qualquer um dos dois chegava apenas em
+# instalacao nova - a antiga ficava com a versao do dia em que foi instalada,
+# para sempre e sem aviso.
+#
+# A lista e de EXCECOES a uma regra que preserva tudo, e nao o contrario: um
+# arquivo novo que apareca em data\ continua protegido por padrao. Inverter
+# isso (preservar so o que estiver listado) faria um esquecimento apagar dado
+# do usuario, que e o erro caro.
+SHIPPED_DATA_FILES = (
+    Path("data/template.vnc.example"),
+    Path("data/LEIA-ME-template-vnc.txt"),
+)
+
+
 def is_preserved(relative: Path) -> bool:
     normalized = Path(*relative.parts)
+    if normalized in SHIPPED_DATA_FILES:
+        return False
     for prefix in PRESERVED_PREFIXES:
         if normalized == prefix or prefix in normalized.parents:
             return True
@@ -189,8 +208,19 @@ def copy_update_files(package_root: Path, install_dir: Path, backup_dir: Path):
             created.append(relative)
 
         temporary = destination.with_name(destination.name + ".update-new")
-        shutil.copy2(source, temporary)
-        os.replace(temporary, destination)
+        try:
+            shutil.copy2(source, temporary)
+            os.replace(temporary, destination)
+        except Exception:
+            # Disco cheio ou arquivo travado pelo antivirus no meio da copia
+            # deixava um <nome>.update-new na pasta de instalacao, que o
+            # rollback nao conhece - ele so desfaz o que ja tinha sido
+            # registrado em overwritten/created.
+            try:
+                temporary.unlink(missing_ok=True)
+            except Exception:
+                pass
+            raise
 
     return overwritten, created
 

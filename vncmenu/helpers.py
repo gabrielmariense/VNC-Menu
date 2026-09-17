@@ -7,10 +7,13 @@ Depende de config, applog e storage.
 """
 
 from pathlib import Path
-from tkinter import messagebox
+from tkinter import filedialog, messagebox
 import re
 
+import customtkinter as ctk
+
 from .config import REALVNC_DIR, VIEWER_REALVNC
+from .theme import FONT_BOLD, FONT_SMALL_BOLD, THEME, button_colors
 from .applog import audit_log, log_exception
 from .storage import load_settings, sanitize_viewer, save_settings
 
@@ -83,7 +86,16 @@ def get_geometry_size(geometry: str, fallback_width: int, fallback_height: int) 
 # dialogs used to save it too, and whenever their layout changed the stale saved
 # size clipped the content. The workaround was to bump the key (_v2, _v3, _v4),
 # which left the previous key in settings.json forever.
-PERSISTED_GEOMETRY_KEYS = {"main", "window_hosts_config", "window_text_output"}
+PERSISTED_GEOMETRY_KEYS = {
+    "main",
+    "window_hosts_config",
+    "window_text_output",
+    # A janela de detalhes tecnicos pedia persistencia e nao recebia:
+    # save_window_geometry ignora silenciosamente chave fora desta
+    # lista, e prune_window_geometries ainda apagava a entrada no
+    # start seguinte.
+    "window_printers_details",
+}
 
 
 PERSISTED_GEOMETRY_PREFIXES = ("window_list_editor_",)
@@ -105,7 +117,9 @@ def prune_window_geometries(settings: dict) -> int:
     removed = len(geometries) - len(kept)
     if removed:
         settings["window_geometries"] = kept
-        save_settings(settings)
+        # False: a limpeza E uma escrita de geometria. Reler do disco aqui
+        # traria de volta exatamente as chaves orfas que acabaram de sair.
+        save_settings(settings, keep_disk_geometry=False)
     return removed
 
 
@@ -142,7 +156,10 @@ def save_window_geometry(win, key: str):
         if key == "main":
             settings["main_window_size"] = geometry.split("+", 1)[0].split("-", 1)[0]
 
-        save_settings(settings)
+        # False: aqui o dicionario em maos acabou de ser lido do disco e a
+        # geometria nova e a mais recente. O padrao (reler) desfaria a propria
+        # gravacao.
+        save_settings(settings, keep_disk_geometry=False)
     except Exception as e:
         try:
             log_exception(e)
@@ -381,3 +398,68 @@ def fit_text_to_width(text, pixels, char_width, minimum=6):
     if cabem >= len(texto):
         return texto
     return texto[:max(1, cabem - 1)] + "…"
+
+
+def styled_button(parent, text: str, command, style: str = "secondary", **kwargs):
+    """CTkButton com as cores do estilo pedido.
+
+    O trio fg_color/hover_color/text_color estava escrito a mao em ~40 lugares.
+    """
+    opcoes = {"font": FONT_BOLD, "text": text, "command": command}
+    opcoes.update(button_colors(style))
+    opcoes.update(kwargs)
+    return ctk.CTkButton(parent, **opcoes)
+
+
+def pick_executable(parent, title: str, filetypes, current: str = "") -> str:
+    """Abre o seletor de arquivo comecando na pasta do caminho atual.
+
+    Uma so implementacao: as janelas de caminho do viewer e do PsExec tinham
+    cada uma a sua, com a mesma regra de pasta inicial e listas de filtro que
+    ja divergiam entre si e de uma terceira copia em dialogs.py.
+    """
+    atual = str(current or "").strip().strip('"')
+    pasta = str(Path(atual).parent) if atual and Path(atual).parent.exists() else r"C:\Program Files"
+    selecionado = filedialog.askopenfilename(
+        parent=parent, title=title, initialdir=pasta, filetypes=list(filetypes),
+    )
+    return selecionado or ""
+
+
+EXECUTABLE_FILETYPES = (("Executáveis", "*.exe"), ("Todos os arquivos", "*.*"))
+
+PSEXEC_FILETYPES = (
+    ("PsExec", "PsExec*.exe"),
+    ("Executáveis", "*.exe"),
+    ("Todos os arquivos", "*.*"),
+)
+
+
+def path_row(parent, row: int, label, variable, on_browse,
+             placeholder: str = "", pad_direita: int = 8):
+    """Campo de caminho com "Procurar...", o bloco que as duas janelas repetiam.
+
+    label=None nao desenha rotulo e coloca o campo na propria `row`: a janela
+    do PsExec explica o campo no texto de cima e nunca teve rotulo proprio.
+    Dar um a ela seria mudar a tela sem pedido.
+
+    Devolve o CTkEntry, porque as duas precisam dele (foco e validacao).
+    """
+    linha_campo = row
+    if label is not None:
+        ctk.CTkLabel(
+            parent, text=label, font=FONT_SMALL_BOLD, text_color=THEME["muted"],
+        ).grid(row=row, column=0, columnspan=3, sticky="w", padx=18, pady=(0, 6))
+        linha_campo = row + 1
+
+    entry = ctk.CTkEntry(
+        parent, textvariable=variable, height=38, fg_color=THEME["surface_2"],
+        border_color=THEME["border"], text_color=THEME["text"],
+        placeholder_text=placeholder, placeholder_text_color=THEME["muted"],
+    )
+    entry.grid(row=linha_campo, column=0, sticky="ew", padx=(18, 8), pady=(0, 12))
+
+    styled_button(
+        parent, "Procurar...", on_browse, width=110, height=38,
+    ).grid(row=linha_campo, column=1, sticky="e", padx=(0, pad_direita), pady=(0, 12))
+    return entry

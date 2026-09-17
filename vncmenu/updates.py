@@ -151,10 +151,17 @@ def get_release_asset_checksum(release: dict, asset: dict) -> str:
         if match:
             return match.group(0).lower()
 
-    match = re.search(r"\b[0-9a-fA-F]{64}\b", checksum_text)
-    if not match:
-        raise RuntimeError("Checksum SHA-256 inválido na release.")
-    return match.group(0).lower()
+    # Fallback so quando o arquivo e inequivoco. Pegar o primeiro hash de um
+    # arquivo com varios assets devolveria o digest de OUTRO arquivo, e a
+    # atualizacao morria com "verificacao SHA-256 falhou" - mensagem que manda
+    # investigar download corrompido quando o problema e o nome nao bater.
+    todos = re.findall(r"\b[0-9a-fA-F]{64}\b", checksum_text)
+    if len(todos) != 1:
+        raise RuntimeError(
+            f"Checksum de {asset_name} não encontrado no arquivo de checksums "
+            "da release."
+        )
+    return todos[0].lower()
 
 
 def calculate_sha256(path: Path) -> str:

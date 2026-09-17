@@ -17,11 +17,11 @@ import urllib.error
 import urllib.request
 import zipfile
 
-from ..config import APP_AUTHOR, APP_NAME, APP_VERSION, COLOR_SCHEME_BLUE, DEFAULT_VIEWER, ERROR_LOG, HOSTS_SOURCE_CUSTOM, HOSTS_SOURCE_SHARED, LOGIN_MODE_AUTO, LOGIN_MODE_MANUAL, SCRIPT_DIR, SEARCH_DEBOUNCE_MS, SEARCH_HOST_COLUMN_WIDTH, SEARCH_SECTOR_COLUMN_WIDTH, UPDATE_DOWNLOAD_DIR, UPDATE_RESULT_JSON
+from ..config import APP_AUTHOR, APP_NAME, APP_VERSION, COLOR_SCHEME_BLUE, DEFAULT_VIEWER, ERROR_LOG, HOSTS_SOURCE_CUSTOM, HOSTS_SOURCE_SHARED, LOGIN_MODE_AUTO, LOGIN_MODE_MANUAL, SCRIPT_DIR, SEARCH_DEBOUNCE_MS, SEARCH_HOST_COLUMN_WIDTH, SEARCH_MAX_RESULTS, SEARCH_SECTOR_COLUMN_WIDTH, UPDATE_DOWNLOAD_DIR, UPDATE_RESULT_JSON
 from ..applog import audit_log, log_exception
 from ..storage import format_host_port, sanitize_port, bootstrap_directories, filter_unit_hosts, get_host_columns, get_hosts_path_for_source, get_sector_hosts, get_sector_names, get_unit_names, hosts_source_display_name, load_global_paths, load_hosts_data, load_settings, normalize_hosts_source, normalize_login_mode, save_settings, set_hosts_source
 from ..theme import FONT_BOLD, FONT_NORMAL, FONT_SMALL, FONT_SMALL_BOLD, FONT_TITLE, THEME, apply_color_theme, normalize_color_scheme
-from ..helpers import bind_clickable_row, ensure_widget_pool, fit_text_to_width, get_geometry_size, get_window_geometries, is_valid_geometry, prune_window_geometries, reset_scrollable_frame_position, restore_window_geometry, safe_filename, save_window_geometry, show_error, show_info, show_warning
+from ..helpers import styled_button, bind_clickable_row, ensure_widget_pool, fit_text_to_width, get_geometry_size, get_window_geometries, is_valid_geometry, prune_window_geometries, reset_scrollable_frame_position, restore_window_geometry, safe_filename, save_window_geometry, show_error, show_info, show_warning
 from ..updates import HTTPS_CONTEXT, calculate_sha256, current_main_entry_name, fetch_latest_release, find_release_zip_asset, get_release_asset_checksum, get_updater_launch_command, normalize_release_version, parse_version
 from .dialogs import ask_text, choose_hosts_source_dialog, confirm_action, ensure_hosts_source_selected, shared_hosts_edit_warning
 from ..remote import format_users_output, launch_vnc, query_all_logged_users, query_logged_users_raw, restart_host
@@ -64,13 +64,21 @@ class SearchResultRow(ctk.CTkFrame):
 
 
 class App(ctk.CTk):
+    # Largura da lateral e minima da janela andam juntas: alargar uma sem
+    # subir a outra tira espaco da grade de hosts, cujos nomes ja truncam.
+    # Como constantes, a relacao fica declarada aqui em vez de viver em dois
+    # numeros soltos que os testes precisavam raspar do codigo-fonte.
+    SIDEBAR_WIDTH = 340
+    MIN_WINDOW_WIDTH = 980
+    MIN_WINDOW_HEIGHT = 560
+
     def __init__(self):
         super().__init__()
         self.title("VNC-Menu")
         # 980 acompanha a barra lateral: ela foi de 260 para 340 para caber
         # nome de setor comprido, e sem subir a minima junto a grade de hosts
         # e que perderia os 80px. Mexer na largura da lateral pede mexer aqui.
-        self.minsize(980, 560)
+        self.minsize(self.MIN_WINDOW_WIDTH, self.MIN_WINDOW_HEIGHT)
 
         self.settings = load_settings()
 
@@ -234,7 +242,7 @@ class App(ctk.CTk):
         # texto. A 340 o botao fica com 252px, ~37 caracteres; o maior nome
         # de setor da lista real tem 33. Alargar aqui tira espaco da grade de
         # hosts, entao a largura minima da janela subiu junto.
-        self.sidebar = ctk.CTkFrame(self, width=340, fg_color=THEME["surface"], corner_radius=22)
+        self.sidebar = ctk.CTkFrame(self, width=self.SIDEBAR_WIDTH, fg_color=THEME["surface"], corner_radius=22)
         self.sidebar.grid(row=0, column=0, sticky="ns", padx=(18, 12), pady=18)
         # pack_propagate e NAO grid_propagate: todos os filhos desta barra sao
         # empacotados com pack(). grid_propagate() so governa filhos geridos
@@ -302,16 +310,13 @@ class App(ctk.CTk):
         self.search_entry.grid(row=0, column=0, sticky="ew")
         self.search_entry.bind("<Escape>", self.on_search_escape)
 
-        ctk.CTkButton(
+        styled_button(
             row,
             font=FONT_BOLD,
             text="✕",
             width=44,
             height=38,
-            command=self.clear_search,
-            fg_color=THEME["surface_3"],
-            hover_color=THEME["accent_soft"],
-            text_color=THEME["secondary_button_text"],
+            command=self.clear_search
         ).grid(row=0, column=1, sticky="e", padx=(8, 0))
 
     def on_search_changed(self, *_args):
@@ -332,7 +337,13 @@ class App(ctk.CTk):
     def apply_search(self):
         self._search_after_id = None
         self.search_query = self.search_var.get().strip()
-        self.refresh_sectors()
+        # A barra de setores so depende de ESTAR buscando, nao do texto: a
+        # unica coisa que muda nela e nenhum setor aparecer selecionado.
+        # Redesenha-la a cada tecla era trabalho garantido e inutil.
+        buscando = bool(self.search_query)
+        if buscando != getattr(self, "_setores_em_busca", None):
+            self._setores_em_busca = buscando
+            self.refresh_sectors()
         self.render_hosts()
         self.update_search_state_label()
         reset_scrollable_frame_position(self.host_grid)
@@ -386,26 +397,20 @@ class App(ctk.CTk):
         # botao no futuro so muda a fatia de cada um, sem cortar nem sobrar.
         actions.grid(row=0, column=0, sticky="ew")
 
-        self.btn_users = ctk.CTkButton(
+        self.btn_users = styled_button(
             actions,
             font=FONT_BOLD,
             text="Usuários",
             height=38,
-            command=self.show_qwinsta_users,
-            fg_color=THEME["surface_3"],
-            hover_color=THEME["accent_soft"],
-            text_color=THEME["secondary_button_text"],
+            command=self.show_qwinsta_users
         )
 
-        self.btn_printers = ctk.CTkButton(
+        self.btn_printers = styled_button(
             actions,
             font=FONT_BOLD,
             text="Impressoras",
             height=38,
-            command=self.open_printers_window,
-            fg_color=THEME["surface_3"],
-            hover_color=THEME["accent_soft"],
-            text_color=THEME["secondary_button_text"],
+            command=self.open_printers_window
         )
 
         # uniform= amarra as colunas na mesma largura; sem isso o texto mais
@@ -447,16 +452,13 @@ class App(ctk.CTk):
             pady=10,
         )
 
-        ctk.CTkButton(
+        styled_button(
             hint_actions,
             font=FONT_BOLD,
             text="Host manual",
             width=120,
             height=32,
-            command=self.open_manual_host,
-            fg_color=THEME["surface_3"],
-            hover_color=THEME["accent_soft"],
-            text_color=THEME["secondary_button_text"],
+            command=self.open_manual_host
         ).pack(side="left", padx=(0, 8))
 
         self.btn_login_mode = ctk.CTkButton(
@@ -641,6 +643,12 @@ class App(ctk.CTk):
             if not botao.winfo_manager():
                 botao.pack(fill="x", padx=8, pady=5)
 
+        # Registrado aqui, e nao em apply_search: qualquer caminho que
+        # redesenhe os setores (trocar setor, trocar unidade, limpar a busca)
+        # deixa o marcador certo, entao a busca nunca pula um redesenho que
+        # precisava acontecer.
+        self._setores_em_busca = bool(self.search_query)
+
     # Largura media do caractere em Segoe UI 12 bold, a fonte do card. Usada
     # para caber o nome na largura REAL do botao; o corte antigo era fixo em
     # 22 caracteres e nao mudava ao redimensionar a janela.
@@ -773,7 +781,15 @@ class App(ctk.CTk):
         "Colunas da Tela" is set to, which a two-line card would not.
         """
         results = filter_unit_hosts(self.hosts_data, self.selected_unit.get(), self.search_query)
-        self.count_label.configure(text=f"{len(results)} host(s) encontrado(s)")
+        total = len(results)
+        # O contador mostra o TOTAL; o limite entra como aviso. Exibir so o
+        # numero desenhado esconderia resultados sem dizer que escondeu.
+        if total > SEARCH_MAX_RESULTS:
+            self.count_label.configure(
+                text=f"{total} host(s) encontrado(s) — mostrando {SEARCH_MAX_RESULTS}, refine a busca")
+            results = results[:SEARCH_MAX_RESULTS]
+        else:
+            self.count_label.configure(text=f"{total} host(s) encontrado(s)")
 
         if not results:
             self._hide_pool(self._search_row_pool)
@@ -783,14 +799,22 @@ class App(ctk.CTk):
             return
 
         self._hide_empty_message()
+        # keep = o limite: sem isso o pool encolhia para 64 a cada tecla que
+        # estreitava o resultado, destruindo centenas de widgets no meio da
+        # digitacao - o mesmo custo da criacao, so que na volta.
         linhas = ensure_widget_pool(
-            self._search_row_pool, len(results), self._build_search_row)
+            self._search_row_pool, len(results), self._build_search_row,
+            keep=SEARCH_MAX_RESULTS)
         self._row_data = {}
 
         for indice, (linha, (sector_name, item)) in enumerate(zip(linhas, results)):
             self._fill_search_row(linha, sector_name, item)
-            linha.grid(row=indice, column=0, columnspan=6,
-                       sticky="ew", padx=8, pady=4)
+            # Reposicionar custa igual a posicionar. Uma linha que ja esta no
+            # lugar certo so precisa do texto novo.
+            if getattr(linha, "_vnc_indice", None) != indice or not linha.winfo_manager():
+                linha.grid(row=indice, column=0, columnspan=6,
+                           sticky="ew", padx=8, pady=4)
+                linha._vnc_indice = indice
 
     def _build_search_row(self):
         """Linha vazia do resultado da busca. O conteudo entra depois."""
@@ -1375,13 +1399,19 @@ class App(ctk.CTk):
             except Exception as exc:
                 log_exception(exc)
                 audit_log("UPDATE_DOWNLOAD_ERROR", f"version={latest_version}; error={exc}")
+                # O Python apaga o nome do except ao sair do bloco. show_failure
+                # roda depois, pelo after(), e lia um nome que ja nao existe:
+                # levantava NameError DENTRO do callback, entao a janela de
+                # progresso fechava e nenhum erro aparecia. Todos os outros
+                # workers do projeto ja copiam para um local antes.
+                erro = exc
 
                 def show_failure():
                     try:
                         download_window.close()
                     except Exception:
                         pass
-                    show_error(self, "Atualizações", f"Falha ao preparar a atualização:\n{exc}")
+                    show_error(self, "Atualizações", f"Falha ao preparar a atualização:\n{erro}")
 
                 self.after(0, show_failure)
 

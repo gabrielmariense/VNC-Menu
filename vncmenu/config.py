@@ -23,7 +23,7 @@ PORT = 5900
 APP_NAME = "VNC-Menu"
 
 
-APP_VERSION = "2.5.3"
+APP_VERSION = "2.5.4"
 
 
 APP_AUTHOR = 'Gabriel "GMErebos" Mariense'
@@ -91,6 +91,12 @@ RESTART_TIMEOUT_SECONDS = 25
 QWINSTA_MAX_WORKERS = 8
 
 
+# Limite do qwinsta por host. Era um 8 solto dentro de _query_logged_user, sem
+# constante e sem relacao com o resto: num site lento, subir os limites de ping
+# nao adiantava nada porque a sessao continuava estourando aqui.
+QWINSTA_TIMEOUT_SECONDS = 8
+
+
 # Espera antes de refazer a lista da busca. Cada tecla destroi e recria os
 # widgets do resultado, entao redesenhar a cada tecla trava a digitacao em
 # listas grandes. 150ms nao e percebido como atraso.
@@ -106,6 +112,15 @@ SEARCH_HOST_COLUMN_WIDTH = 150
 
 
 SEARCH_SECTOR_COLUMN_WIDTH = 130
+
+
+# Quantas linhas de resultado sao efetivamente desenhadas. Uma letra sozinha
+# casa com centenas de hosts, e cada linha e um frame com tres labels: a
+# primeira tecla construia ~400 widgets de uma vez (o travamento), e cada
+# tecla seguinte reconfigurava e reposicionava todos eles. Ninguem rola 400
+# resultados - refina a busca. O total real continua no contador, entao o
+# limite aparece, nao se esconde.
+SEARCH_MAX_RESULTS = 100
 
 
 VIEWER_ULTRAVNC = "ultravnc"

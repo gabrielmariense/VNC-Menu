@@ -353,7 +353,14 @@ def normalize_hosts_data(data):
 def load_hosts_data(path=SHARED_HOSTS_JSON, defaults=DEFAULT_HOSTS):
     path = Path(path)
     if not path.exists():
-        save_json(defaults, path)
+        # Em try pelo mesmo motivo de bootstrap_directories(): numa instalacao
+        # compartilhada somente-leitura o save_json levanta PermissionError e
+        # isso derrubava a leitura da lista de hosts inteira, quando o certo e
+        # seguir com os padroes em memoria.
+        try:
+            save_json(defaults, path)
+        except Exception as exc:
+            log_exception(exc)
         return normalize_hosts_data(defaults)
     try:
         return normalize_hosts_data(json.loads(path.read_text(encoding="utf-8")))
@@ -541,13 +548,38 @@ def load_settings():
     return settings
 
 
-def save_settings(settings):
+# Chaves escritas por save_window_geometry(), que le e grava o arquivo por
+# conta propria. Quem guarda um settings desde a inicializacao nao pode
+# devolve-las ao disco: seriam as de quando o aplicativo abriu.
+GEOMETRY_OWNED_KEYS = ("window_geometries", "main_window_size")
+
+
+def save_settings(settings, *, keep_disk_geometry: bool = True):
     """
     Save to Documents when possible and use AppData only as a real fallback.
 
     When the primary save succeeds, remove a stale fallback file so future
     startups cannot load outdated values such as hosts_source.
+
+    keep_disk_geometry existe porque ha DOIS escritores deste arquivo. A tela
+    principal guarda settings na inicializacao e regrava o dicionario inteiro
+    ao mudar qualquer opcao; save_window_geometry le, altera so a geometria e
+    regrava. Redimensionar uma janela e depois mudar uma opcao qualquer fazia
+    a copia antiga em memoria apagar o tamanho recem-salvo, sem erro nenhum.
+    Relendo as chaves de geometria aqui, quem nao e dono delas nao as
+    sobrescreve. O proprio save_window_geometry passa False: ali o valor em
+    maos E o mais novo.
     """
+    if keep_disk_geometry:
+        settings = dict(settings)
+        try:
+            do_disco = load_settings()
+        except Exception:
+            do_disco = {}
+        for chave in GEOMETRY_OWNED_KEYS:
+            if chave in do_disco:
+                settings[chave] = do_disco[chave]
+
     if _write_settings_file(SETTINGS_JSON, settings):
         try:
             FALLBACK_SETTINGS_JSON.unlink(missing_ok=True)
