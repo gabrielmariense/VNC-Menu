@@ -18,6 +18,12 @@ import urllib.request
 
 from .config import APP_NAME, APP_VERSION, GITHUB_LATEST_RELEASE_API, SCRIPT_DIR, UPDATER_EXE_NAME, UPDATER_SCRIPT_NAME
 
+
+# Ultimo recurso quando nao ha __main__ com arquivo (interpretador embutido).
+# Melhor um nome errado e conhecido, que o atualizador recusa pela checagem de
+# vncmenu\__init__.py, do que "updates.py", que ele aceitava e instalava torto.
+UPDATER_MAIN_FALLBACK = "VNC-Menu.pyw"
+
 def create_https_context() -> ssl.SSLContext:
     """Create a verified HTTPS context compatible with corporate Windows PKI.
 
@@ -194,9 +200,28 @@ def get_updater_launch_command(work_dir: Path) -> list[str]:
 
 
 def current_main_entry_name() -> str:
+    """Nome do ponto de entrada, para o atualizador achar a raiz do pacote.
+
+    Ancorado no __main__, nunca neste arquivo. Path(__file__).name resolve
+    para o arquivo onde a linha esta escrita: depois da modularizacao isso
+    passou a devolver "updates.py", e o atualizador procurava updates.py
+    dentro do pacote baixado. Ele achava vncmenu\\updates.py, concluia que a
+    raiz do pacote era a pasta vncmenu\\ e copiava o CONTEUDO dela para a
+    pasta de instalacao - config.py, remote.py, ui\\ e o resto soltos na raiz,
+    com o ponto de entrada e o proprio atualizador intactos. A instalacao
+    ficava suja e na versao antiga.
+
+    E a mesma armadilha que _detect_install_root() em config.py descreve: o
+    ponto de entrada e o unico ancoradouro estavel.
+    """
     if getattr(sys, "frozen", False):
         return Path(sys.executable).name
-    return Path(__file__).name
+
+    entry = getattr(sys.modules.get("__main__"), "__file__", None)
+    if entry:
+        return Path(entry).name
+
+    return UPDATER_MAIN_FALLBACK
 
 
 def format_release_notes_for_display(markdown_text: str) -> str:

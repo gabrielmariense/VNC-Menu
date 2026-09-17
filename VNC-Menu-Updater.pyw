@@ -140,20 +140,27 @@ def find_package_root(staging: Path, requested_main: str) -> tuple[Path, Path]:
     main_file = sorted(candidates, key=lambda path: len(path.parts))[0]
     package_root = main_file.parent
 
-    # Um pacote de codigo-fonte TEM de trazer vncmenu\ ao lado do ponto de
-    # entrada. Sem esta checagem, um ZIP montado errado (com o conteudo de
-    # vncmenu\ solto na raiz, por exemplo) era instalado assim mesmo: os
-    # modulos caiam soltos na pasta de instalacao e o aplicativo nao subia.
-    # Melhor recusar o pacote do que espalhar arquivo pela instalacao.
-    # O build empacotado (.exe) nao tem essa pasta: ali o codigo vai em
-    # _internal\, entao a regra so vale para o ponto de entrada .pyw.
-    if main_file.suffix.lower() == ".pyw":
-        if not (package_root / "vncmenu" / "__init__.py").is_file():
-            raise RuntimeError(
-                "O pacote de atualizacao esta malformado: nao ha a pasta "
-                "vncmenu\\ ao lado de " + main_file.name + ". Nenhum arquivo "
-                "foi alterado."
-            )
+    # Uma raiz de pacote valida tem vncmenu\ ao lado (codigo-fonte) ou
+    # _internal\ (build empacotado). Sem isso o pacote e recusado: melhor
+    # recusar do que espalhar arquivo pela instalacao.
+    #
+    # A checagem NAO olha mais a extensao do arquivo encontrado. Quando so
+    # valia para .pyw, um --main-entry errado escapava por baixo dela: o
+    # aplicativo mandava "updates.py", isso casava com vncmenu\updates.py, a
+    # raiz virava a propria pasta vncmenu\ e o conteudo dela era copiado solto
+    # para a pasta de instalacao, deixando o ponto de entrada na versao
+    # antiga. Quem define uma raiz valida e o que esta AO LADO dela, nunca o
+    # nome de quem pediu.
+    valido = (
+        (package_root / "vncmenu" / "__init__.py").is_file()
+        or (package_root / "_internal").is_dir()
+    )
+    if not valido:
+        raise RuntimeError(
+            "O pacote de atualizacao esta malformado: nao ha a pasta "
+            "vncmenu\\ nem _internal\\ ao lado de " + main_file.name +
+            ". Nenhum arquivo foi alterado."
+        )
 
     return package_root, main_file
 
