@@ -5,8 +5,10 @@ sobre, janelas de progresso e a janela de saida de texto.
 """
 
 from typing import Any
+from datetime import datetime
 from pathlib import Path
 import customtkinter as ctk
+from tkinter import filedialog
 import json
 import os
 import threading
@@ -17,10 +19,10 @@ from ..config import APP_AUTHOR, APP_NAME, STARTUP_FOLDER, APP_VERSION, COLOR_SC
 from ..applog import audit_log, log_exception
 from ..storage import find_psexec, format_host_port, sanitize_port, split_host_port, get_sector_by_name, get_sector_names, get_unit_by_name, get_unit_names, load_creds, load_global_paths, load_psexec_path, normalize_hosts_data, sanitize_viewer, save_creds, save_global_paths, save_json, save_psexec_path, save_settings, viewer_display_name
 from ..theme import FONT_BOLD, FONT_MONO, FONT_NORMAL, FONT_SMALL, FONT_SMALL_BOLD, FONT_SUBTITLE, THEME, color_scheme_display_name
-from ..helpers import EXECUTABLE_FILETYPES, PSEXEC_FILETYPES, path_row, pick_executable, styled_button, center_window, ensure_widget_pool, fit_dialog_to_content, remember_window_geometry, rename_realvnc_profile, rename_realvnc_profiles_for_sector, safe_filename, save_window_geometry, show_error, show_warning
+from ..helpers import bind_clickable_row, center_window, ensure_widget_pool, reset_scrollable_frame_position, fit_dialog_to_content, remember_window_geometry, rename_realvnc_profile, rename_realvnc_profiles_for_sector, safe_filename, save_window_geometry, show_error, show_warning
 from ..updates import fetch_latest_release, format_release_notes_for_display, normalize_release_version
 from .dialogs import ModalDialog, ask_host_details, ask_text, confirm_action, show_psexec_required_dialog
-from ..remote import PrinterScriptAborted, format_run_summary, run_printer_script, PsExecQueryError, script_runs_hidden, host_responds_to_ping, log_psexec_failure, query_remote_printers, validate_script_name
+from ..remote import format_run_summary, PsExecQueryError, driver_install_failures, script_runs_hidden, format_driver_install_report, format_script_run_report, format_users_output, host_responds_to_ping, install_printer_drivers, log_psexec_failure, query_logged_users_raw, query_remote_printers, run_startup_script, validate_script_name
 
 def show_text_window(
     parent,
@@ -71,22 +73,21 @@ def show_text_window(
         corner_radius=12,
         wrap="none",
     )
-    # Empacotado com side="bottom" ANTES da caixa, que expande: o pack atende
-    # na ordem de empacotamento, entao um botao de altura fixa empacotado
-    # depois so ganha espaco quando sobra - e quando nao sobra, ele sai da
-    # tela. A caixa tem rolagem; o botao nao.
-    styled_button(
+    textbox.pack(fill="both", expand=True, padx=18, pady=(0, 14))
+    textbox.insert("1.0", content)
+    textbox.configure(state="disabled")
+
+    ctk.CTkButton(
         outer,
         font=FONT_BOLD,
         text="Fechar",
         width=140,
         height=36,
-        command=win.destroy
-    ).pack(side="bottom", anchor="e", padx=18, pady=(0, 18))
-
-    textbox.pack(fill="both", expand=True, padx=18, pady=(0, 14))
-    textbox.insert("1.0", content)
-    textbox.configure(state="disabled")
+        command=win.destroy,
+        fg_color=THEME["surface_3"],
+        hover_color=THEME["accent_soft"],
+        text_color=THEME["secondary_button_text"],
+    ).pack(anchor="e", padx=18, pady=(0, 18))
 
     if remember_geometry_key:
         remember_window_geometry(win, remember_geometry_key, width, height)
@@ -97,20 +98,9 @@ def show_text_window(
     win.lift()
     win.focus()
 
-    def _solta_topmost():
-        # O try de fora protege o AGENDAMENTO; este protege a EXECUCAO. O
-        # script do after vive no interpretador, nao no widget, entao fechar a
-        # janela dentro dos 250ms nao o cancela - e a janela de progresso do
-        # qwinsta fecha assim que o worker volta, o que pode ser bem antes.
-        try:
-            if win.winfo_exists():
-                win.attributes("-topmost", False)
-        except tk.TclError:
-            pass
-
     try:
         win.attributes("-topmost", True)
-        win.after(250, _solta_topmost)
+        win.after(250, lambda: win.attributes("-topmost", False))
     except Exception:
         pass
 
@@ -172,13 +162,16 @@ def show_psexec_error_dialog(parent, host: str, error: PsExecQueryError):
          "style": "primary", "width": 110, "height": 38},
     ])
 
-    details_button = styled_button(
+    details_button = ctk.CTkButton(
         dialog.buttons,
         text="Detalhes",
         width=130,
         height=38,
         command=toggle_details,
-        font=FONT_BOLD
+        font=FONT_BOLD,
+        fg_color=THEME["surface_3"],
+        hover_color=THEME["accent_soft"],
+        text_color=THEME["secondary_button_text"],
     )
     details_button.pack(side="left")
 
@@ -252,20 +245,9 @@ class IndeterminateProgressWindow(ctk.CTkToplevel):
             self.focus()
 
         if bring_to_front:
-            def _solta_topmost():
-                # Esta e a janela de progresso do qwinsta: ela e fechada assim
-                # que o worker volta, o que pode acontecer dentro dos 250ms se
-                # a consulta falhar rapido (nome nao resolvido). O script do
-                # after vive no interpretador e nao e cancelado pelo destroy.
-                try:
-                    if self.winfo_exists():
-                        self.attributes("-topmost", False)
-                except tk.TclError:
-                    pass
-
             try:
                 self.attributes("-topmost", True)
-                self.after(250, _solta_topmost)
+                self.after(250, lambda: self.attributes("-topmost", False))
             except Exception:
                 pass
 
@@ -347,13 +329,16 @@ class CredsWindow(ctk.CTkToplevel):
             hover_color=THEME["accent_soft"],
             text_color=THEME["text"],
         ).pack(side="right", padx=(10, 0))
-        styled_button(
+        ctk.CTkButton(
             buttons,
             font=FONT_BOLD,
             text="Salvar",
             width=130,
             height=42,
-            command=self.save, style="primary"
+            command=self.save,
+            fg_color=THEME["accent"],
+            hover_color=THEME["accent_hover"],
+            text_color=THEME["button_text"],
         ).pack(side="right")
 
         center_window(self, 500, 390)
@@ -402,9 +387,9 @@ class SimpleListEditor(ctk.CTkToplevel):
             ("Remover", self.remove_item),
             ("A-Z", self.sort_items),
         ]:
-            styled_button(actions, font=FONT_BOLD, text=text, command=cmd, width=70).pack(side="left", padx=(0, 8))
+            ctk.CTkButton(actions, text_color=THEME["secondary_button_text"], font=FONT_BOLD, text=text, command=cmd, width=70, fg_color=THEME["surface_3"], hover_color=THEME["accent_soft"]).pack(side="left", padx=(0, 8))
 
-        styled_button(actions, font=FONT_BOLD, text="Fechar", command=self.destroy, width=80, style="primary").pack(side="right")
+        ctk.CTkButton(actions, text_color=THEME["button_text"], font=FONT_BOLD, text="Fechar", command=self.destroy, width=80, fg_color=THEME["accent"], hover_color=THEME["accent_hover"]).pack(side="right")
 
         self.render_items()
         remember_window_geometry(self, f"window_list_editor_{safe_filename(title)}", 520, 520)
@@ -645,11 +630,14 @@ class HostUnitsConfigWindow(ctk.CTkToplevel):
         )
         self.unit_menu.pack(fill="x", padx=18, pady=(0, 12))
 
-        styled_button(
+        ctk.CTkButton(
             self.left,
             font=FONT_BOLD,
             text="Editar Unidades",
-            command=self.open_units_editor
+            command=self.open_units_editor,
+            fg_color=THEME["surface_3"],
+            hover_color=THEME["accent_soft"],
+            text_color=THEME["secondary_button_text"],
         ).pack(fill="x", padx=18, pady=(0, 18))
 
         ctk.CTkLabel(self.left, text="Setores", font=FONT_SMALL_BOLD, text_color=THEME["muted"]).pack(anchor="w", padx=18, pady=(0, 6))
@@ -657,11 +645,14 @@ class HostUnitsConfigWindow(ctk.CTkToplevel):
         self.sector_frame = ctk.CTkScrollableFrame(self.left, fg_color=THEME["bg"], corner_radius=14)
         self.sector_frame.pack(fill="both", expand=True, padx=18, pady=(0, 14))
 
-        styled_button(
+        ctk.CTkButton(
             self.left,
             font=FONT_BOLD,
             text="Editar Setores",
-            command=self.open_sectors_editor
+            command=self.open_sectors_editor,
+            fg_color=THEME["surface_3"],
+            hover_color=THEME["accent_soft"],
+            text_color=THEME["secondary_button_text"],
         ).pack(fill="x", padx=18, pady=(0, 18))
 
     def build_right_panel(self):
@@ -730,22 +721,28 @@ class HostUnitsConfigWindow(ctk.CTkToplevel):
         footer = ctk.CTkFrame(self.right, fg_color="transparent")
         footer.grid(row=4, column=0, sticky="ew", padx=22, pady=(0, 16))
 
-        styled_button(
+        ctk.CTkButton(
             footer,
             font=FONT_BOLD,
             text="Fechar",
             width=118,
             height=38,
-            command=self.close
+            command=self.close,
+            fg_color=THEME["surface_3"],
+            hover_color=THEME["accent_soft"],
+            text_color=THEME["secondary_button_text"],
         ).pack(side="right", padx=(8, 0))
 
-        styled_button(
+        ctk.CTkButton(
             footer,
             font=FONT_BOLD,
             text="Salvar",
             width=118,
             height=38,
-            command=self.save, style="primary"
+            command=self.save,
+            fg_color=THEME["accent"],
+            hover_color=THEME["accent_hover"],
+            text_color=THEME["button_text"],
         ).pack(side="right")
 
     def current_unit(self):
@@ -835,11 +832,6 @@ class HostUnitsConfigWindow(ctk.CTkToplevel):
         linhas = ensure_widget_pool(
             self._host_row_pool, len(hosts), self._criar_linha_host)
         self.host_row_widgets = {}
-        # Zerado junto: so acumulava. ensure_widget_pool destroi as linhas
-        # acima do limite do pool, e os objetos destruidos continuavam como
-        # chave aqui para sempre, mantendo vivo o wrapper Tk de cada um. Com o
-        # reset, o mapa passa a conter apenas as linhas visiveis agora.
-        self._indice_da_linha = {}
 
         for idx, (linha, item) in enumerate(zip(linhas, hosts)):
             selected = idx == self.selected_host_index
@@ -1084,19 +1076,22 @@ class ViewerPathsWindow(ctk.CTkToplevel):
         buttons = ctk.CTkFrame(box, fg_color="transparent")
         buttons.grid(row=6, column=0, columnspan=3, sticky="ew", padx=18, pady=(18, 18))
 
-        styled_button(
+        ctk.CTkButton(
             buttons, font=FONT_BOLD, text="Usar padrões", width=135, height=40,
-            command=self.restore_defaults
+            command=self.restore_defaults, fg_color=THEME["surface_3"],
+            hover_color=THEME["accent_soft"], text_color=THEME["secondary_button_text"],
         ).pack(side="left")
 
-        styled_button(
+        ctk.CTkButton(
             buttons, font=FONT_BOLD, text="Cancelar", width=110, height=40,
-            command=self.destroy
+            command=self.destroy, fg_color=THEME["surface_3"],
+            hover_color=THEME["accent_soft"], text_color=THEME["secondary_button_text"],
         ).pack(side="right", padx=(8, 0))
 
-        styled_button(
+        ctk.CTkButton(
             buttons, font=FONT_BOLD, text="Salvar", width=110, height=40,
-            command=self.save, style="primary"
+            command=self.save, fg_color=THEME["accent"],
+            hover_color=THEME["accent_hover"], text_color=THEME["button_text"],
         ).pack(side="right")
 
         center_window(self, 720, 390)
@@ -1104,14 +1099,31 @@ class ViewerPathsWindow(ctk.CTkToplevel):
         self.grab_set()
 
     def _path_row(self, parent, row: int, label: str, variable: tk.StringVar):
-        path_row(parent, row, label, variable,
-                 lambda v=variable, l=label: self.browse(v, l))
+        ctk.CTkLabel(parent, text=label, font=FONT_SMALL_BOLD, text_color=THEME["muted"]).grid(
+            row=row, column=0, columnspan=3, sticky="w", padx=18, pady=(0, 6)
+        )
+        entry = ctk.CTkEntry(
+            parent, textvariable=variable, height=38, fg_color=THEME["surface_2"],
+            border_color=THEME["border"], text_color=THEME["text"],
+            placeholder_text_color=THEME["muted"],
+        )
+        entry.grid(row=row + 1, column=0, sticky="ew", padx=(18, 8), pady=(0, 12))
+        ctk.CTkButton(
+            parent, font=FONT_BOLD, text="Procurar...", width=110, height=38,
+            command=lambda v=variable, l=label: self.browse(v, l),
+            fg_color=THEME["surface_3"], hover_color=THEME["accent_soft"],
+            text_color=THEME["secondary_button_text"],
+        ).grid(row=row + 1, column=1, sticky="e", padx=(0, 8), pady=(0, 12))
 
     def browse(self, variable: tk.StringVar, title: str):
-        selecionado = pick_executable(
-            self, f"Selecionar {title}", EXECUTABLE_FILETYPES, variable.get())
-        if selecionado:
-            variable.set(selecionado)
+        current = variable.get().strip()
+        initial_dir = str(Path(current).parent) if current and Path(current).parent.exists() else r"C:\Program Files"
+        selected = filedialog.askopenfilename(
+            parent=self, title=f"Selecionar {title}", initialdir=initial_dir,
+            filetypes=[("Executáveis", "*.exe"), ("Todos os arquivos", "*.*")],
+        )
+        if selected:
+            variable.set(selected)
 
     def restore_defaults(self):
         self.ultravnc_var.set(ULTRAVNC_EXE)
@@ -1159,24 +1171,35 @@ class PsExecPathWindow(ctk.CTkToplevel):
         ).grid(row=2, column=0, columnspan=2, sticky="w", padx=18, pady=(0, 14))
 
         self.path_var = tk.StringVar(value=load_psexec_path())
-        # Sem rotulo e na linha 3, como era: os dois textos acima ja explicam
-        # o campo.
-        self.entry = path_row(
-            box, 3, None, self.path_var, self.browse,
-            placeholder="PsExec no PATH", pad_direita=18)
+        self.entry = ctk.CTkEntry(
+            box, textvariable=self.path_var, height=38, fg_color=THEME["surface_2"],
+            border_color=THEME["border"], text_color=THEME["text"],
+            placeholder_text="PsExec no PATH", placeholder_text_color=THEME["muted"],
+        )
+        self.entry.grid(row=3, column=0, sticky="ew", padx=(18, 8), pady=(0, 18))
+        ctk.CTkButton(
+            box, text="Procurar...", width=110, height=38, command=self.browse, font=FONT_BOLD,
+            fg_color=THEME["surface_3"], hover_color=THEME["accent_soft"],
+            text_color=THEME["secondary_button_text"],
+        ).grid(row=3, column=1, sticky="e", padx=(0, 18), pady=(0, 18))
 
         buttons = ctk.CTkFrame(box, fg_color="transparent")
         buttons.grid(row=4, column=0, columnspan=2, sticky="ew", padx=18, pady=(0, 18))
 
-        styled_button(
+        ctk.CTkButton(
             buttons, text="Usar PATH", width=110, height=40, command=lambda: self.path_var.set(""),
-            font=FONT_BOLD
+            font=FONT_BOLD, fg_color=THEME["surface_3"], hover_color=THEME["accent_soft"],
+            text_color=THEME["secondary_button_text"],
         ).pack(side="left")
-        styled_button(
-            buttons, text="Cancelar", width=110, height=40, command=self.destroy, font=FONT_BOLD
+        ctk.CTkButton(
+            buttons, text="Cancelar", width=110, height=40, command=self.destroy, font=FONT_BOLD,
+            fg_color=THEME["surface_3"], hover_color=THEME["accent_soft"],
+            text_color=THEME["secondary_button_text"],
         ).pack(side="right", padx=(8, 0))
-        styled_button(
-            buttons, text="Salvar", width=110, height=40, command=self.save, font=FONT_BOLD, style="primary"
+        ctk.CTkButton(
+            buttons, text="Salvar", width=110, height=40, command=self.save, font=FONT_BOLD,
+            fg_color=THEME["accent"], hover_color=THEME["accent_hover"],
+            text_color=THEME["button_text"],
         ).pack(side="right")
 
         center_window(self, 680, 270)
@@ -1185,12 +1208,13 @@ class PsExecPathWindow(ctk.CTkToplevel):
         self.entry.focus_set()
 
     def browse(self):
-        # Antes nao comecava na pasta do caminho atual, ao contrario da janela
-        # de caminhos do viewer: mesma tarefa, duas implementacoes.
-        selecionado = pick_executable(
-            self, "Selecionar PsExec", PSEXEC_FILETYPES, self.path_var.get())
-        if selecionado:
-            self.path_var.set(selecionado)
+        selected = filedialog.askopenfilename(
+            parent=self,
+            title="Selecionar PsExec",
+            filetypes=(("PsExec", "PsExec*.exe"), ("Executáveis", "*.exe"), ("Todos os arquivos", "*.*")),
+        )
+        if selected:
+            self.path_var.set(selected)
 
     def save(self):
         value = self.path_var.get().strip().strip('"')
@@ -1439,16 +1463,6 @@ class UpdateAvailableWindow(ctk.CTkToplevel):
             spacing1=3,
             spacing3=3,
         )
-        footer = ctk.CTkFrame(
-            outer,
-            fg_color="transparent",
-        )
-        # side="bottom" e ANTES da caixa de notas, que expande: o pack atende
-        # na ordem de empacotamento, e um rodape empacotado depois de um
-        # widget com expand=True sai da tela quando o espaco aperta. Aqui isso
-        # levaria junto o botao "Atualizar agora".
-        footer.pack(side="bottom", fill="x", padx=20, pady=(0, 18))
-
         notes_box.pack(
             fill="both",
             expand=True,
@@ -1457,6 +1471,12 @@ class UpdateAvailableWindow(ctk.CTkToplevel):
         )
         notes_box.insert("1.0", notes)
         notes_box.configure(state="disabled")
+
+        footer = ctk.CTkFrame(
+            outer,
+            fg_color="transparent",
+        )
+        footer.pack(fill="x", padx=20, pady=(0, 18))
 
         # Equal columns keep the four actions aligned at any window width.
         for column in range(4):
@@ -1583,11 +1603,15 @@ class HostActionsWindow(ctk.CTkToplevel):
         acoes.grid_columnconfigure(1, weight=1, uniform="hostacoes")
 
         def secundario(texto, comando):
-            return styled_button(
-                acoes, font=FONT_BOLD, text=texto, height=40, command=comando)
+            return ctk.CTkButton(
+                acoes, font=FONT_BOLD, text=texto, height=40, command=comando,
+                fg_color=THEME["surface_3"], hover_color=THEME["accent_soft"],
+                text_color=THEME["secondary_button_text"])
 
-        self.btn_connect = styled_button(
-            acoes, font=FONT_BOLD, text="Conectar", height=40, command=self.do_connect, style="primary")
+        self.btn_connect = ctk.CTkButton(
+            acoes, font=FONT_BOLD, text="Conectar", height=40, command=self.do_connect,
+            fg_color=THEME["accent"], hover_color=THEME["accent_hover"],
+            text_color=THEME["button_text"])
         self.btn_sessions = secundario("Sessões", self.do_sessions)
         self.btn_printers = secundario("Impressoras", self.do_printers)
         self.btn_share = secundario("Abrir c$", self.do_admin_share)
@@ -1607,8 +1631,10 @@ class HostActionsWindow(ctk.CTkToplevel):
         self.btn_startup.grid(row=2, column=1, sticky="ew", padx=(6, 0), pady=(0, 8))
         self.btn_restart.grid(row=3, column=1, sticky="ew", padx=(6, 0))
 
-        styled_button(
-            box, font=FONT_BOLD, text="Fechar", height=36, width=110, command=self.destroy).pack(anchor="e", padx=18, pady=(0, 18))
+        ctk.CTkButton(
+            box, font=FONT_BOLD, text="Fechar", height=36, width=110, command=self.destroy,
+            fg_color=THEME["surface_3"], hover_color=THEME["accent_soft"],
+            text_color=THEME["secondary_button_text"]).pack(anchor="e", padx=18, pady=(0, 18))
 
         # Botoes so ligam quando ha um host: agir sobre campo vazio abriria o
         # viewer sem alvo, ou pediria confirmacao de reinicio de coisa nenhuma.
@@ -1750,35 +1776,36 @@ class ChangelogWindow(ctk.CTkToplevel):
             spacing1=3,
             spacing3=3,
         )
-        footer = ctk.CTkFrame(outer, fg_color="transparent")
-        # Empacotado com side="bottom" ANTES do widget que expande: o pack
-        # atende na ordem de empacotamento, entao um rodape de altura fixa
-        # empacotado depois so ganha espaco quando sobra - e quando nao
-        # sobra, ele sai da tela. A caixa de texto tem rolagem; os botoes
-        # nao.
-        footer.pack(side="bottom", fill="x", padx=20, pady=(0, 18))
-
         self.notes_box.pack(fill="both", expand=True, padx=20, pady=(0, 14))
         self.set_notes("Carregando as notas da última versão...")
 
-        self.retry_button = styled_button(
+        footer = ctk.CTkFrame(outer, fg_color="transparent")
+        footer.pack(fill="x", padx=20, pady=(0, 18))
+
+        self.retry_button = ctk.CTkButton(
             footer,
             font=FONT_BOLD,
             text="Tentar de novo",
             width=145,
             height=38,
-            command=self.load_async
+            command=self.load_async,
+            fg_color=THEME["surface_3"],
+            hover_color=THEME["accent_soft"],
+            text_color=THEME["secondary_button_text"],
         )
         # So aparece se a consulta falhar.
         self.retry_button.pack_forget()
 
-        styled_button(
+        ctk.CTkButton(
             footer,
             font=FONT_BOLD,
             text="Fechar",
             width=110,
             height=38,
-            command=self.destroy, style="primary"
+            command=self.destroy,
+            fg_color=THEME["accent"],
+            hover_color=THEME["accent_hover"],
+            text_color=THEME["button_text"],
         ).pack(side="right")
 
         # Quem abre esta janela e o Sobre, que e modal (grab_set). Sem tomar o
@@ -1992,40 +2019,52 @@ class AboutWindow(ctk.CTkToplevel):
         )
         buttons.pack(fill="x", padx=22, pady=(0, 10))
 
-        styled_button(
+        ctk.CTkButton(
             buttons,
             font=FONT_BOLD,
             text="Buscar atualização",
             width=170,
             height=38,
-            command=self.check_updates, style="primary"
+            command=self.check_updates,
+            fg_color=THEME["accent"],
+            hover_color=THEME["accent_hover"],
+            text_color=THEME["button_text"],
         ).pack(side="left")
 
-        styled_button(
+        ctk.CTkButton(
             buttons,
             font=FONT_BOLD,
             text="Changelog",
             width=130,
             height=38,
-            command=self.open_changelog
+            command=self.open_changelog,
+            fg_color=THEME["surface_3"],
+            hover_color=THEME["accent_soft"],
+            text_color=THEME["secondary_button_text"],
         ).pack(side="left", padx=(8, 0))
 
-        styled_button(
+        ctk.CTkButton(
             buttons,
             font=FONT_BOLD,
             text="Pasta de logs",
             width=145,
             height=38,
-            command=self.open_logs_folder
+            command=self.open_logs_folder,
+            fg_color=THEME["surface_3"],
+            hover_color=THEME["accent_soft"],
+            text_color=THEME["secondary_button_text"],
         ).pack(side="left", padx=(8, 0))
 
-        styled_button(
+        ctk.CTkButton(
             buttons,
             font=FONT_BOLD,
             text="Fechar",
             width=110,
             height=38,
-            command=self.destroy, style="primary"
+            command=self.destroy,
+            fg_color=THEME["accent"],
+            hover_color=THEME["accent_hover"],
+            text_color=THEME["button_text"],
         ).pack(side="right")
 
         ctk.CTkLabel(
@@ -2131,6 +2170,8 @@ class SettingsWindow(ctk.CTkToplevel):
         self.grab_set()
 
     def _build_content(self):
+        for child in self.winfo_children():
+            child.destroy()
 
         self.configure(fg_color=THEME["bg"])
         outer = ctk.CTkFrame(self, fg_color=THEME["surface"], corner_radius=18)
@@ -2192,8 +2233,10 @@ class SettingsWindow(ctk.CTkToplevel):
         other = self._section(content, "OUTROS")
         self._nav_button(other, "Sobre", self.parent.open_about, last=True)
 
-        styled_button(
-            outer, font=FONT_BOLD, text="Fechar", command=self.destroy, height=40, style="primary"
+        ctk.CTkButton(
+            outer, font=FONT_BOLD, text="Fechar", command=self.destroy,
+            fg_color=THEME["accent"], hover_color=THEME["accent_hover"],
+            text_color=THEME["button_text"], height=40,
         ).pack(fill="x", padx=18, pady=(4, 16))
 
     def _section(self, parent, title: str):
@@ -2208,9 +2251,11 @@ class SettingsWindow(ctk.CTkToplevel):
         return section
 
     def _nav_button(self, parent, text: str, command, last: bool = False):
-        styled_button(
+        ctk.CTkButton(
             parent, font=FONT_BOLD, text=text, anchor="w",
-            command=lambda c=command: self.run_and_close(c), height=36
+            command=lambda c=command: self.run_and_close(c), height=36,
+            fg_color=THEME["surface_3"], hover_color=THEME["accent_soft"],
+            text_color=THEME["secondary_button_text"],
         ).pack(fill="x", padx=10, pady=(0, 10 if last else 6))
 
     def _switch_row(self, parent, text: str, variable: tk.BooleanVar, command, last: bool = False):
@@ -2343,9 +2388,11 @@ class PrintersWindow(ctk.CTkToplevel):
             self.host_entry.insert(0, str(host).strip().lstrip("\\"))
         self.host_entry.bind("<Return>", lambda _e: self.do_query())
 
-        self.btn_query = styled_button(
+        self.btn_query = ctk.CTkButton(
             box, font=FONT_BOLD, text="Consultar impressoras", height=40,
-            command=self.do_query, style="primary")
+            command=self.do_query,
+            fg_color=THEME["accent"], hover_color=THEME["accent_hover"],
+            text_color=THEME["button_text"])
         self.btn_query.pack(fill="x", padx=18, pady=(0, 16))
 
         ctk.CTkFrame(box, height=1, fg_color=THEME["border"]).pack(
@@ -2366,9 +2413,11 @@ class PrintersWindow(ctk.CTkToplevel):
         self.script_entry.grid(row=0, column=0, sticky="ew")
         self.script_entry.insert(0, self.DEFAULT_SCRIPT)
 
-        self.btn_folder = styled_button(
+        self.btn_folder = ctk.CTkButton(
             linha, font=FONT_BOLD, text="Abrir pasta", width=140, height=38,
-            command=self.open_folder)
+            command=self.open_folder,
+            fg_color=THEME["surface_3"], hover_color=THEME["accent_soft"],
+            text_color=THEME["secondary_button_text"])
         self.btn_folder.grid(row=0, column=1, sticky="e", padx=(8, 0))
 
         ctk.CTkLabel(box, text=STARTUP_FOLDER, font=FONT_NORMAL,
@@ -2407,14 +2456,18 @@ class PrintersWindow(ctk.CTkToplevel):
 
         # Nasce desabilitado em vez de escondido: um botao que aparece empurra
         # o "Fechar" no exato momento em que a pessoa vai clicar nele.
-        self.btn_details = styled_button(
+        self.btn_details = ctk.CTkButton(
             rodape, font=FONT_BOLD, text="Detalhes técnicos", height=36,
-            width=170, command=self.open_details, state="disabled")
+            width=170, command=self.open_details, state="disabled",
+            fg_color=THEME["surface_3"], hover_color=THEME["accent_soft"],
+            text_color=THEME["secondary_button_text"])
         self.btn_details.pack(side="left")
 
-        styled_button(
+        ctk.CTkButton(
             rodape, font=FONT_BOLD, text="Fechar", height=36, width=110,
-            command=self.destroy).pack(side="right")
+            command=self.destroy,
+            fg_color=THEME["surface_3"], hover_color=THEME["accent_soft"],
+            text_color=THEME["secondary_button_text"]).pack(side="right")
 
         # ------------------------------------------------------------- saida
         self.output = ctk.CTkTextbox(
@@ -2487,16 +2540,7 @@ class PrintersWindow(ctk.CTkToplevel):
             except Exception:
                 return
             callback()
-
-        # O after() TAMBEM precisa de guarda: ele roda na thread do worker e
-        # levanta TclError se a janela ja foi fechada durante a consulta - que
-        # pode levar um minuto e nao bloqueia a janela. A thread morreria com
-        # excecao nao tratada, sem console para mostra-la, e o _set_busy(False)
-        # nunca rodaria. ChangelogWindow.load_async ja trata assim.
-        try:
-            self.after(0, wrapper)
-        except tk.TclError:
-            pass
+        self.after(0, wrapper)
 
     # ------------------------------------------------------------- actions
 
@@ -2645,19 +2689,45 @@ class PrintersWindow(ctk.CTkToplevel):
         )
 
         def worker():
+            partes = []
             erro = None
             offline = False
-            abortado = None
-            resultado = {}
+            abortado = False
+            drivers = {}
+            data = {}
 
             try:
                 if not host_responds_to_ping(host):
                     offline = True
                     audit_log("STARTUP_SCRIPT_HOST_OFFLINE", f"host={host}")
                 else:
-                    resultado = run_printer_script(host, script_name, psexec_path)
-            except PrinterScriptAborted as parada:
-                abortado = parada
+                    drivers = install_printer_drivers(host, script_name, psexec_path)
+                    audit_log(
+                        "DRIVER_INSTALL_RESULT",
+                        f"host={host}; status={drivers.get('Status')}; "
+                        f"falhas={len(driver_install_failures(drivers))}",
+                    )
+                    partes.append(format_driver_install_report(host, drivers))
+                    if drivers.get("Status") != "ok":
+                        # Sem driver nenhum instalado, rodar o script apaga as
+                        # impressoras do usuario e pode nao conseguir remapear.
+                        # Melhor parar antes de estragar.
+                        partes.append(
+                            "O script NÃO foi executado: a instalação de "
+                            "drivers não chegou a rodar, e executar assim "
+                            "apagaria as impressoras do usuário sem "
+                            "garantia de remapear."
+                        )
+                        abortado = True
+
+                    if not abortado:
+                        data = run_startup_script(host, script_name, psexec_path)
+                        audit_log(
+                            "STARTUP_SCRIPT_RESULT",
+                            f"host={host}; script={script_name}; "
+                            f"status={data.get('Status')}; user={data.get('User') or '-'}",
+                        )
+                        partes.append(format_script_run_report(host, data))
             except PsExecQueryError as exc:
                 log_psexec_failure(host, psexec_path, exc)
                 audit_log("STARTUP_SCRIPT_PSEXEC_ERROR",
@@ -2689,17 +2759,10 @@ class PrintersWindow(ctk.CTkToplevel):
                                f"Falha ao executar em {host}:\n\n{erro}\n\n"
                                f"Log: {ERROR_LOG}")
                     return
-                if abortado is not None:
-                    # Parada deliberada nossa, nao falha de comunicacao.
-                    self._set_output(
-                        format_run_summary(host, abortado.drivers, {}))
-                    self._set_details(abortado.relatorio)
-                    return
                 # A caixa fica com o resumo; o relatorio inteiro vai para o
                 # botao de detalhes.
-                self._set_output(format_run_summary(
-                    host, resultado.get("drivers", {}), resultado.get("script", {})))
-                self._set_details(resultado.get("relatorio", ""))
+                self._set_output(format_run_summary(host, drivers, data))
+                self._set_details(("\n\n" + ("-" * 60) + "\n\n").join(partes))
 
             self._finish(finish)
 

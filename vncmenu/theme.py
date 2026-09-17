@@ -155,24 +155,3 @@ FONT_SMALL_BOLD = ("Segoe UI", 11, "bold")
 # alinhadas por espacos, e uma fonte proporcional desalinha tudo. Em 12 ela
 # ainda le maior que a Segoe UI 11 que estava ali antes.
 FONT_MONO = ("Consolas", 12)
-
-
-# Nome -> chaves do THEME. Aqui e nao em dialogs.py porque nao e so dos
-# dialogos: as janelas Toplevel repetiam o mesmo trio de cores a mao, ~40
-# vezes, e trocar o estilo secundario significava editar cada uma delas.
-BUTTON_STYLES = {
-    "primary": ("accent", "accent_hover", "button_text"),
-    "secondary": ("surface_3", "accent_soft", "secondary_button_text"),
-    "danger": ("danger", "danger_hover", "button_text"),
-}
-
-
-def button_colors(style: str = "secondary") -> dict:
-    """kwargs de cor de um botao. Lido do THEME na hora da chamada, porque o
-    THEME e mutado in-place quando o usuario troca o tema."""
-    fg, hover, texto = BUTTON_STYLES[style]
-    return {
-        "fg_color": THEME[fg],
-        "hover_color": THEME[hover],
-        "text_color": THEME[texto],
-    }

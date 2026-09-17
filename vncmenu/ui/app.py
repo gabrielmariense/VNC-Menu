@@ -21,7 +21,7 @@ from ..config import APP_AUTHOR, APP_NAME, APP_VERSION, COLOR_SCHEME_BLUE, DEFAU
 from ..applog import audit_log, log_exception
 from ..storage import format_host_port, sanitize_port, bootstrap_directories, filter_unit_hosts, get_host_columns, get_hosts_path_for_source, get_sector_hosts, get_sector_names, get_unit_names, hosts_source_display_name, load_global_paths, load_hosts_data, load_settings, normalize_hosts_source, normalize_login_mode, save_settings, set_hosts_source
 from ..theme import FONT_BOLD, FONT_NORMAL, FONT_SMALL, FONT_SMALL_BOLD, FONT_TITLE, THEME, apply_color_theme, normalize_color_scheme
-from ..helpers import styled_button, bind_clickable_row, ensure_widget_pool, fit_text_to_width, get_geometry_size, get_window_geometries, is_valid_geometry, prune_window_geometries, reset_scrollable_frame_position, restore_window_geometry, safe_filename, save_window_geometry, show_error, show_info, show_warning
+from ..helpers import bind_clickable_row, ensure_widget_pool, fit_text_to_width, get_geometry_size, get_window_geometries, is_valid_geometry, prune_window_geometries, reset_scrollable_frame_position, restore_window_geometry, safe_filename, save_window_geometry, show_error, show_info, show_warning
 from ..updates import HTTPS_CONTEXT, calculate_sha256, current_main_entry_name, fetch_latest_release, find_release_zip_asset, get_release_asset_checksum, get_updater_launch_command, normalize_release_version, parse_version
 from .dialogs import ask_text, choose_hosts_source_dialog, confirm_action, ensure_hosts_source_selected, shared_hosts_edit_warning
 from ..remote import format_users_output, launch_vnc, query_all_logged_users, query_logged_users_raw, restart_host
@@ -64,21 +64,13 @@ class SearchResultRow(ctk.CTkFrame):
 
 
 class App(ctk.CTk):
-    # Largura da lateral e minima da janela andam juntas: alargar uma sem
-    # subir a outra tira espaco da grade de hosts, cujos nomes ja truncam.
-    # Como constantes, a relacao fica declarada aqui em vez de viver em dois
-    # numeros soltos que os testes precisavam raspar do codigo-fonte.
-    SIDEBAR_WIDTH = 340
-    MIN_WINDOW_WIDTH = 980
-    MIN_WINDOW_HEIGHT = 560
-
     def __init__(self):
         super().__init__()
         self.title("VNC-Menu")
         # 980 acompanha a barra lateral: ela foi de 260 para 340 para caber
         # nome de setor comprido, e sem subir a minima junto a grade de hosts
         # e que perderia os 80px. Mexer na largura da lateral pede mexer aqui.
-        self.minsize(self.MIN_WINDOW_WIDTH, self.MIN_WINDOW_HEIGHT)
+        self.minsize(980, 560)
 
         self.settings = load_settings()
 
@@ -242,7 +234,7 @@ class App(ctk.CTk):
         # texto. A 340 o botao fica com 252px, ~37 caracteres; o maior nome
         # de setor da lista real tem 33. Alargar aqui tira espaco da grade de
         # hosts, entao a largura minima da janela subiu junto.
-        self.sidebar = ctk.CTkFrame(self, width=self.SIDEBAR_WIDTH, fg_color=THEME["surface"], corner_radius=22)
+        self.sidebar = ctk.CTkFrame(self, width=340, fg_color=THEME["surface"], corner_radius=22)
         self.sidebar.grid(row=0, column=0, sticky="ns", padx=(18, 12), pady=18)
         # pack_propagate e NAO grid_propagate: todos os filhos desta barra sao
         # empacotados com pack(). grid_propagate() so governa filhos geridos
@@ -310,13 +302,16 @@ class App(ctk.CTk):
         self.search_entry.grid(row=0, column=0, sticky="ew")
         self.search_entry.bind("<Escape>", self.on_search_escape)
 
-        styled_button(
+        ctk.CTkButton(
             row,
             font=FONT_BOLD,
             text="✕",
             width=44,
             height=38,
-            command=self.clear_search
+            command=self.clear_search,
+            fg_color=THEME["surface_3"],
+            hover_color=THEME["accent_soft"],
+            text_color=THEME["secondary_button_text"],
         ).grid(row=0, column=1, sticky="e", padx=(8, 0))
 
     def on_search_changed(self, *_args):
@@ -397,20 +392,26 @@ class App(ctk.CTk):
         # botao no futuro so muda a fatia de cada um, sem cortar nem sobrar.
         actions.grid(row=0, column=0, sticky="ew")
 
-        self.btn_users = styled_button(
+        self.btn_users = ctk.CTkButton(
             actions,
             font=FONT_BOLD,
             text="Usuários",
             height=38,
-            command=self.show_qwinsta_users
+            command=self.show_qwinsta_users,
+            fg_color=THEME["surface_3"],
+            hover_color=THEME["accent_soft"],
+            text_color=THEME["secondary_button_text"],
         )
 
-        self.btn_printers = styled_button(
+        self.btn_printers = ctk.CTkButton(
             actions,
             font=FONT_BOLD,
             text="Impressoras",
             height=38,
-            command=self.open_printers_window
+            command=self.open_printers_window,
+            fg_color=THEME["surface_3"],
+            hover_color=THEME["accent_soft"],
+            text_color=THEME["secondary_button_text"],
         )
 
         # uniform= amarra as colunas na mesma largura; sem isso o texto mais
@@ -452,13 +453,16 @@ class App(ctk.CTk):
             pady=10,
         )
 
-        styled_button(
+        ctk.CTkButton(
             hint_actions,
             font=FONT_BOLD,
             text="Host manual",
             width=120,
             height=32,
-            command=self.open_manual_host
+            command=self.open_manual_host,
+            fg_color=THEME["surface_3"],
+            hover_color=THEME["accent_soft"],
+            text_color=THEME["secondary_button_text"],
         ).pack(side="left", padx=(0, 8))
 
         self.btn_login_mode = ctk.CTkButton(
@@ -1399,19 +1403,20 @@ class App(ctk.CTk):
             except Exception as exc:
                 log_exception(exc)
                 audit_log("UPDATE_DOWNLOAD_ERROR", f"version={latest_version}; error={exc}")
-                # O Python apaga o nome do except ao sair do bloco. show_failure
-                # roda depois, pelo after(), e lia um nome que ja nao existe:
-                # levantava NameError DENTRO do callback, entao a janela de
-                # progresso fechava e nenhum erro aparecia. Todos os outros
-                # workers do projeto ja copiam para um local antes.
-                erro = exc
+
+                # O texto e copiado AQUI de proposito: o Python apaga o nome do
+                # except ao sair do bloco, e show_failure so roda depois, no
+                # after(). Usar exc la dentro levantava NameError, entao a
+                # janela de progresso fechava e nenhuma mensagem aparecia -
+                # falha de atualizacao silenciosa.
+                mensagem_erro = str(exc)
 
                 def show_failure():
                     try:
                         download_window.close()
                     except Exception:
                         pass
-                    show_error(self, "Atualizações", f"Falha ao preparar a atualização:\n{erro}")
+                    show_error(self, "Atualizações", f"Falha ao preparar a atualização:\n{mensagem_erro}")
 
                 self.after(0, show_failure)
 

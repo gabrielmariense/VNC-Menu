@@ -353,10 +353,10 @@ def normalize_hosts_data(data):
 def load_hosts_data(path=SHARED_HOSTS_JSON, defaults=DEFAULT_HOSTS):
     path = Path(path)
     if not path.exists():
-        # Em try pelo mesmo motivo de bootstrap_directories(): numa instalacao
-        # compartilhada somente-leitura o save_json levanta PermissionError e
-        # isso derrubava a leitura da lista de hosts inteira, quando o certo e
-        # seguir com os padroes em memoria.
+        # Em try pelo mesmo motivo do bootstrap: numa instalacao compartilhada
+        # somente-leitura o save_json levanta PermissionError, e isso derrubava
+        # a leitura da lista de hosts inteira. Nao poder GRAVAR o arquivo
+        # padrao nao impede seguir com os padroes em memoria.
         try:
             save_json(defaults, path)
         except Exception as exc:
@@ -565,20 +565,25 @@ def save_settings(settings, *, keep_disk_geometry: bool = True):
     principal guarda settings na inicializacao e regrava o dicionario inteiro
     ao mudar qualquer opcao; save_window_geometry le, altera so a geometria e
     regrava. Redimensionar uma janela e depois mudar uma opcao qualquer fazia
-    a copia antiga em memoria apagar o tamanho recem-salvo, sem erro nenhum.
-    Relendo as chaves de geometria aqui, quem nao e dono delas nao as
-    sobrescreve. O proprio save_window_geometry passa False: ali o valor em
-    maos E o mais novo.
+    a segunda escrita desfazer a primeira, e o tamanho voltava ao de quando o
+    aplicativo abriu. Aqui as chaves de geometria sao relidas do disco antes
+    de gravar - menos para quem ESCREVE geometria, que passa False e manda o
+    proprio valor.
     """
     if keep_disk_geometry:
-        settings = dict(settings)
         try:
-            do_disco = load_settings()
-        except Exception:
-            do_disco = {}
-        for chave in GEOMETRY_OWNED_KEYS:
-            if chave in do_disco:
-                settings[chave] = do_disco[chave]
+            em_disco = load_settings()
+        except Exception as exc:
+            # Nao poder reler nao pode impedir de salvar: nesse caso grava o
+            # que o chamador trouxe, que e o comportamento antigo.
+            log_exception(exc)
+        else:
+            settings = dict(settings)
+            for chave in GEOMETRY_OWNED_KEYS:
+                if chave in em_disco:
+                    settings[chave] = em_disco[chave]
+                else:
+                    settings.pop(chave, None)
 
     if _write_settings_file(SETTINGS_JSON, settings):
         try:

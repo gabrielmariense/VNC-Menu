@@ -28,7 +28,7 @@ from ctypes import wintypes
 
 from concurrent.futures import ThreadPoolExecutor
 
-from .config import QWINSTA_MAX_WORKERS, QWINSTA_TIMEOUT_SECONDS, AUTH_TIMEOUT, AUTH_TITLE_RE, DEFAULT_VIEWER, ERROR_LOG, ERROR_LOG_MAX_BYTES, HOST_PING_PROCESS_TIMEOUT_SECONDS, HOST_PING_TIMEOUT_MS, PSEXEC_TIMEOUT_SECONDS, REALVNC_DIR, REALVNC_EXE, RESTART_TIMEOUT_SECONDS, SCRIPT_RUN_TIMEOUT_SECONDS, SCRIPT_RUN_WAIT_SECONDS, STARTUP_FOLDER, STARTUP_TASK_NAME, TEMPLATE_VNC, ULTRAVNC_EXE, VIEWER_REALVNC
+from .config import QWINSTA_MAX_WORKERS, AUTH_TIMEOUT, AUTH_TITLE_RE, DEFAULT_VIEWER, ERROR_LOG, ERROR_LOG_MAX_BYTES, HOST_PING_PROCESS_TIMEOUT_SECONDS, HOST_PING_TIMEOUT_MS, PSEXEC_TIMEOUT_SECONDS, REALVNC_DIR, REALVNC_EXE, RESTART_TIMEOUT_SECONDS, SCRIPT_RUN_TIMEOUT_SECONDS, SCRIPT_RUN_WAIT_SECONDS, STARTUP_FOLDER, STARTUP_TASK_NAME, TEMPLATE_VNC, ULTRAVNC_EXE, VIEWER_REALVNC
 from .applog import audit_log, log_exception, rotate_log_if_needed
 from .storage import format_host_port, sanitize_port, split_host_port, get_realvnc_exe, get_ultravnc_exe, load_creds, resolve_existing_exe, sanitize_viewer, viewer_display_name
 from .helpers import realvnc_profile_name, safe_filename, show_error, show_info
@@ -414,28 +414,7 @@ def launch_vnc(
 
         # This is the launch behavior from the old working Tkinter version:
         # copy the template unchanged and pass the target as host::port.
-        #
-        # A copia vai para uma pasta NOSSA dentro do TEMP, varrida antes de
-        # cada conexao. Um perfil exportado do UltraVNC Viewer pode carregar a
-        # senha salva (e por isso que data\template.vnc fica fora do
-        # versionamento, como o LEIA-ME explica), e antes cada conexao deixava
-        # uma copia em %TEMP%\uvnc_<host>.vnc, num caminho previsivel, para
-        # sempre - uma por host. Apagar logo apos o Popen nao serve: o viewer
-        # le o arquivo depois. Varrer a pasta na proxima conexao deixa no
-        # maximo uma sobra, a da sessao em uso.
-        tmp_dir = Path(tempfile.gettempdir()) / "VNC-Menu-Perfis"
-        try:
-            tmp_dir.mkdir(parents=True, exist_ok=True)
-            for antigo in tmp_dir.glob("*.vnc"):
-                try:
-                    antigo.unlink()
-                except OSError:
-                    # Em uso por um viewer ainda aberto: sai na proxima vez.
-                    pass
-        except OSError:
-            tmp_dir = Path(tempfile.gettempdir())
-
-        tmp_vnc = tmp_dir / f"uvnc_{safe_filename(host)}.vnc"
+        tmp_vnc = Path(tempfile.gettempdir()) / f"uvnc_{safe_filename(host)}.vnc"
         shutil.copyfile(TEMPLATE_VNC, tmp_vnc)
 
         cmd = [ultravnc_exe, "-config", str(tmp_vnc), f"{host}::{port}"]
@@ -677,34 +656,6 @@ def log_psexec_failure(host, psexec_path, error: PsExecQueryError):
         pass
 
 
-def _psexec_powershell_command(psexec_path, host: str, encoded_command: str) -> list:
-    """Linha de comando do PsExec para rodar PowerShell na maquina remota.
-
-    Uma so para as tres operacoes: os dezesseis elementos eram identicos nos
-    tres lugares e o que muda de verdade e o payload e o limite de tempo.
-    -s (SYSTEM) e -h (token elevado) sao o que permite ler o registro de outros
-    perfis e instalar driver; -n 5 limita a espera pela conexao.
-    """
-    return [
-        str(psexec_path),
-        rf"\\{host}",
-        "-s",
-        "-h",
-        "-accepteula",
-        "-nobanner",
-        "-n",
-        "5",
-        "powershell.exe",
-        "-NoLogo",
-        "-NoProfile",
-        "-NonInteractive",
-        "-ExecutionPolicy",
-        "Bypass",
-        "-EncodedCommand",
-        encoded_command,
-    ]
-
-
 def _run_psexec(command, host, psexec_path, timeout_seconds):
     """Executa o PsExec e traduz as falhas locais em PsExecQueryError.
 
@@ -799,33 +750,6 @@ def _encoded_command(script: str) -> str:
         )
     return codificado
 
-# Metade de escrita do formato de fio. A outra metade e _decode_marked_payload,
-# que e uma so em Python - tres copias do escritor contra um leitor e o que faz
-# um ajuste de tamanho de bloco virar bug "so naquela maquina". Largura do
-# bloco, deflate cru e a pausa de drenagem tem de casar com o decodificador,
-# entao vivem aqui e sao interpolados nos tres payloads.
-_PS_EMITE = """function Emite($m1,$m2,$json){
- # Comprimido e quebrado em linhas: a saida do PsExec chegava cortada no meio
- # em algumas maquinas, sempre na mesma, e sem o marcador final nada pode ser
- # lido. Comprimir reduz o texto varias vezes e quebrar em linhas evita
- # depender de uma unica escrita gigante. O Flush esvazia o buffer do .NET e a
- # pausa da tempo do PSEXESVC drenar o pipe antes do processo morrer - sem ela
- # a cauda se perde mesmo com o buffer ja esvaziado.
- $bytes=[Text.Encoding]::UTF8.GetBytes([string]$json)
- $ms=New-Object IO.MemoryStream
- $ds=New-Object IO.Compression.DeflateStream($ms,[IO.Compression.CompressionMode]::Compress)
- $ds.Write($bytes,0,$bytes.Length);$ds.Dispose()
- $b64=[Convert]::ToBase64String($ms.ToArray())
- [Console]::Out.WriteLine($m1)
- for($i=0;$i -lt $b64.Length;$i+=400){
-  [Console]::Out.WriteLine($b64.Substring($i,[Math]::Min(400,$b64.Length-$i)))
- }
- [Console]::Out.WriteLine($m2)
- [Console]::Out.Flush()
- Start-Sleep -Milliseconds 300
-}"""
-
-
 def _decode_marked_payload(output, begin_marker, end_marker):
     """Extrai, descomprime e devolve o JSON entre os marcadores. None se nao der.
 
@@ -880,14 +804,11 @@ def _truncation_error(host, psexec_path, returncode, stdout, stderr):
     )
 
 
-def _build_printer_query_payload() -> str:
-    """PowerShell que lista as impressoras da maquina e resolve os IPs.
+def query_remote_printers(host: str, psexec_path: Path) -> str:
+    host = str(host or "").strip().lstrip("\\")
+    if not host:
+        raise ValueError("Hostname ou IP não informado.")
 
-    Builder separado como os outros dois payloads. Estava embutido em
-    query_remote_printers, que por isso misturava o script com o
-    transporte - e deixava o coletor so testavel por leitura do
-    codigo-fonte, enquanto os irmaos sao testados pelo valor que devolvem.
-    """
     # O coletor resolve o endereco de cada fila compartilhada consultando o
     # SERVIDOR de impressao. Antes fazia isso fila a fila: duas chamadas RPC
     # remotas por fila, repetidas para cada perfil de usuario da maquina. Numa
@@ -895,7 +816,7 @@ def _build_printer_query_payload() -> str:
     # Agora cada servidor e lido UMA vez para um hashtable e o resto e busca
     # local. O caminho fila a fila continua existindo como reserva, para o
     # servidor que permite consultar uma fila mas nao enumerar o conjunto.
-    return r'''$ErrorActionPreference='SilentlyContinue';$ProgressPreference='SilentlyContinue'
+    collector = r'''$ErrorActionPreference='SilentlyContinue';$ProgressPreference='SilentlyContinue'
 $m1='__VNC_MENU_PRINTERS_BEGIN__';$m2='__VNC_MENU_PRINTERS_END__';$r=@();$ports=@{}
 $dnsCache=@{};$serverCache=@{}
 function Get-IP($value){
@@ -944,38 +865,63 @@ Get-Printer|ForEach-Object{
  # pessoa, e o suporte via no relatorio uma fila que a maquina nao tinha.
  if($name-and$name-notmatch'^\\\\'){$r+=[pscustomobject]@{Name=$name;IP=$address}}
 }
-# Registry::HKEY_USERS em vez de montar um PSDrive. Com
-# $ErrorActionPreference='SilentlyContinue', um New-PSDrive que falhasse nao
-# dizia nada: o Get-ChildItem seguinte vinha vazio e a maquina era reportada
-# como se nao tivesse impressora de rede nenhuma - resposta errada
-# apresentada como certa. O provedor Registry:: nao precisa de montagem, e e
-# a mesma forma que a instalacao de drivers ja usa.
+if(!(Get-PSDrive HKU -ErrorAction SilentlyContinue)){New-PSDrive HKU Registry HKEY_USERS|Out-Null;$newHku=$true}
 $conexoes=@{}
-Get-ChildItem 'Registry::HKEY_USERS'|Where-Object{$_.PSChildName-match'^S-1-5-21-(?:\d+-){3}\d+$'}|ForEach-Object{
- Get-ChildItem "Registry::HKEY_USERS\$($_.PSChildName)\Printers\Connections"|ForEach-Object{
+Get-ChildItem HKU:\|Where-Object{$_.PSChildName-match'^S-1-5-21-(?:\d+-){3}\d+$'}|ForEach-Object{
+ Get-ChildItem "HKU:\$($_.PSChildName)\Printers\Connections"|ForEach-Object{
   $parts=@(($_.PSChildName-replace'^,,','')-split',')
   if($parts.Count-ge2){$server=[string]$parts[0];$queue=[string]($parts[1..($parts.Count-1)]-join',');$chave="\\$server\$queue";if(!$conexoes.ContainsKey($chave)){$conexoes[$chave]=@($server,$queue)}}
  }
 }
+if($newHku){Remove-PSDrive HKU}
 foreach($chave in @($conexoes.Keys)){
  $par=$conexoes[$chave];$address=Get-SharedAddress $par[0] $par[1]
  if(!$address){$address='NÃO IDENTIFICADO'}
  $r+=[pscustomobject]@{Name=$chave;IP=$address}
 }
-''' + _PS_EMITE + r'''
+function Emite($m1,$m2,$json){
+ # Comprimido e quebrado em linhas: a saida do PsExec chegava cortada no meio
+ # em algumas maquinas, sempre na mesma, e sem o marcador final nada pode ser
+ # lido. Comprimir reduz o texto varias vezes e quebrar em linhas evita
+ # depender de uma unica escrita gigante. O Flush esvazia o buffer do .NET e a
+ # pausa da tempo do PSEXESVC drenar o pipe antes do processo morrer - sem ela
+ # a cauda se perde mesmo com o buffer ja esvaziado.
+ $bytes=[Text.Encoding]::UTF8.GetBytes([string]$json)
+ $ms=New-Object IO.MemoryStream
+ $ds=New-Object IO.Compression.DeflateStream($ms,[IO.Compression.CompressionMode]::Compress)
+ $ds.Write($bytes,0,$bytes.Length);$ds.Dispose()
+ $b64=[Convert]::ToBase64String($ms.ToArray())
+ [Console]::Out.WriteLine($m1)
+ for($i=0;$i -lt $b64.Length;$i+=400){
+  [Console]::Out.WriteLine($b64.Substring($i,[Math]::Min(400,$b64.Length-$i)))
+ }
+ [Console]::Out.WriteLine($m2)
+ [Console]::Out.Flush()
+ Start-Sleep -Milliseconds 300
+}
 $json=ConvertTo-Json -InputObject @($r|Sort-Object Name,IP -Unique)-Compress
 Emite $m1 $m2 $json'''
 
+    encoded_command = _encoded_command(collector)
 
-
-def query_remote_printers(host: str, psexec_path: Path) -> str:
-    host = str(host or "").strip().lstrip("\\")
-    if not host:
-        raise ValueError("Hostname ou IP não informado.")
-
-    encoded_command = _encoded_command(_build_printer_query_payload())
-
-    command = _psexec_powershell_command(psexec_path, host, encoded_command)
+    command = [
+        str(psexec_path),
+        rf"\\{host}",
+        "-s",
+        "-h",
+        "-accepteula",
+        "-nobanner",
+        "-n",
+        "5",
+        "powershell.exe",
+        "-NoLogo",
+        "-NoProfile",
+        "-NonInteractive",
+        "-ExecutionPolicy",
+        "Bypass",
+        "-EncodedCommand",
+        encoded_command,
+    ]
 
     completed = _run_psexec(command, host, psexec_path, PSEXEC_TIMEOUT_SECONDS)
 
@@ -988,9 +934,9 @@ def query_remote_printers(host: str, psexec_path: Path) -> str:
     raw_rows = _decode_marked_payload(combined_output, start_marker, end_marker)
 
     if raw_rows is None and start_marker not in combined_output:
-        # Sem checagem de truncamento aqui: ela exige o marcador de ABERTURA
-        # presente, e esta condicao ja garante que ele nao esta. O caso real
-        # de saida cortada cai no bloco de baixo.
+        if _truncated_output(combined_output, start_marker, end_marker):
+            raise _truncation_error(
+                host, psexec_path, completed.returncode, stdout, stderr)
         summary, hint, category = _diagnose_psexec_failure(combined_output, completed.returncode)
         details = _build_psexec_details(
             host,
@@ -1080,13 +1026,11 @@ def _query_logged_user(item):
         return (name, "SEM HOST")
 
     try:
-        # Os mesmos limites de host_responds_to_ping. Estavam fixos em 800ms e
-        # 3s aqui: duas politicas de ping no mesmo modulo e so uma ajustavel.
         ping = subprocess.run(
-            ["ping", "-n", "1", "-w", str(int(HOST_PING_TIMEOUT_MS)), host],
+            ["ping", "-n", "1", "-w", "800", host],
             capture_output=True,
             text=True,
-            timeout=HOST_PING_PROCESS_TIMEOUT_SECONDS,
+            timeout=3,
             creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
         )
 
@@ -1097,7 +1041,7 @@ def _query_logged_user(item):
             ["qwinsta", f"/server:{host}"],
             capture_output=True,
             text=True,
-            timeout=QWINSTA_TIMEOUT_SECONDS,
+            timeout=8,
             creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
         )
 
@@ -1315,7 +1259,26 @@ $m1='__VNC_MENU_RUNVBS_BEGIN__';$m2='__VNC_MENU_RUNVBS_END__'
 $folder={folder};$name={name};$task={task}
 $o=[ordered]@{{Status='';User='';MetodoUsuario='';MetodoTarefa='';Script='';Available=@();LastResult=$null;Detail='';Ms=0;MsPreparo=0;MsScript=0}}
 $faseInicio=Get-Date
-{_PS_EMITE}
+function Emite($m1,$m2,$json){{
+ # Comprimido e quebrado em linhas: a saida do PsExec chegava cortada no meio
+ # em algumas maquinas, sempre na mesma, e sem o marcador final nada pode ser
+ # lido. Comprimir reduz o texto varias vezes e quebrar em linhas evita
+ # depender de uma unica escrita gigante. O Flush esvazia o buffer do .NET e a
+ # pausa da tempo do PSEXESVC drenar o pipe antes do processo morrer - sem ela
+ # a cauda se perde mesmo com o buffer ja esvaziado.
+ $bytes=[Text.Encoding]::UTF8.GetBytes([string]$json)
+ $ms=New-Object IO.MemoryStream
+ $ds=New-Object IO.Compression.DeflateStream($ms,[IO.Compression.CompressionMode]::Compress)
+ $ds.Write($bytes,0,$bytes.Length);$ds.Dispose()
+ $b64=[Convert]::ToBase64String($ms.ToArray())
+ [Console]::Out.WriteLine($m1)
+ for($i=0;$i -lt $b64.Length;$i+=400){{
+  [Console]::Out.WriteLine($b64.Substring($i,[Math]::Min(400,$b64.Length-$i)))
+ }}
+ [Console]::Out.WriteLine($m2)
+ [Console]::Out.Flush()
+ Start-Sleep -Milliseconds 300
+}}
 function Send($s,$d){{
  $o.Status=$s;$o.Detail=[string]$d
  $o.Ms=[int]((Get-Date)-$faseInicio).TotalMilliseconds
@@ -1487,12 +1450,6 @@ while($ran -and (Get-Date) -lt $end){{
 $o.MsScript=[int]((Get-Date)-$scriptInicio).TotalMilliseconds
 $res=Tarefa-Resultado
 if($null -ne $res){{$o.LastResult=[int]$res}}
-# O $ran so fica verdadeiro se ALGUM poll pegar a tarefa em execucao, e o
-# intervalo e de 250ms: um script que comeca e termina dentro de um intervalo
-# nunca era visto rodando e saia como 'not_started', acusando o usuario de ter
-# deslogado. O codigo da ultima execucao e prova melhor - 267011
-# (SCHED_S_TASK_HAS_NOT_RUN) e o unico que significa "nunca rodou".
-if($null -ne $res -and [int]$res -ne 267011){{$ran=$true}}
 $aindaRodando=Tarefa-Rodando
 Tarefa-Remover
 if(-not $ran){{Send 'not_started' ''}}
@@ -1592,7 +1549,24 @@ def run_startup_script(host: str, script_name: str, psexec_path: Path) -> dict:
     payload = _build_run_script_payload(script_name)
     encoded_command = _encoded_command(payload)
 
-    command = _psexec_powershell_command(psexec_path, host, encoded_command)
+    command = [
+        str(psexec_path),
+        rf"\\{host}",
+        "-s",
+        "-h",
+        "-accepteula",
+        "-nobanner",
+        "-n",
+        "5",
+        "powershell.exe",
+        "-NoLogo",
+        "-NoProfile",
+        "-NonInteractive",
+        "-ExecutionPolicy",
+        "Bypass",
+        "-EncodedCommand",
+        encoded_command,
+    ]
 
     # Medido AQUI, e nao dentro do payload: o que o payload nao consegue ver e
     # justamente o custo de o PsExec abrir o servico na maquina remota, que e
@@ -1653,15 +1627,6 @@ DRIVER_INSTALL_HINT = {
 }
 
 
-# Padroes da extracao de filas do script da empresa. Compartilhados entre o
-# PowerShell que roda na maquina (quem de fato extrai) e parse_printer_paths
-# (a versao em Python, que so os testes exercitam). Eram dois pares de regex
-# iguais mantidos a mao: os testes davam a impressao de cobrir a extracao
-# enquanto testavam uma copia que nenhum usuario executa.
-_PRINTER_PATH_RE = '"(\\\\\\\\[^"\\r\\n]+)"'
-_PRINTER_QUEUE_RE = '^\\\\\\\\[^\\\\]+\\\\.+'
-
-
 def parse_printer_paths(script_text: str) -> list:
     r"""Extrai os \\servidor\fila escritos entre aspas no script.
 
@@ -1672,11 +1637,11 @@ def parse_printer_paths(script_text: str) -> list:
     o suporte espera ver as filas.
     """
     encontrados = []
-    for bruto in re.findall(_PRINTER_PATH_RE, str(script_text or "")):
+    for bruto in re.findall(r'"(\\\\[^"\r\n]+)"', str(script_text or "")):
         caminho = bruto.strip().rstrip("\\")
         # Precisa ser \\servidor\fila: so o servidor, sem fila, nao instala
         # driver nenhum e viraria uma chamada perdida.
-        if not re.match(_PRINTER_QUEUE_RE, caminho):
+        if not re.match(r"^\\\\[^\\]+\\.+", caminho):
             continue
         if caminho.casefold() not in {item.casefold() for item in encontrados}:
             encontrados.append(caminho)
@@ -1717,7 +1682,26 @@ $m1='__VNC_MENU_DRIVERS_BEGIN__';$m2='__VNC_MENU_DRIVERS_END__'
 $folder={folder};$name={name}
 $o=[ordered]@{{Status='';Script='';Queues=@();Results=@();Detail='';Ms=0;FilasUsuario=@();FilasSistema=@();LimpasSistema=@()}}
 $faseInicio=Get-Date
-{_PS_EMITE}
+function Emite($m1,$m2,$json){{
+ # Comprimido e quebrado em linhas: a saida do PsExec chegava cortada no meio
+ # em algumas maquinas, sempre na mesma, e sem o marcador final nada pode ser
+ # lido. Comprimir reduz o texto varias vezes e quebrar em linhas evita
+ # depender de uma unica escrita gigante. O Flush esvazia o buffer do .NET e a
+ # pausa da tempo do PSEXESVC drenar o pipe antes do processo morrer - sem ela
+ # a cauda se perde mesmo com o buffer ja esvaziado.
+ $bytes=[Text.Encoding]::UTF8.GetBytes([string]$json)
+ $ms=New-Object IO.MemoryStream
+ $ds=New-Object IO.Compression.DeflateStream($ms,[IO.Compression.CompressionMode]::Compress)
+ $ds.Write($bytes,0,$bytes.Length);$ds.Dispose()
+ $b64=[Convert]::ToBase64String($ms.ToArray())
+ [Console]::Out.WriteLine($m1)
+ for($i=0;$i -lt $b64.Length;$i+=400){{
+  [Console]::Out.WriteLine($b64.Substring($i,[Math]::Min(400,$b64.Length-$i)))
+ }}
+ [Console]::Out.WriteLine($m2)
+ [Console]::Out.Flush()
+ Start-Sleep -Milliseconds 300
+}}
 function Send($s,$d){{
  $o.Status=$s;$o.Detail=[string]$d
  $o.Ms=[int]((Get-Date)-$faseInicio).TotalMilliseconds
@@ -1730,9 +1714,9 @@ $o.Script=$file
 if(-not (Test-Path -LiteralPath $file -PathType Leaf)){{Send 'no_script' ''}}
 $txt=Get-Content -LiteralPath $file -Raw
 $achados=@()
-foreach($mm in [regex]::Matches([string]$txt,'{_PRINTER_PATH_RE}')){{
+foreach($mm in [regex]::Matches([string]$txt,'"(\\\\[^"\r\n]+)"')){{
  $p=([string]$mm.Groups[1].Value).Trim().TrimEnd('\')
- if($p -match '{_PRINTER_QUEUE_RE}' -and $achados -notcontains $p){{$achados+=$p}}
+ if($p -match '^\\\\[^\\]+\\.+' -and $achados -notcontains $p){{$achados+=$p}}
 }}
 $o.Queues=$achados
 if($achados.Count -eq 0){{Send 'no_queues' ''}}
@@ -2011,68 +1995,6 @@ def _wmi_degradado(drivers: dict, script_data: dict) -> bool:
     return False
 
 
-class PrinterScriptAborted(Exception):
-    """A fase de drivers nao terminou, entao o script nao foi executado.
-
-    Excecao propria porque NAO e uma falha de comunicacao: a decisao de parar
-    foi nossa, deliberada, e a mensagem certa para o operador e outra.
-    """
-
-    def __init__(self, drivers: dict, relatorio: str):
-        super().__init__("A instalação de drivers não concluiu.")
-        self.drivers = drivers
-        self.relatorio = relatorio
-
-
-def run_printer_script(host: str, script_name: str, psexec_path: Path) -> dict:
-    """Instala os drivers e, se der certo, roda o script na sessao do usuario.
-
-    Vive aqui, e nao dentro da janela, porque nada disto e interface: e a
-    ordem das duas operacoes remotas e a TRAVA entre elas. Enquanto estava no
-    worker da janela, a decisao de abortar - a que protege as impressoras do
-    usuario - so era exercitavel abrindo a janela de verdade, ou seja, nunca.
-
-    Devolve {drivers, script, relatorio}. Levanta PrinterScriptAborted quando
-    a fase de drivers nao concluiu, e PsExecQueryError quando a comunicacao
-    falha.
-    """
-    partes = []
-
-    drivers = install_printer_drivers(host, script_name, psexec_path)
-    audit_log(
-        "DRIVER_INSTALL_RESULT",
-        f"host={host}; status={drivers.get('Status')}; "
-        f"falhas={len(driver_install_failures(drivers))}",
-    )
-    partes.append(format_driver_install_report(host, drivers))
-
-    if drivers.get("Status") != "ok":
-        # Sem driver nenhum instalado, rodar o script apaga as impressoras do
-        # usuario e pode nao conseguir remapear. Melhor parar antes de
-        # estragar.
-        partes.append(
-            "O script NÃO foi executado: a instalação de drivers não chegou "
-            "a rodar, e executar assim apagaria as impressoras do usuário "
-            "sem garantia de remapear."
-        )
-        raise PrinterScriptAborted(
-            drivers, ("\n\n" + ("-" * 60) + "\n\n").join(partes))
-
-    data = run_startup_script(host, script_name, psexec_path)
-    audit_log(
-        "STARTUP_SCRIPT_RESULT",
-        f"host={host}; script={script_name}; "
-        f"status={data.get('Status')}; user={data.get('User') or '-'}",
-    )
-    partes.append(format_script_run_report(host, data))
-
-    return {
-        "drivers": drivers,
-        "script": data,
-        "relatorio": ("\n\n" + ("-" * 60) + "\n\n").join(partes),
-    }
-
-
 def format_run_summary(host: str, drivers: dict, script_data: dict) -> str:
     """Resumo curto da execucao, para quem so quer as impressoras de volta.
 
@@ -2180,7 +2102,24 @@ def install_printer_drivers(host: str, script_name: str, psexec_path: Path) -> d
     payload = _build_driver_install_payload(script_name)
     encoded_command = _encoded_command(payload)
 
-    command = _psexec_powershell_command(psexec_path, host, encoded_command)
+    command = [
+        str(psexec_path),
+        rf"\\{host}",
+        "-s",
+        "-h",
+        "-accepteula",
+        "-nobanner",
+        "-n",
+        "5",
+        "powershell.exe",
+        "-NoLogo",
+        "-NoProfile",
+        "-NonInteractive",
+        "-ExecutionPolicy",
+        "Bypass",
+        "-EncodedCommand",
+        encoded_command,
+    ]
 
     _psexec_inicio = time.monotonic()
     completed = _run_psexec(command, host, psexec_path, SCRIPT_RUN_TIMEOUT_SECONDS)

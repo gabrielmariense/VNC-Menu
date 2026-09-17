@@ -23,7 +23,7 @@ PORT = 5900
 APP_NAME = "VNC-Menu"
 
 
-APP_VERSION = "2.5.4"
+APP_VERSION = "2.5.5"
 
 
 APP_AUTHOR = 'Gabriel "GMErebos" Mariense'
@@ -89,12 +89,6 @@ RESTART_TIMEOUT_SECONDS = 25
 # Consultas qwinsta simultaneas. Conservador de proposito: 30 de uma vez
 # contra a mesma rede e bem diferente de 8.
 QWINSTA_MAX_WORKERS = 8
-
-
-# Limite do qwinsta por host. Era um 8 solto dentro de _query_logged_user, sem
-# constante e sem relacao com o resto: num site lento, subir os limites de ping
-# nao adiantava nada porque a sessao continuava estourando aqui.
-QWINSTA_TIMEOUT_SECONDS = 8
 
 
 # Espera antes de refazer a lista da busca. Cada tecla destroi e recria os

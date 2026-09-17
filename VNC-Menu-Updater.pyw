@@ -20,7 +20,7 @@ PRESERVED_PREFIXES = (
 )
 
 
-# Arquivos que o repositorio PUBLICA dentro de data\. Eles nao sao dados do
+# Arquivos que o repositorio PUBLICA dentro de data\. Nao sao dados do
 # usuario: o template.vnc.example e a semente que o bootstrap usa para criar o
 # template.vnc na primeira execucao, e o LEIA-ME e documentacao. Com data\
 # preservada inteira, uma correcao em qualquer um dos dois chegava apenas em
@@ -214,8 +214,8 @@ def copy_update_files(package_root: Path, install_dir: Path, backup_dir: Path):
         except Exception:
             # Disco cheio ou arquivo travado pelo antivirus no meio da copia
             # deixava um <nome>.update-new na pasta de instalacao, que o
-            # rollback nao conhece - ele so desfaz o que ja tinha sido
-            # registrado em overwritten/created.
+            # rollback nao conhece - ele so desfaz o que ja foi registrado em
+            # overwritten/created.
             try:
                 temporary.unlink(missing_ok=True)
             except Exception:
