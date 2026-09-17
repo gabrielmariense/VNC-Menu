@@ -79,6 +79,7 @@ def wait_for_process(pid: int, timeout_seconds: int = 120):
 
 def safe_extract(archive_path: Path, destination: Path):
     destination = destination.resolve()
+    planejados = []
     with zipfile.ZipFile(archive_path, "r") as archive:
         for info in archive.infolist():
             relative = Path(info.filename.replace("\\", "/"))
@@ -93,7 +94,24 @@ def safe_extract(archive_path: Path, destination: Path):
             if destination not in target.parents and target != destination:
                 raise RuntimeError(f"Caminho fora da pasta de extração: {info.filename}")
 
-        archive.extractall(destination)
+            planejados.append((info, relative))
+
+        # Extracao explicita, e nao extractall(). O ZIP gerado pelo
+        # Compress-Archive do Windows PowerShell 5.1 grava os nomes com
+        # CONTRABARRA, o que a especificacao do formato proibe (APPNOTE
+        # 4.4.17.1 exige barra normal). O extractall() so acerta esses nomes
+        # porque no Windows os.sep e a contrabarra e ele parte por ali: fora
+        # do Windows o caminho inteiro vira UM nome de arquivo e o pacote sai
+        # achatado. Aqui o separador ja foi normalizado na validacao acima,
+        # entao o resultado e o mesmo em qualquer sistema.
+        for info, relative in planejados:
+            destino = destination / relative
+            if info.is_dir():
+                destino.mkdir(parents=True, exist_ok=True)
+                continue
+            destino.parent.mkdir(parents=True, exist_ok=True)
+            with archive.open(info) as origem, open(destino, "wb") as saida:
+                shutil.copyfileobj(origem, saida)
 
 
 def find_package_root(staging: Path, requested_main: str) -> tuple[Path, Path]:
@@ -120,7 +138,24 @@ def find_package_root(staging: Path, requested_main: str) -> tuple[Path, Path]:
         )
 
     main_file = sorted(candidates, key=lambda path: len(path.parts))[0]
-    return main_file.parent, main_file
+    package_root = main_file.parent
+
+    # Um pacote de codigo-fonte TEM de trazer vncmenu\ ao lado do ponto de
+    # entrada. Sem esta checagem, um ZIP montado errado (com o conteudo de
+    # vncmenu\ solto na raiz, por exemplo) era instalado assim mesmo: os
+    # modulos caiam soltos na pasta de instalacao e o aplicativo nao subia.
+    # Melhor recusar o pacote do que espalhar arquivo pela instalacao.
+    # O build empacotado (.exe) nao tem essa pasta: ali o codigo vai em
+    # _internal\, entao a regra so vale para o ponto de entrada .pyw.
+    if main_file.suffix.lower() == ".pyw":
+        if not (package_root / "vncmenu" / "__init__.py").is_file():
+            raise RuntimeError(
+                "O pacote de atualizacao esta malformado: nao ha a pasta "
+                "vncmenu\\ ao lado de " + main_file.name + ". Nenhum arquivo "
+                "foi alterado."
+            )
+
+    return package_root, main_file
 
 
 def copy_update_files(package_root: Path, install_dir: Path, backup_dir: Path):

@@ -22,6 +22,7 @@ import shutil
 import subprocess
 import tempfile
 import threading
+import zlib
 import time
 from ctypes import wintypes
 
@@ -705,26 +706,120 @@ def _run_psexec(command, host, psexec_path, timeout_seconds):
         ) from exc
 
 
+
+# Limite do CreateProcess para a linha de comando inteira. O -EncodedCommand
+# do PowerShell e base64 de UTF-16LE, ou seja ~2,67 caracteres de linha para
+# cada caractere de script: 12 KB de payload ja estouram 32 KB de linha. Foi
+# assim que a execucao do script parou de sair do lugar com
+# "[WinError 206] O nome do arquivo ou a extensao e muito grande", levantado
+# pelo subprocess aqui, antes de qualquer coisa chegar na maquina remota.
+COMMAND_LINE_LIMIT = 32767
+
+
+def _encoded_command(script: str) -> str:
+    """Comprime o script e devolve o -EncodedCommand do carregador.
+
+    Comprimir em vez de encurtar o script: o payload cresce conforme o
+    diagnostico melhora, e cortar comentario para caber de novo seria trocar
+    o que explica o codigo por espaco em linha de comando. Deflate cru
+    (wbits=-15) e o que o DeflateStream do .NET le.
+    """
+    bruto = zlib.compressobj(9, zlib.DEFLATED, -15)
+    comprimido = bruto.compress(script.encode("utf-8")) + bruto.flush()
+    carga = base64.b64encode(comprimido).decode("ascii")
+
+    carregador = (
+        "$d=[IO.Compression.DeflateStream]::new("
+        f"[IO.MemoryStream]::new([Convert]::FromBase64String('{carga}')),"
+        "[IO.Compression.CompressionMode]::Decompress);"
+        "$r=[IO.StreamReader]::new($d,[Text.Encoding]::UTF8);"
+        "$s=$r.ReadToEnd();$r.Dispose();"
+        "Invoke-Expression $s"
+    )
+
+    codificado = base64.b64encode(carregador.encode("utf-16-le")).decode("ascii")
+    if len(codificado) >= COMMAND_LINE_LIMIT - 512:
+        # Folga para o resto da linha (PsExec, host, flags). Estourar aqui
+        # seria o mesmo WinError 206, so que mais dificil de ler.
+        raise PsExecQueryError(
+            "O comando ficou grande demais para a linha de comando do Windows.",
+            "Isso é um defeito do aplicativo, não da máquina remota.",
+            f"Comando codificado: {len(codificado)} caracteres; "
+            f"limite: {COMMAND_LINE_LIMIT}.",
+            category="command_too_long",
+        )
+    return codificado
+
+def _truncated_output(output, begin_marker, end_marker):
+    """True quando a saida comecou a chegar e foi cortada no meio.
+
+    O marcador de abertura presente sem o de fechamento e a assinatura de
+    saida truncada: o script remoto rodou e escreveu, mas o texto nao chegou
+    inteiro. Sem distinguir isso, a falha aparecia como "o PsExec nao
+    retornou o resultado esperado", que manda investigar o lado errado.
+    """
+    texto = str(output or "")
+    return begin_marker in texto and end_marker not in texto
+
+
+def _truncation_error(host, psexec_path, returncode, stdout, stderr):
+    """Erro especifico de saida cortada, com o diagnostico certo."""
+    return PsExecQueryError(
+        "A resposta do computador remoto chegou incompleta.",
+        "O comando rodou e comecou a responder, mas a saida foi cortada no "
+        "meio. Costuma ser a saida do PowerShell sendo fechada antes de "
+        "esvaziar o buffer. Tente novamente; se repetir sempre nessa "
+        "máquina, os detalhes técnicos mostram o quanto chegou.",
+        _build_psexec_details(host, psexec_path, returncode, stdout, stderr),
+        returncode=returncode,
+        category="truncated_output",
+    )
+
+
 def query_remote_printers(host: str, psexec_path: Path) -> str:
     host = str(host or "").strip().lstrip("\\")
     if not host:
         raise ValueError("Hostname ou IP não informado.")
 
-    collector = r'''$ErrorActionPreference='SilentlyContinue'
+    # O coletor resolve o endereco de cada fila compartilhada consultando o
+    # SERVIDOR de impressao. Antes fazia isso fila a fila: duas chamadas RPC
+    # remotas por fila, repetidas para cada perfil de usuario da maquina. Numa
+    # estacao com dez perfis isso passava de quarenta idas e voltas em serie.
+    # Agora cada servidor e lido UMA vez para um hashtable e o resto e busca
+    # local. O caminho fila a fila continua existindo como reserva, para o
+    # servidor que permite consultar uma fila mas nao enumerar o conjunto.
+    collector = r'''$ErrorActionPreference='SilentlyContinue';$ProgressPreference='SilentlyContinue'
 $m1='__VNC_MENU_PRINTERS_BEGIN__';$m2='__VNC_MENU_PRINTERS_END__';$r=@();$ports=@{}
+$dnsCache=@{};$serverCache=@{}
 function Get-IP($value){
  $value=[string]$value
  if([string]::IsNullOrWhiteSpace($value)){return ''}
  if($value-match'(?<!\d)(?:\d{1,3}\.){3}\d{1,3}(?!\d)'){return $Matches[0]}
- try{return ([Net.Dns]::GetHostAddresses($value)|Where-Object{$_.AddressFamily-eq'InterNetwork'}|Select-Object -First 1).IPAddressToString}catch{return ''}
+ if($dnsCache.ContainsKey($value)){return $dnsCache[$value]}
+ $ip=''
+ try{$ip=([Net.Dns]::GetHostAddresses($value)|Where-Object{$_.AddressFamily-eq'InterNetwork'}|Select-Object -First 1).IPAddressToString}catch{$ip=''}
+ $dnsCache[$value]=$ip
+ return $ip
 }
 function Get-Address($port){
  if(!$port){return ''};$name=[string]$port.Name
  if($name-match'(?i)^USB'){return 'USB'}
  $ip=Get-IP $port.PrinterHostAddress;if(!$ip){$ip=Get-IP $name};return $ip
 }
+function Get-ServerMap($server){
+ if($serverCache.ContainsKey($server)){return $serverCache[$server]}
+ $portas=@{};$mapa=@{}
+ foreach($p in @(Get-PrinterPort -ComputerName $server)){$portas[[string]$p.Name]=$p}
+ foreach($q in @(Get-Printer -ComputerName $server)){$mapa[[string]$q.Name]=$portas[[string]$q.PortName]}
+ $serverCache[$server]=$mapa
+ return $mapa
+}
 function Get-SharedAddress($server,$queue){
  if(!$server-or!$queue){return ''}
+ $mapa=Get-ServerMap $server
+ if($null -ne $mapa -and $mapa.ContainsKey($queue) -and $null -ne $mapa[$queue]){
+  return (Get-Address $mapa[$queue])
+ }
  $printer=Get-Printer -ComputerName $server -Name $queue
  if(!$printer){return ''}
  return (Get-Address (Get-PrinterPort -ComputerName $server -Name ([string]$printer.PortName)))
@@ -735,21 +830,33 @@ Get-Printer|ForEach-Object{
  if(!$address-and$connection-match'^\\\\([^\\]+)\\(.+)$'){$address=Get-SharedAddress $Matches[1] $Matches[2]}
  if(!$address-and$name-match'^\\\\([^\\]+)\\(.+)$'){$address=Get-SharedAddress $Matches[1] $Matches[2]}
  if(!$address){$address='NÃO IDENTIFICADO'}
- if($name){$r+=[pscustomobject]@{Name=$name;IP=$address}}
+ # Este Get-Printer roda como SYSTEM, entao as conexoes de rede que ele
+ # enxerga sao as do perfil do SYSTEM - nunca as do usuario. As do usuario
+ # vem da varredura do HKEY_USERS logo abaixo. Listar as daqui misturava a
+ # sobra deixada pela instalacao de drivers com as impressoras reais da
+ # pessoa, e o suporte via no relatorio uma fila que a maquina nao tinha.
+ if($name-and$name-notmatch'^\\\\'){$r+=[pscustomobject]@{Name=$name;IP=$address}}
 }
 if(!(Get-PSDrive HKU -ErrorAction SilentlyContinue)){New-PSDrive HKU Registry HKEY_USERS|Out-Null;$newHku=$true}
+$conexoes=@{}
 Get-ChildItem HKU:\|Where-Object{$_.PSChildName-match'^S-1-5-21-(?:\d+-){3}\d+$'}|ForEach-Object{
  Get-ChildItem "HKU:\$($_.PSChildName)\Printers\Connections"|ForEach-Object{
   $parts=@(($_.PSChildName-replace'^,,','')-split',')
-  if($parts.Count-ge2){$server=[string]$parts[0];$queue=[string]($parts[1..($parts.Count-1)]-join',');$address=Get-SharedAddress $server $queue;if(!$address){$address='NÃO IDENTIFICADO'};$r+=[pscustomobject]@{Name="\\$server\$queue";IP=$address}}
+  if($parts.Count-ge2){$server=[string]$parts[0];$queue=[string]($parts[1..($parts.Count-1)]-join',');$chave="\\$server\$queue";if(!$conexoes.ContainsKey($chave)){$conexoes[$chave]=@($server,$queue)}}
  }
 }
 if($newHku){Remove-PSDrive HKU}
+foreach($chave in @($conexoes.Keys)){
+ $par=$conexoes[$chave];$address=Get-SharedAddress $par[0] $par[1]
+ if(!$address){$address='NÃO IDENTIFICADO'}
+ $r+=[pscustomobject]@{Name=$chave;IP=$address}
+}
 $json=ConvertTo-Json -InputObject @($r|Sort-Object Name,IP -Unique)-Compress
 $payload=[Convert]::ToBase64String([Text.Encoding]::UTF8.GetBytes($json))
-[Console]::Out.WriteLine($m1+$payload+$m2)'''
+[Console]::Out.WriteLine($m1+$payload+$m2)
+[Console]::Out.Flush()'''
 
-    encoded_command = base64.b64encode(collector.encode("utf-16-le")).decode("ascii")
+    encoded_command = _encoded_command(collector)
 
     command = [
         str(psexec_path),
@@ -784,6 +891,9 @@ $payload=[Convert]::ToBase64String([Text.Encoding]::UTF8.GetBytes($json))
     )
 
     if not match:
+        if _truncated_output(combined_output, start_marker, end_marker):
+            raise _truncation_error(
+                host, psexec_path, completed.returncode, stdout, stderr)
         summary, hint, category = _diagnose_psexec_failure(combined_output, completed.returncode)
         details = _build_psexec_details(
             host,
@@ -977,10 +1087,20 @@ SCRIPT_RUN_STATUS = {
     "no_folder": "A pasta de inicialização não existe no computador remoto.",
     "no_script": "O arquivo não foi encontrado na pasta de inicialização.",
     "no_user": "Nenhum usuário logado no computador remoto.",
+    "user_unknown": "Não foi possível descobrir quem está logado no computador remoto.",
     "register_failed": "Não foi possível criar a tarefa agendada no computador remoto.",
     "start_failed": "A tarefa agendada foi criada, mas não iniciou.",
     "not_started": "A tarefa foi criada e disparada, mas nunca entrou em execução.",
     "timeout": "O script começou a rodar, mas não terminou dentro do tempo de espera.",
+}
+
+# Por qual caminho descobrimos quem esta logado. Aparece no relatorio porque
+# cair no terceiro e o sinal de que o WMI da maquina esta ruim, mesmo quando o
+# resto da execucao deu certo.
+SCRIPT_USER_METHOD = {
+    "cim": "via WMI",
+    "explorer_cim": "via WMI, pelo explorer",
+    "explorer_token": "pelo token do explorer — o WMI não respondeu",
 }
 
 SCRIPT_RUN_HINT = {
@@ -989,6 +1109,17 @@ SCRIPT_RUN_HINT = {
     "no_user": "Com a sessão vazia não há token de usuário para usar. "
                "Rodar como SYSTEM mapearia as impressoras no perfil errado, "
                "então nada foi executado.",
+    # Diferente de no_user de proposito: aqui a sessao pode muito bem estar
+    # ocupada. O que houve foi as consultas falharem, e o sintoma classico e
+    # o repositorio WMI corrompido - o mesmo que derruba Get-Printer e
+    # Add-Printer e aparece como "namespace invalido" na fase de drivers.
+    "user_unknown": "As três consultas de sessão falharam, então não dá para "
+                    "saber se a sessão está vazia. Nada foi executado. Se a "
+                    "fase de drivers acusou \"namespace inválido\", o "
+                    "repositório WMI da máquina está corrompido: nesse "
+                    "computador, rode "
+                    "\"winmgmt /verifyrepository\" e, se acusar problema, "
+                    "\"winmgmt /salvagerepository\".",
     "register_failed": "A política de tarefas agendadas pode estar bloqueando "
                        "o logon interativo. Veja a mensagem do Windows abaixo.",
     "start_failed": "Veja a mensagem do Windows abaixo.",
@@ -1081,14 +1212,17 @@ def _build_run_script_payload(script_name: str) -> str:
     # nao o app, que ja terá removido a tarefa e ido embora.
     limite = int(SCRIPT_RUN_WAIT_SECONDS) + 120
 
-    return f"""$ErrorActionPreference='SilentlyContinue'
+    return f"""$ErrorActionPreference='SilentlyContinue';$ProgressPreference='SilentlyContinue'
 $m1='__VNC_MENU_RUNVBS_BEGIN__';$m2='__VNC_MENU_RUNVBS_END__'
 $folder={folder};$name={name};$task={task}
-$o=[ordered]@{{Status='';User='';Script='';Available=@();LastResult=$null;Detail=''}}
+$o=[ordered]@{{Status='';User='';MetodoUsuario='';MetodoTarefa='';Script='';Available=@();LastResult=$null;Detail='';Ms=0;MsPreparo=0;MsScript=0}}
+$faseInicio=Get-Date
 function Send($s,$d){{
  $o.Status=$s;$o.Detail=[string]$d
+ $o.Ms=[int]((Get-Date)-$faseInicio).TotalMilliseconds
  $j=ConvertTo-Json -InputObject $o -Compress -Depth 4
  [Console]::Out.WriteLine($m1+[Convert]::ToBase64String([Text.Encoding]::UTF8.GetBytes($j))+$m2)
+ [Console]::Out.Flush()
  exit
 }}
 if(-not (Test-Path -LiteralPath $folder -PathType Container)){{Send 'no_folder' $folder}}
@@ -1096,48 +1230,169 @@ $o.Available=@(Get-ChildItem -LiteralPath $folder -File | ForEach-Object{{$_.Nam
 $file=Join-Path $folder $name
 $o.Script=$file
 if(-not (Test-Path -LiteralPath $file -PathType Leaf)){{Send 'no_script' ''}}
-$u=''
-try{{$u=[string](Get-CimInstance -ClassName Win32_ComputerSystem -ErrorAction Stop).UserName}}catch{{$u=''}}
+# Quem esta logado, por tres caminhos independentes. O primeiro e o segundo
+# passam pelo WMI; num computador com o repositorio WMI corrompido os dois
+# falham, e ate a 2.5.2 isso era reportado como "ninguem logado" - conclusao
+# errada, tirada de uma pergunta que nao chegou a ser respondida. O terceiro
+# (Get-Process -IncludeUserName, que le o token do processo direto) nao passa
+# por WMI, e $falhou separa "a sessao esta vazia" de "nao consegui perguntar".
+$u='';$metodo='';$falhou=$false
+try{{
+ $u=[string](Get-CimInstance -ClassName Win32_ComputerSystem -ErrorAction Stop).UserName
+ if($u){{$metodo='cim'}}
+}}catch{{$falhou=$true}}
 if(-not $u){{
- foreach($proc in @(Get-CimInstance -ClassName Win32_Process -Filter "Name='explorer.exe'")){{
-  $ow=Invoke-CimMethod -InputObject $proc -MethodName GetOwner
-  if($ow -and $ow.User){{
-   if($ow.Domain){{$u="$($ow.Domain)\\$($ow.User)"}}else{{$u=[string]$ow.User}}
-   break
+ try{{
+  foreach($proc in @(Get-CimInstance -ClassName Win32_Process -Filter "Name='explorer.exe'" -ErrorAction Stop)){{
+   $ow=Invoke-CimMethod -InputObject $proc -MethodName GetOwner -ErrorAction Stop
+   if($ow -and $ow.User){{
+    if($ow.Domain){{$u="$($ow.Domain)\\$($ow.User)"}}else{{$u=[string]$ow.User}}
+    $metodo='explorer_cim'
+    break
+   }}
   }}
- }}
+ }}catch{{$falhou=$true}}
+}}
+if(-not $u){{
+ try{{
+  foreach($proc in @(Get-Process -Name explorer -IncludeUserName -ErrorAction Stop)){{
+   if($proc.UserName){{$u=[string]$proc.UserName;$metodo='explorer_token';break}}
+  }}
+ }}catch{{$falhou=$true}}
 }}
 $o.User=$u
-if(-not $u){{Send 'no_user' ''}}
-Unregister-ScheduledTask -TaskName $task -Confirm:$false
-$act=New-ScheduledTaskAction -Execute {exe} -Argument ('{argumento} "'+$file+'"') -WorkingDirectory $folder
-$pri=New-ScheduledTaskPrincipal -UserId $u -LogonType Interactive
-$cfg=New-ScheduledTaskSettingsSet -AllowStartIfOnBatteries -DontStopIfGoingOnBatteries -ExecutionTimeLimit (New-TimeSpan -Seconds {limite})
-$def=New-ScheduledTask -Action $act -Principal $pri -Settings $cfg
-try{{Register-ScheduledTask -TaskName $task -InputObject $def -Force -ErrorAction Stop|Out-Null}}
-catch{{Send 'register_failed' $_.Exception.Message}}
-try{{Start-ScheduledTask -TaskName $task -ErrorAction Stop}}
+$o.MetodoUsuario=$metodo
+if(-not $u){{
+ if($falhou){{Send 'user_unknown' ''}}
+ Send 'no_user' ''
+}}
+# --- Criacao da tarefa, por dois caminhos -----------------------------------
+# O modulo ScheduledTasks e CDXML: fala com o provedor WMI do agendador. Numa
+# maquina com o repositorio WMI corrompido os New-ScheduledTask* devolvem nada
+# e o Register reclama de InputObject nulo - foi assim que isso apareceu em
+# campo. O COM Schedule.Service e a API classica do agendador, nao passa por
+# WMI, e faz registro, execucao, leitura de estado e remocao. Por isso e a
+# segunda tentativa, e nao a primeira: o modulo esta em producia funcionando
+# no resto do parque e trocar o caminho de todo mundo seria risco sem motivo.
+$viaCom=$false;$pasta=$null;$erroModulo=''
+try{{Unregister-ScheduledTask -TaskName $task -Confirm:$false}}catch{{}}
+$def=$null
+try{{
+ $act=New-ScheduledTaskAction -Execute {exe} -Argument ('{argumento} "'+$file+'"') -WorkingDirectory $folder
+ $pri=New-ScheduledTaskPrincipal -UserId $u -LogonType Interactive
+ $cfg=New-ScheduledTaskSettingsSet -AllowStartIfOnBatteries -DontStopIfGoingOnBatteries -ExecutionTimeLimit (New-TimeSpan -Seconds {limite})
+ if($act -and $pri -and $cfg){{$def=New-ScheduledTask -Action $act -Principal $pri -Settings $cfg}}
+ else{{$erroModulo='os cmdlets do modulo ScheduledTasks nao devolveram nada'}}
+}}catch{{$def=$null;$erroModulo=[string]$_.Exception.Message}}
+if($def){{
+ try{{
+  Register-ScheduledTask -TaskName $task -InputObject $def -Force -ErrorAction Stop|Out-Null
+  $o.MetodoTarefa='modulo'
+ }}catch{{$def=$null;$erroModulo=[string]$_.Exception.Message}}
+}}
+if(-not $def){{
+ try{{
+  $svc=New-Object -ComObject Schedule.Service
+  $svc.Connect()
+  $pasta=$svc.GetFolder('\\')
+  try{{$pasta.DeleteTask($task,0)}}catch{{}}
+  $cmdXml=[Security.SecurityElement]::Escape([string]{exe})
+  $argXml=[Security.SecurityElement]::Escape('{argumento} "'+$file+'"')
+  $dirXml=[Security.SecurityElement]::Escape([string]$folder)
+  $usrXml=[Security.SecurityElement]::Escape([string]$u)
+  $xml=@"
+<?xml version="1.0" encoding="UTF-16"?>
+<Task version="1.2" xmlns="http://schemas.microsoft.com/windows/2004/02/mit/task">
+ <Principals>
+  <Principal id="Author">
+   <UserId>$usrXml</UserId>
+   <LogonType>InteractiveToken</LogonType>
+   <RunLevel>LeastPrivilege</RunLevel>
+  </Principal>
+ </Principals>
+ <Settings>
+  <MultipleInstancesPolicy>IgnoreNew</MultipleInstancesPolicy>
+  <DisallowStartIfOnBatteries>false</DisallowStartIfOnBatteries>
+  <StopIfGoingOnBatteries>false</StopIfGoingOnBatteries>
+  <AllowHardTerminate>true</AllowHardTerminate>
+  <StartWhenAvailable>false</StartWhenAvailable>
+  <RunOnlyIfNetworkAvailable>false</RunOnlyIfNetworkAvailable>
+  <IdleSettings><StopOnIdleEnd>false</StopOnIdleEnd><RestartOnIdle>false</RestartOnIdle></IdleSettings>
+  <AllowStartOnDemand>true</AllowStartOnDemand>
+  <Enabled>true</Enabled>
+  <Hidden>false</Hidden>
+  <RunOnlyIfIdle>false</RunOnlyIfIdle>
+  <WakeToRun>false</WakeToRun>
+  <ExecutionTimeLimit>PT{limite}S</ExecutionTimeLimit>
+  <Priority>7</Priority>
+ </Settings>
+ <Actions Context="Author">
+  <Exec>
+   <Command>$cmdXml</Command>
+   <Arguments>$argXml</Arguments>
+   <WorkingDirectory>$dirXml</WorkingDirectory>
+  </Exec>
+ </Actions>
+</Task>
+"@
+  # 6 = TASK_CREATE_OR_UPDATE, 3 = TASK_LOGON_INTERACTIVE_TOKEN. Mesmo
+  # principal do caminho do modulo: usa o token da sessao ja aberta, sem senha.
+  $pasta.RegisterTask($task,$xml,6,$null,$null,3)|Out-Null
+  $viaCom=$true;$o.MetodoTarefa='com'
+ }}catch{{
+  $detalhe=[string]$_.Exception.Message
+  if($erroModulo){{$detalhe=$erroModulo+' | COM: '+$detalhe}}
+  Send 'register_failed' $detalhe
+ }}
+}}
+$o.MsPreparo=[int]((Get-Date)-$faseInicio).TotalMilliseconds
+
+# Dali para baixo o codigo nao pode mais chamar o modulo: nas maquinas que
+# caem no COM ele nao responde a nada. Estas quatro funcoes sao o unico ponto
+# que conhece a diferenca.
+function Tarefa-Rodar(){{
+ if($viaCom){{$pasta.GetTask($task).Run($null)|Out-Null}}
+ else{{Start-ScheduledTask -TaskName $task -ErrorAction Stop}}
+}}
+function Tarefa-Rodando(){{
+ if($viaCom){{return ([int]$pasta.GetTask($task).State -eq 4)}}
+ return ([string](Get-ScheduledTask -TaskName $task).State -eq 'Running')
+}}
+function Tarefa-Resultado(){{
+ if($viaCom){{return [int]$pasta.GetTask($task).LastTaskResult}}
+ $info=Get-ScheduledTaskInfo -TaskName $task
+ if($info){{return [int]$info.LastTaskResult}}
+ return $null
+}}
+function Tarefa-Remover(){{
+ if($viaCom){{try{{$pasta.DeleteTask($task,0)}}catch{{}}}}
+ else{{Unregister-ScheduledTask -TaskName $task -Confirm:$false}}
+}}
+
+$scriptInicio=Get-Date
+try{{Tarefa-Rodar}}
 catch{{
- Unregister-ScheduledTask -TaskName $task -Confirm:$false
+ Tarefa-Remover
  Send 'start_failed' $_.Exception.Message
 }}
 $ran=$false
 $end=(Get-Date).AddSeconds(20)
 while((Get-Date) -lt $end){{
- if((Get-ScheduledTask -TaskName $task).State -eq 'Running'){{$ran=$true;break}}
- Start-Sleep -Milliseconds 400
+ if(Tarefa-Rodando){{$ran=$true;break}}
+ Start-Sleep -Milliseconds 250
 }}
 $end=(Get-Date).AddSeconds({wait})
 while($ran -and (Get-Date) -lt $end){{
- if((Get-ScheduledTask -TaskName $task).State -ne 'Running'){{break}}
- Start-Sleep -Milliseconds 1000
+ if(-not (Tarefa-Rodando)){{break}}
+ Start-Sleep -Milliseconds 250
 }}
-$info=Get-ScheduledTaskInfo -TaskName $task
-if($info){{$o.LastResult=[int]$info.LastTaskResult}}
-$still=[string](Get-ScheduledTask -TaskName $task).State
-Unregister-ScheduledTask -TaskName $task -Confirm:$false
+$o.MsScript=[int]((Get-Date)-$scriptInicio).TotalMilliseconds
+$res=Tarefa-Resultado
+if($null -ne $res){{$o.LastResult=[int]$res}}
+$aindaRodando=Tarefa-Rodando
+Tarefa-Remover
 if(-not $ran){{Send 'not_started' ''}}
-if($still -eq 'Running'){{Send 'timeout' ''}}
+if($aindaRodando){{Send 'timeout' ''}}
 Send 'ok' ''"""
 
 
@@ -1167,7 +1422,13 @@ def format_script_run_report(host: str, data: dict) -> str:
     ]
 
     user = str((data or {}).get("User") or "").strip()
-    lines.append(f"Usuário logado: {user or '-'}")
+    metodo = SCRIPT_USER_METHOD.get(str((data or {}).get("MetodoUsuario") or ""), "")
+    lines.append(f"Usuário logado: {user or '-'}" + (f"  ({metodo})" if user and metodo else ""))
+
+    if str((data or {}).get("MetodoTarefa") or "") == "com":
+        # Mesma informacao que "o WMI nao respondeu" na linha do usuario: a
+        # execucao deu certo, mas a maquina esta degradada.
+        lines.append("Tarefa criada pela API COM — o módulo do agendador não respondeu.")
 
     script = str((data or {}).get("Script") or "").strip()
     if script:
@@ -1178,6 +1439,21 @@ def format_script_run_report(host: str, data: dict) -> str:
         # O script da empresa nunca limpa o ON ERROR RESUME NEXT, entao 0 aqui
         # significa "o cscript iniciou e saiu", nao "as impressoras voltaram".
         lines.append(f"Código da tarefa: {last}")
+
+    preparo = _format_phase_ms((data or {}).get("MsPreparo"))
+    execucao = _format_phase_ms((data or {}).get("MsScript"))
+    total = _format_phase_ms((data or {}).get("Ms"))
+    psexec = _format_phase_ms((data or {}).get("MsPsExec"))
+    if preparo or execucao or total or psexec:
+        lines.append("")
+        if preparo:
+            lines.append(f"Preparo da tarefa: {preparo}")
+        if execucao:
+            lines.append(f"Execução do script: {execucao}")
+        if total:
+            lines.append(f"Total na máquina: {total}")
+        if psexec:
+            lines.append(f"Conexão PsExec (total da chamada): {psexec}")
 
     hint = SCRIPT_RUN_HINT.get(status, "")
     if hint:
@@ -1219,7 +1495,7 @@ def run_startup_script(host: str, script_name: str, psexec_path: Path) -> dict:
 
     script_name = validate_script_name(script_name)
     payload = _build_run_script_payload(script_name)
-    encoded_command = base64.b64encode(payload.encode("utf-16-le")).decode("ascii")
+    encoded_command = _encoded_command(payload)
 
     command = [
         str(psexec_path),
@@ -1240,13 +1516,22 @@ def run_startup_script(host: str, script_name: str, psexec_path: Path) -> dict:
         encoded_command,
     ]
 
+    # Medido AQUI, e nao dentro do payload: o que o payload nao consegue ver e
+    # justamente o custo de o PsExec abrir o servico na maquina remota, que e
+    # a diferenca entre este numero e o "Total na maquina" dele.
+    _psexec_inicio = time.monotonic()
     completed = _run_psexec(command, host, psexec_path, SCRIPT_RUN_TIMEOUT_SECONDS)
+    _psexec_ms = int((time.monotonic() - _psexec_inicio) * 1000)
 
     stdout = _decode_process_output(completed.stdout)
     stderr = _decode_process_output(completed.stderr)
     data = parse_run_script_payload(f"{stdout}\n{stderr}")
 
     if not data:
+        if _truncated_output(f"{stdout}\n{stderr}",
+                             "__VNC_MENU_RUNVBS_BEGIN__", "__VNC_MENU_RUNVBS_END__"):
+            raise _truncation_error(
+                host, psexec_path, completed.returncode, stdout, stderr)
         summary, hint, category = _diagnose_psexec_failure(
             f"{stdout}\n{stderr}", completed.returncode
         )
@@ -1261,6 +1546,7 @@ def run_startup_script(host: str, script_name: str, psexec_path: Path) -> dict:
             category=category,
         )
 
+    data["MsPsExec"] = _psexec_ms
     return data
 
 
@@ -1270,6 +1556,15 @@ DRIVER_INSTALL_STATUS = {
     "ok": "Instalação de drivers concluída.",
     "no_script": "O arquivo não foi encontrado na pasta de inicialização.",
     "no_queues": "Nenhum caminho de impressora foi encontrado dentro do script.",
+}
+
+# De onde veio a resposta de cada fila. Fica no relatorio porque a diferenca
+# entre "o usuario ja tinha" e "uma execucao nossa anterior tinha" e o que
+# distingue a checagem que serve da que so acerta na segunda vez.
+DRIVER_SKIP_SOURCE = {
+    "usuario": "já no perfil de um usuário",
+    "ja_existia": "respondido pelo servidor",
+    "instalou_com": "pela API COM, o WMI recusou",
 }
 
 DRIVER_INSTALL_HINT = {
@@ -1312,18 +1607,35 @@ def _build_driver_install_payload(script_name: str) -> str:
     A conexao criada fica no perfil do SYSTEM de proposito: o que interessa e
     o driver, que vai para o driver store da MAQUINA. Remover a conexao depois
     so acrescentaria um jeito de falhar depois do objetivo ja alcancado.
+
+    Antes de instalar qualquer coisa a fila e procurada em DUAS listas locais,
+    nenhuma delas com ida ao servidor:
+
+      * as conexoes do proprio SYSTEM (Get-Printer). Essa lista so tem o que
+        uma execucao ANTERIOR nossa criou, entao nunca acerta na primeira vez
+        em cada maquina;
+      * as conexoes do usuario logado, lidas direto de
+        HKU\\<SID>\\Printers\\Connections. Essa e a que responde a pergunta que
+        interessa - "esse usuario ja tem essa impressora funcionando?" - e
+        acerta ja na primeira execucao.
+
+    Uma conexao existente do usuario prova que o driver ja esta no driver
+    store da maquina, que e o unico motivo desta fase existir.
     """
     name = _powershell_single_quoted(script_name)
     folder = _powershell_single_quoted(STARTUP_FOLDER)
 
-    return rf"""$ErrorActionPreference='SilentlyContinue'
+    return rf"""$ErrorActionPreference='SilentlyContinue';$ProgressPreference='SilentlyContinue'
 $m1='__VNC_MENU_DRIVERS_BEGIN__';$m2='__VNC_MENU_DRIVERS_END__'
 $folder={folder};$name={name}
-$o=[ordered]@{{Status='';Script='';Queues=@();Results=@();Detail=''}}
+$o=[ordered]@{{Status='';Script='';Queues=@();Results=@();Detail='';Ms=0;FilasUsuario=@();FilasSistema=@();LimpasSistema=@()}}
+$faseInicio=Get-Date
 function Send($s,$d){{
  $o.Status=$s;$o.Detail=[string]$d
+ $o.Ms=[int]((Get-Date)-$faseInicio).TotalMilliseconds
  $j=ConvertTo-Json -InputObject $o -Compress -Depth 5
  [Console]::Out.WriteLine($m1+[Convert]::ToBase64String([Text.Encoding]::UTF8.GetBytes($j))+$m2)
+ [Console]::Out.Flush()
  exit
 }}
 $file=Join-Path $folder $name
@@ -1337,17 +1649,121 @@ foreach($mm in [regex]::Matches([string]$txt,'"(\\\\[^"\r\n]+)"')){{
 }}
 $o.Queues=$achados
 if($achados.Count -eq 0){{Send 'no_queues' ''}}
+
+# --- Conexoes ja presentes na maquina, sem tocar no servidor ---------------
+
+# 1) As conexoes do proprio SYSTEM. NAO servem para decidir nada: elas so
+# existem porque uma execucao NOSSA anterior as criou, e a pergunta aqui e se
+# o USUARIO ja tem a fila. Sao lidas para serem APAGADAS.
+#
+# O Add-Printer roda como SYSTEM porque o driver vai para o driver store da
+# maquina, que e o objetivo; a conexao no perfil do SYSTEM e so um efeito
+# colateral. Deixa-la la fazia a consulta de impressoras - que tambem roda
+# como SYSTEM e tambem chama Get-Printer - listar a nossa sobra junto com as
+# impressoras do usuario, como se ele tivesse uma fila que nunca teve.
+#
+# Em try: numa maquina com o WMI corrompido isso pode ser erro TERMINANTE,
+# que o SilentlyContinue nao segura.
+$filasSistema=@()
+try{{
+ foreach($imp in @(Get-Printer)){{
+  $n=[string]$imp.Name
+  if($n.StartsWith('\\')){{$filasSistema+=$n}}
+ }}
+}}catch{{$filasSistema=@()}}
+$o.FilasSistema=$filasSistema
+
+function Limpa-Sistema($caminho){{
+ # Remove so a conexao do perfil do SYSTEM. O driver fica no driver store da
+ # maquina, que e justamente o que esta fase existe para garantir.
+ try{{Remove-Printer -Name $caminho -ErrorAction Stop;return $true}}catch{{}}
+ try{{
+  (New-Object -ComObject WScript.Network).RemovePrinterConnection($caminho,$true,$false)
+  return $true
+ }}catch{{}}
+ return $false
+}}
+
+# Sobras de versoes anteriores, que deixavam a conexao para tras. Sem isso a
+# maquina fica com a nossa sujeira ate alguem apagar na mao.
+$limpas=@()
+foreach($sobra in $filasSistema){{
+ if(Limpa-Sistema $sobra){{$limpas+=$sobra}}
+}}
+$o.LimpasSistema=$limpas
+
+# 2) As dos perfis de usuario carregados. Varre TODOS os SIDs de conta real
+# em HKEY_USERS em vez de perguntar ao WMI quem esta logado: e a mesma
+# varredura que a consulta de impressoras ja usa, nao depende de CIM e por
+# isso continua respondendo em maquina com o WMI quebrado - que e
+# exatamente a maquina onde Get-Printer e Add-Printer tambem falham e a
+# checagem local e mais necessaria.
+# As conexoes ficam como subchaves com as contrabarras trocadas por virgula:
+# \\SRV\FILA vira ,,SRV,FILA.
+$filasUsuario=@()
+try{{
+ foreach($hive in @(Get-ChildItem 'Registry::HKEY_USERS' | Where-Object{{
+   $_.PSChildName -match '^S-1-5-21-(?:\d+-){{3}}\d+$'}})){{
+  $chave="Registry::HKEY_USERS\$($hive.PSChildName)\Printers\Connections"
+  foreach($sub in @(Get-ChildItem -Path $chave)){{
+   $filasUsuario+=([string]$sub.PSChildName).Replace(',','\')
+  }}
+ }}
+}}catch{{}}
+$o.FilasUsuario=$filasUsuario
+
+# So os perfis de usuario entram na decisao. O perfil do SYSTEM diria apenas
+# "ja instalamos isso antes", que nao responde se o usuario tem a fila - e era
+# por isso que a checagem so acertava a partir da segunda execucao.
+$conhecidas=New-Object 'System.Collections.Generic.HashSet[string]' ([StringComparer]::OrdinalIgnoreCase)
+foreach($n in $filasUsuario){{[void]$conhecidas.Add($n.TrimEnd('\'))}}
+
 foreach($path in $achados){{
- $r=[ordered]@{{Path=$path;Ok=$false;Error=''}}
+ $r=[ordered]@{{Path=$path;Ok=$false;Error='';Pulou=$false;JaExistia=$false;Fonte='';Ms=0}}
+ $t0=Get-Date
+ # Consulta LOCAL antes da remota: se a fila ja esta presente, o driver ja
+ # esta no driver store e o Add-Printer so faria uma ida ao servidor para
+ # nao mudar nada. Era isso que fazia TODA execucao pagar a fase de drivers,
+ # inclusive nas maquinas onde nao havia nada a instalar.
+ if($conhecidas.Contains($path)){{
+  $r.Ok=$true;$r.Pulou=$true
+  $r.Fonte='usuario'
+  $r.Ms=[int]((Get-Date)-$t0).TotalMilliseconds
+  $o.Results+=,$r
+  continue
+ }}
  try{{
   Add-Printer -ConnectionName $path -ErrorAction Stop
-  $r.Ok=$true
+  $r.Ok=$true;$r.Fonte='instalou'
+  [void](Limpa-Sistema $path)
  }}catch{{
   $msg=[string]$_.Exception.Message
   # Ja instalada e sucesso: o driver que interessa ja esta no driver store.
-  if($msg -match '(?i)already exists|ja existe|já existe'){{$r.Ok=$true}}
+  # Marcado a parte de proposito: cair aqui significa que as duas listas
+  # locais erraram, e isso precisa aparecer no relatorio em vez de se
+  # disfarcar de instalacao bem sucedida.
+  if($msg -match '(?i)already exists|ja existe|já existe'){{
+   $r.Ok=$true;$r.JaExistia=$true;$r.Fonte='ja_existia'
+   [void](Limpa-Sistema $path)
+  }}
+  # Add-Printer e um cmdlet CDXML: ele fala com o provedor WMI de impressao.
+  # Em maquina com o repositorio WMI corrompido ele responde 'namespace
+  # invalido' e NENHUMA fila instala - inclusive as que o proprio script da
+  # empresa instala sem problema, porque o script usa a API COM antiga, que
+  # nao passa por WMI. Entao o COM e a segunda tentativa, nao um plano B
+  # teorico: e comprovadamente o caminho que funciona nessas maquinas.
+  elseif($msg -match '(?i)namespace|0x8004100E|WBEM'){{
+   try{{
+    (New-Object -ComObject WScript.Network).AddWindowsPrinterConnection($path)
+    $r.Ok=$true;$r.Fonte='instalou_com'
+    [void](Limpa-Sistema $path)
+   }}catch{{
+    $r.Error=$msg+' | COM: '+[string]$_.Exception.Message
+   }}
+  }}
   else{{$r.Error=$msg}}
  }}
+ $r.Ms=[int]((Get-Date)-$t0).TotalMilliseconds
  $o.Results+=,$r
 }}
 Send 'ok' ''"""
@@ -1383,6 +1799,39 @@ def driver_install_failures(data: dict) -> list:
     return falhas
 
 
+def _format_phase_ms(value) -> str:
+    """Tempo medido, ex.: '3,4s' ou '9 ms'. Vazio quando nao ha medicao.
+
+    Vazio e diferente de zero de proposito: o payload so passou a medir tempo
+    na 2.5.2, entao uma execucao de versao anterior nao deve imprimir um
+    '0,0s' que parece medicao e nao e. Abaixo de um segundo sai em ms para que
+    uma fila pulada (poucos milissegundos) nao vire '0,0s'.
+    """
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        return ""
+    if value <= 0:
+        return ""
+    if value < 1000:
+        return f"{int(value)} ms"
+    return f"{value / 1000.0:.1f}s".replace(".", ",")
+
+
+def driver_install_wmi_broken(data: dict) -> bool:
+    """True quando TODA falha foi de namespace do WMI.
+
+    Vale como diagnostico so quando e unanime: uma fila com erro de namespace
+    no meio de outras com erro de acesso seria coincidencia, mas todas elas
+    significa que o provedor de impressao nao respondeu a nenhuma chamada.
+    """
+    falhas = driver_install_failures(data)
+    if not falhas:
+        return False
+    return all(
+        re.search(r"(?i)namespace|0x8004100E|WBEM", erro or "")
+        for _caminho, erro in falhas
+    )
+
+
 def format_driver_install_report(host: str, data: dict) -> str:
     """Relatorio da instalacao de drivers, fila por fila."""
     status = str((data or {}).get("Status") or "")
@@ -1405,13 +1854,33 @@ def format_driver_install_report(host: str, data: dict) -> str:
             if not isinstance(item, dict):
                 continue
             caminho = str(item.get("Path") or "?")
-            if item.get("Ok"):
-                linhas.append(f"  OK    {caminho}")
+            if item.get("Pulou"):
+                rotulo = "JÁ TINHA"
+            elif item.get("JaExistia"):
+                # As duas listas locais erraram e quem respondeu foi o
+                # servidor. Nao pode aparecer como instalacao: e um round-trip
+                # que a checagem local deveria ter evitado.
+                rotulo = "JÁ EXISTIA"
+            elif item.get("Ok"):
+                rotulo = "INSTALOU"
             else:
-                linhas.append(f"  FALHA {caminho}")
+                rotulo = "FALHA"
+            tempo = _format_phase_ms(item.get("Ms"))
+            partes = [p for p in (DRIVER_SKIP_SOURCE.get(str(item.get("Fonte") or "")), tempo) if p]
+            sufixo = f"  ({', '.join(partes)})" if partes else ""
+            linhas.append(f"  {rotulo:<11}{caminho}{sufixo}")
+            if not item.get("Ok"):
                 erro = str(item.get("Error") or "").strip()
                 if erro:
-                    linhas.append(f"        {erro}")
+                    linhas.append(f"             {erro}")
+
+    fase = _format_phase_ms((data or {}).get("Ms"))
+    if fase:
+        linhas.extend(["", f"Tempo da fase de drivers: {fase}"])
+
+    psexec = _format_phase_ms((data or {}).get("MsPsExec"))
+    if psexec:
+        linhas.append(f"Conexão PsExec (total da chamada): {psexec}")
 
     hint = DRIVER_INSTALL_HINT.get(status, "")
     if hint:
@@ -1419,13 +1888,27 @@ def format_driver_install_report(host: str, data: dict) -> str:
 
     falhas = driver_install_failures(data)
     if status == "ok" and falhas:
-        linhas.extend([
-            "",
-            "As filas acima falharam. Se o erro for de acesso, o servidor não "
-            "está liberando o driver para a conta de máquina deste computador; "
-            "se for de driver, a fila pode estar publicando um driver que esta "
-            "máquina não aceita.",
-        ])
+        if driver_install_wmi_broken(data):
+            # Conclusao diferente e acao diferente: nao adianta mexer no
+            # servidor de impressao nem no driver da fila. O defeito e na
+            # propria maquina, e enquanto ele existir Get-Printer, Add-Printer
+            # e a consulta de quem esta logado continuam falhando junto.
+            linhas.extend([
+                "",
+                "Todas as filas falharam por namespace do WMI — não é o "
+                "servidor nem o driver, é o repositório WMI deste computador "
+                "que está corrompido. A tentativa pela API COM também não "
+                "passou. Nessa máquina, rode \"winmgmt /verifyrepository\" e, "
+                "se acusar problema, \"winmgmt /salvagerepository\".",
+            ])
+        else:
+            linhas.extend([
+                "",
+                "As filas acima falharam. Se o erro for de acesso, o servidor "
+                "não está liberando o driver para a conta de máquina deste "
+                "computador; se for de driver, a fila pode estar publicando um "
+                "driver que esta máquina não aceita.",
+            ])
 
     return "\n".join(linhas)
 
@@ -1451,7 +1934,7 @@ def install_printer_drivers(host: str, script_name: str, psexec_path: Path) -> d
 
     script_name = validate_script_name(script_name)
     payload = _build_driver_install_payload(script_name)
-    encoded_command = base64.b64encode(payload.encode("utf-16-le")).decode("ascii")
+    encoded_command = _encoded_command(payload)
 
     command = [
         str(psexec_path),
@@ -1472,13 +1955,19 @@ def install_printer_drivers(host: str, script_name: str, psexec_path: Path) -> d
         encoded_command,
     ]
 
+    _psexec_inicio = time.monotonic()
     completed = _run_psexec(command, host, psexec_path, SCRIPT_RUN_TIMEOUT_SECONDS)
+    _psexec_ms = int((time.monotonic() - _psexec_inicio) * 1000)
 
     stdout = _decode_process_output(completed.stdout)
     stderr = _decode_process_output(completed.stderr)
     data = parse_driver_install_payload(f"{stdout}\n{stderr}")
 
     if not data:
+        if _truncated_output(f"{stdout}\n{stderr}",
+                             "__VNC_MENU_DRIVERS_BEGIN__", "__VNC_MENU_DRIVERS_END__"):
+            raise _truncation_error(
+                host, psexec_path, completed.returncode, stdout, stderr)
         summary, hint, category = _diagnose_psexec_failure(
             f"{stdout}\n{stderr}", completed.returncode
         )
@@ -1490,4 +1979,5 @@ def install_printer_drivers(host: str, script_name: str, psexec_path: Path) -> d
             returncode=completed.returncode, category=category,
         )
 
+    data["MsPsExec"] = _psexec_ms
     return data
